@@ -16,6 +16,7 @@ SDL2, the whole game is one `.c` file and compiles to under ~150Kb.
 | **Katana** - Deflect incoming bullets with your katana or take out enemies at close range. | ![Katana](screenshots/shot_katana_pose.png) |
 | **Dodge roll** - `SHIFT` / `CTRL` / `C` rolls you sideways evading enemy fire | ![Dodge roll](screenshots/shot_dodge.png) |
 | **Shatter** - Defeating enemies sometimes leaves behind health packs or ammo. | ![Shatter](screenshots/shot_shatter.png) |
+| **SDF blend-shell figures** - Every character body is capsule primitives merged into one draw call; a vertex shader snaps the merged mesh onto their combined smooth-min SDF, so joints have no seams, lighting flows across them (normals from the field gradient), and part colors blend by proximity. The OVERLORD below is 18 blended shapes in a single call. | ![Boss](screenshots/shot_boss.png) |
 
 
 ## Build & run
@@ -54,7 +55,7 @@ Clear every agent in a sector to win.
 
 ## Regression mode
 
-`./dilation --smoke` runs a fixed, deterministic choreography and writes nine PPM
+`./dilation --smoke` runs a fixed, deterministic choreography and writes ten PPM
 screenshots, then prints `SMOKE OK`. It forces `tscale=1` and fixed RNG seeds,
 so output is byte-stable run-to-run — a cheap visual/behavioral regression gate
 for refactors.

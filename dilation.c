@@ -83,6 +83,10 @@ static void load_gl(void){
 #define TRAILN 12         /* trail points per bullet */
 #define MAXSHARD 512
 #define SHLIGHTS 8        /* lights fed to the shader per frame */
+#define MAXSHAPES 24      /* blend-shell shapes per figure (= MS in VS2) */
+#define SHSEG 10          /* template capsule: radial segments */
+#define SHBAND 10         /* template capsule: bands (3 cap + 4 side + 3 cap) */
+#define SHVPS (SHSEG*SHBAND*6)  /* template vertices per shape */
 #define MINTS 0.045f      /* simulation never fully stops (SUPERHOT creep) */
 #define NLEVEL 4
 #define STEP 0.55f        /* max auto step-up: anything taller is a wall */
@@ -942,6 +946,9 @@ static void audio_cb(void*ud,Uint8*stream,int len){
 static GLuint prog;
 static GLint uCam,uNL,uLpos,uLcol,uM3,uT,uTint,uBump,uEmis,uAlb,uNrm,
              uTime,uRain,uGloss,uAlpha,uFog,uRim,uRimCol;
+static GLuint prog2;   /* SDF blend-shell program (figures' bodies) */
+static GLint u2SA,u2SB,u2SC,u2NS,u2K,u2Relax,
+             u2Cam,u2NL,u2Lpos,u2Lcol,u2Fog,u2Gloss,u2Alpha,u2Rim,u2RimCol;
 static const char*VS=
 "#version 120\n"
 "uniform mat3 uM3; uniform vec3 uT;\n"
@@ -951,26 +958,127 @@ static const char*VS=
 "  vP=wp; vN=uM3*gl_Normal; vUV=gl_MultiTexCoord0.xy;\n"
 "  gl_Position = gl_ModelViewProjectionMatrix * vec4(wp,1.0);\n"
 "}\n";
-static const char*FS=
+/* ---- SDF blend-shell vertex shader (prog2). The figures' body parts are
+ * recorded as round cones (capsule with two radii); a merged template mesh is
+ * drawn in ONE call per figure and every vertex is snapped onto the smooth-min
+ * SDF surface of all the figure's shapes combined. Where shapes overlap their
+ * meshes converge onto the same blended isosurface, so the seams between limb
+ * segments simply cease to exist. Normals come from the field gradient
+ * (lighting flows continuously across joints) and colors blend by SDF
+ * proximity (soft gradients at every join). Exponential smooth-min because a
+ * single log-sum-exp accumulation yields the field, its exact gradient AND the
+ * per-shape color weights in one branchless loop. Cost is per-VERTEX: this is
+ * still ordinary mesh rasterization, no raymarching. */
+static const char*VS2=
 "#version 120\n"
+"#define MS 24\n"                       /* keep in sync with MAXSHAPES */
+"uniform vec4 uSA[MS];\n"               /* A.xyz, radius at A */
+"uniform vec4 uSB[MS];\n"               /* B.xyz, radius at B */
+"uniform vec4 uSC[MS];\n"               /* shape rgb, emissive */
+"uniform int uNS; uniform float uK; uniform int uRelax;\n"
+"varying vec3 vP; varying vec3 vN; varying vec3 vTint; varying float vEmis;\n"
+/* round cone (iq), extended to return the analytic gradient per region. The
+ * side gradient is exact and cheap because d = pa*l2 - ba*y is perpendicular
+ * to ba, collapsing grad(x2) to 2*l2*d. Returns (gradient, distance). */
+"vec4 rcone(vec3 p,int i){\n"
+"  vec3 A=uSA[i].xyz; float rA=uSA[i].w, rB=uSB[i].w;\n"
+"  vec3 ba=uSB[i].xyz-A; float l2=dot(ba,ba), il2=1.0/l2, rr=rA-rB, a2=l2-rr*rr;\n"
+"  vec3 pa=p-A; float y=dot(pa,ba);\n"
+"  vec3 d=pa*l2-ba*y; float x2=dot(d,d);\n"
+"  float z=y-l2, kq=sign(rr)*rr*rr*x2;\n"
+"  if(sign(z)*a2*z*z*l2>kq){ vec3 pb=p-uSB[i].xyz; float lb=max(length(pb),1e-6);\n"
+"    return vec4(pb/lb, lb-rB); }\n"
+"  if(sign(y)*a2*y*y*l2<kq){ float la=max(length(pa),1e-6);\n"
+"    return vec4(pa/la, la-rA); }\n"
+"  float sq=sqrt(max(x2*a2*il2,1e-20));\n"
+"  return vec4((a2*(d/sq)+rr*ba)*il2, (sq+y*rr)*il2-rA);\n"
+"}\n"
+/* the combined field: sequential polynomial smooth-min fold. Bounded — shapes
+ * further than k from the running min contribute nothing, so the deeply
+ * overlapped union of 20+ parts doesn't inflate (exp/log-sum-exp does).
+ * Gradient and color ride the same fold weights: normals stay continuous
+ * across joins and colors gradient by proximity for free. */
+"void sdf(vec3 p, out float f, out vec3 g, out vec4 ce){\n"
+"  vec4 dg=rcone(p,0);\n"
+"  float d=dg.w; vec3 G=dg.xyz; vec4 CE=uSC[0];\n"
+"  for(int i=1;i<MS;i++){ if(i>=uNS)break;\n"
+"    vec4 n=rcone(p,i);\n"
+"    float h=clamp(0.5+0.5*(n.w-d)/uK,0.0,1.0);\n"
+"    d=mix(n.w,d,h)-uK*h*(1.0-h);\n"
+"    G=mix(n.xyz,G,h);\n"
+"    CE=mix(uSC[i],CE,h);\n"
+"  }\n"
+"  f=d; g=G; ce=CE;\n"
+"}\n"
+"void main(){\n"
+/* place the template vertex on its own shape: gl_Vertex = unit-sphere dir
+ * (y = axial part), texcoord = (shape slot, axis param t). Approximate
+ * placement is fine - the relaxation below snaps it onto the exact surface. */
+"  int s=int(gl_MultiTexCoord0.x+0.5);\n"
+"  float t=gl_MultiTexCoord0.y;\n"
+"  vec3 A=uSA[s].xyz, B=uSB[s].xyz;\n"
+"  vec3 ba=B-A; float l=max(length(ba),1e-6);\n"
+"  vec3 u=ba/l;\n"
+"  vec3 rf=abs(u.y)>0.9? vec3(1.0,0.0,0.0):vec3(0.0,1.0,0.0);\n"
+"  vec3 U=normalize(cross(u,rf)); vec3 V=cross(u,U);\n"
+"  vec3 v=gl_Vertex.xyz;\n"
+"  vec3 p=mix(A,B,t)+mix(uSA[s].w,uSB[s].w,t)*(U*v.x+u*v.y+V*v.z);\n"
+/* Newton-relax onto the f=0 isosurface; the final eval doubles as the last
+ * step AND the shading source (normal/color), so steps = uRelax+1 */
+/* step f along the normalized gradient: in blend regions |grad| < 1, so the
+ * raw Newton step f*g/|g|^2 overshoots wildly (spikes); f*ghat understeps and
+ * converges over the iterations instead */
+"  float f; vec3 g; vec4 ce;\n"
+"  for(int it=0;it<3;it++){ if(it>=uRelax)break;\n"
+"    sdf(p,f,g,ce);\n"
+"    p-=f*g*inversesqrt(max(dot(g,g),1e-8));\n"
+"  }\n"
+"  sdf(p,f,g,ce);\n"
+"  p-=f*g*inversesqrt(max(dot(g,g),1e-8));\n"
+"  if(dot(g,g)<1e-8) g=vec3(0.0,1.0,0.0);\n"
+"  vN=normalize(g); vTint=ce.rgb; vEmis=ce.a;\n"
+"  vP=p;\n"
+"  gl_Position=gl_ModelViewProjectionMatrix*vec4(p,1.0);\n"
+"}\n";
+
+/* the fragment source is shared between the legacy program and the SDF
+ * blend-shell program (prog2): the shell defines SHELL, takes albedo/emissive
+ * from per-vertex varyings (blended per-shape colors) and drops the
+ * texture/bump/rain paths, but lighting/rim/fog/gamma are literally the same
+ * code so figures and world can never drift apart in shading. */
+static const char*FS_BODY=
+"#ifdef SHELL\n"
+"varying vec3 vTint; varying float vEmis;\n"
+"#else\n"
 "uniform sampler2D uAlb; uniform sampler2D uNrm;\n"
+"uniform vec3 uTint; uniform float uBump; uniform float uEmis;\n"
+"uniform float uTime; uniform float uRain;\n"
+"varying vec2 vUV;\n"
+"float h1(float x){ return fract(sin(x*127.1)*43758.5453); }\n"
+"#endif\n"
 "uniform vec3 uCam; uniform int uNL;\n"
 "uniform vec4 uLpos[8]; uniform vec3 uLcol[8];\n"
-"uniform vec3 uTint; uniform float uBump; uniform float uEmis;\n"
-"uniform float uTime; uniform float uRain; uniform float uGloss; uniform float uAlpha;\n"
+"uniform float uGloss; uniform float uAlpha;\n"
 "uniform vec3 uFog;\n"
 "uniform float uRim; uniform vec3 uRimCol;\n"
-"varying vec3 vP; varying vec3 vN; varying vec2 vUV;\n"
-"float h1(float x){ return fract(sin(x*127.1)*43758.5453); }\n"
+"varying vec3 vP; varying vec3 vN;\n"
 "void main(){\n"
+"#ifdef SHELL\n"
+"  vec3 base = vTint;\n"
+"  float emis = vEmis;\n"
+"#else\n"
 "  vec3 base = texture2D(uAlb,vUV).rgb * uTint;\n"
+"  float emis = uEmis;\n"
+"#endif\n"
 "  vec3 N = normalize(vN);\n"
+"#ifndef SHELL\n"
 "  if(uBump>0.5){\n"
 "    vec3 T = (abs(N.y)>0.5)? vec3(1.0,0.0,0.0) : vec3(N.z,0.0,-N.x);\n"
 "    vec3 B = cross(N,T);\n"
 "    vec3 tn = texture2D(uNrm,vUV).xyz*2.0-1.0;\n"
 "    N = normalize(T*tn.x + B*tn.y + N*tn.z);\n"
 "  }\n"
+"#endif\n"
 "  vec3 col = base*0.05;\n"
 "  vec3 V = normalize(uCam - vP);\n"
 "  for(int i=0;i<8;i++){ if(i>=uNL)break;\n"
@@ -988,6 +1096,7 @@ static const char*FS=
 "    float fres = pow(1.0 - clamp(dot(N,V),0.0,1.0), 3.0);\n"
 "    col += uRimCol*fres*uRim;\n"
 "  }\n"
+"#ifndef SHELL\n"
 "  if(uRain>0.5){\n"
 "    /* digital rain: world-aligned columns of flickering glyph cells */\n"
 "    float cx = floor(vUV.x*16.0);\n"
@@ -999,7 +1108,8 @@ static const char*FS=
 "    float glyph = step(0.50, h1(cx*91.0 + floor(vUV.y*34.0)*17.0 + floor(uTime*9.0)*3.0));\n"
 "    col += vec3(0.10,1.00,0.42)*tail*glyph*on*(0.18+0.22*h1(cx*5.1));\n"
 "  }\n"
-"  col = mix(col, base, uEmis);\n"
+"#endif\n"
+"  col = mix(col, base, emis);\n"
 "  float fd = clamp((distance(uCam,vP)-6.0)/30.0, 0.0, 1.0);\n"
 "  col = mix(col, uFog, fd);\n"
 "  gl_FragColor = vec4(sqrt(col),uAlpha);\n"
@@ -1013,10 +1123,20 @@ static GLuint shader(GLenum ty,const char*src){
     fprintf(stderr,"[dilation] shader fail:\n%s\n",log); exit(1); }
   return s;
 }
+/* compose a fragment shader from a #version/#define prefix + the shared body */
+static GLuint shader2(GLenum ty,const char*prefix,const char*body){
+  GLuint s=glCreateShader(ty);
+  const char*srcs[2]={prefix,body};
+  glShaderSource(s,2,srcs,0); glCompileShader(s);
+  GLint ok; glGetShaderiv(s,GL_COMPILE_STATUS,&ok);
+  if(!ok){ char log[2048]; glGetShaderInfoLog(s,2048,0,log);
+    fprintf(stderr,"[dilation] shader fail:\n%s\n",log); exit(1); }
+  return s;
+}
 static void init_shaders(void){
   prog=glCreateProgram();
   glAttachShader(prog,shader(GL_VERTEX_SHADER,VS));
-  glAttachShader(prog,shader(GL_FRAGMENT_SHADER,FS));
+  glAttachShader(prog,shader2(GL_FRAGMENT_SHADER,"#version 120\n",FS_BODY));
   glLinkProgram(prog);
   GLint ok; glGetProgramiv(prog,GL_LINK_STATUS,&ok);
   if(!ok){ char log[2048]; glGetProgramInfoLog(prog,2048,0,log);
@@ -1031,6 +1151,27 @@ static void init_shaders(void){
   uGloss=glGetUniformLocation(prog,"uGloss"); uAlpha=glGetUniformLocation(prog,"uAlpha");
   uFog=glGetUniformLocation(prog,"uFog");
   uRim=glGetUniformLocation(prog,"uRim"); uRimCol=glGetUniformLocation(prog,"uRimCol");
+
+  prog2=glCreateProgram();
+  glAttachShader(prog2,shader(GL_VERTEX_SHADER,VS2));
+  glAttachShader(prog2,shader2(GL_FRAGMENT_SHADER,"#version 120\n#define SHELL\n",FS_BODY));
+  glLinkProgram(prog2);
+  glGetProgramiv(prog2,GL_LINK_STATUS,&ok);
+  if(!ok){ char log[2048]; glGetProgramInfoLog(prog2,2048,0,log);
+    fprintf(stderr,"[dilation] shell link fail:\n%s\n",log); exit(1); }
+  u2SA=glGetUniformLocation(prog2,"uSA[0]");
+  u2SB=glGetUniformLocation(prog2,"uSB[0]");
+  u2SC=glGetUniformLocation(prog2,"uSC[0]");
+  u2NS=glGetUniformLocation(prog2,"uNS");   u2K=glGetUniformLocation(prog2,"uK");
+  u2Relax=glGetUniformLocation(prog2,"uRelax");
+  u2Cam=glGetUniformLocation(prog2,"uCam"); u2NL=glGetUniformLocation(prog2,"uNL");
+  u2Lpos=glGetUniformLocation(prog2,"uLpos[0]");
+  u2Lcol=glGetUniformLocation(prog2,"uLcol[0]");
+  u2Fog=glGetUniformLocation(prog2,"uFog");
+  u2Gloss=glGetUniformLocation(prog2,"uGloss");
+  u2Alpha=glGetUniformLocation(prog2,"uAlpha");
+  u2Rim=glGetUniformLocation(prog2,"uRim");
+  u2RimCol=glGetUniformLocation(prog2,"uRimCol");
 }
 
 /* ---------------------------------------------------------------- particles */
@@ -1078,10 +1219,17 @@ static float rollT,rollCD,rollDX,rollDZ;    /* dodge roll: timer + direction  */
 static float kvx,kvz;                       /* wall-kick horizontal impulse   */
 static float pmoveb;                        /* idle<->run blend for the avatar*/
 static float avYaw;                         /* smoothed avatar facing (rad)   */
+static float cmbYaw;                        /* smoothed combat pose yaw (rad, negated convention) */
 static float camDist=3.05f,camYs=-1.0f;     /* smoothed camera boom + height  */
 static float coyT;                          /* coyote time: late edge jumps   */
 static float hurtCD;                        /* post-hit mercy window          */
 static float mzT,mzX,mzY,mzZ;               /* avatar muzzle flash            */
+/* pose-fed muzzle anchors: the figure draws stash the ACTUAL barrel-tip world
+ * position each upright frame (bladeGlow idiom); the laser/bullets/flash read
+ * it so the beam grows out of the drawn gun instead of a fixed shoulder
+ * offset. valid==0 falls back to the old rigid math (roll, katana, culled). */
+static float gunGlow[4];                    /* player pistol tip: x,y,z,valid */
+static float agentGun[MAXENEMY][4];         /* enemy pistol tips: x,y,z,valid */
 
 static float player_height(void){ return rollT>0 ? 0.85f : 1.72f; }
 static float player_camh(void){ return py + (rollT>0 ? 1.45f : 1.92f); }
@@ -1096,6 +1244,8 @@ static void reset_game(void){
   gen_level(curlevel,gseed);
   px=startx; pz=startz; pyaw=startyaw; ppitch=0; pvx=pvz=pvy=0;
   avYaw=startyaw*PI/180.0f;
+  cmbYaw=-startyaw*PI/180.0f;   /* combat pose yaw uses the negated convention */
+  gunGlow[3]=0; memset(agentGun,0,sizeof agentGun);
   py=hgt[(int)(startz/CELL)][(int)(startx/CELL)];
   php=100; pammo=6; haspistol=1; jumps=1;
   tscale=1; actT=0; mouseAcc=0;
@@ -1255,9 +1405,12 @@ static void player_aim(float*dx,float*dy,float*dz){
  * avatar's right-hand pistol so the laser/rounds read as coming from the gun,
  * while direction remains fully controlled by the player's look yaw/pitch. */
 static void player_muzzle(float*ox,float*oy,float*oz){
-  /* Keep the ballistic/laser origin near the authored right hand.  The visible
-   * pistol is attached to the hand transform in draw_player(); this fixed
-   * shoulder-space offset avoids the previous free-floating aim-basis gun. */
+  /* Preferred origin: the ACTUAL barrel tip stashed by draw_player last frame
+   * (1-frame pose latency, invisible). The beam, lock test, bullets, flash and
+   * temp light all route through here, so they stay glued to the drawn gun. */
+  if(gunGlow[3]>0){ *ox=gunGlow[0]; *oy=gunGlow[1]; *oz=gunGlow[2]; return; }
+  /* Fallback (roll, katana swing, first frame, post-reset): the old fixed
+   * shoulder-space offset near the authored right hand. */
   float yr=avYaw;
   float fx=sinf(yr), fz=-cosf(yr), rx=cosf(yr), rz=sinf(yr);
   float crouch=rollT>0?0.46f:1.0f;
@@ -1632,6 +1785,10 @@ static void update_enemies(float wdt){
            * roll under it, jump over it, or stand still and study it */
           float my=e->y+1.36f, aimY=py+1.28f;
           float hx=e->x+sinf(e->yaw)*0.45f, hz=e->z-cosf(e->yaw)*0.45f;
+          /* fire from the drawn pistol tip when the agent was rendered last
+           * frame; distance-culled shooters keep the chest-forward fallback */
+          { int gi=(int)(e-en);
+            if(agentGun[gi][3]>0){ hx=agentGun[gi][0]; my=agentGun[gi][1]; hz=agentGun[gi][2]; } }
           for(int k=-1;k<=1;k++){
             float sp=k*0.14f+(frand()-0.5f)*0.03f;
             float bdx=dx+(-dz)*sp, bdz=dz+dx*sp;
@@ -1697,6 +1854,123 @@ static int prim_open(int type,float a,float b,float c,int seg,int ring){
   primc[nprim].l=l; nprim++;
   glNewList(l,GL_COMPILE_AND_EXECUTE);
   return 2;
+}
+
+/* ---------------------------------------------------------- SDF blend-shell
+ * The figures' cylinder/sphere body parts are recorded as round cones during
+ * the (unchanged) pose pass and rendered as ONE draw call per figure: a static
+ * template mesh — MAXSHAPES unit capsules tagged with their slot — is drawn
+ * through prog2, whose vertex shader places each vertex on its own shape and
+ * relaxes it onto the smooth-min surface of all shapes combined. Overlapping
+ * parts converge onto the same isosurface, so joints have no seams; hard-cut
+ * accessories (wedges/boxes, weapons, eyes) stay on the legacy path on top. */
+static float*shellTpl;                  /* MAXSHAPES*SHVPS interleaved verts   */
+static int   shellN=0, shellRec=0;      /* shapes recorded, recording armed    */
+static float shellA[MAXSHAPES][4], shellB[MAXSHAPES][4], shellC[MAXSHAPES][4];
+static float shellK=0.06f, shellGloss=0.55f, shellRim=0, shellRimCol[3];
+static float figCol[4]={1,1,1,0};       /* tint+emissive baked per shape       */
+
+/* template band -> (unit-sphere dir, axis param). Bands 0-2 sweep the bottom
+ * hemisphere at t=0, 3-6 the side rings at the equator, 7-9 the top at t=1. */
+static void shell_bandpt(int bi,float a,float*d,float*t){
+  float ph;
+  if(bi<=3){ *t=0; ph=-PI*0.5f+PI*0.5f*bi/3.0f; }
+  else if(bi<=7){ *t=(bi-3)/4.0f; ph=0; }
+  else { *t=1; ph=PI*0.5f*(bi-7)/3.0f; }
+  d[0]=cosf(a)*cosf(ph); d[1]=sinf(ph); d[2]=sinf(a)*cosf(ph);
+}
+static void shell_init(void){
+  shellTpl=malloc(sizeof(float)*MAXSHAPES*SHVPS*5);
+  float*w=shellTpl;
+  for(int sl=0;sl<MAXSHAPES;sl++)
+    for(int j=0;j<SHBAND;j++)for(int i=0;i<SHSEG;i++){
+      float a0=2*PI*i/SHSEG, a1=2*PI*(i+1)/SHSEG;
+      float d[4][3], t[4];
+      shell_bandpt(j,a0,d[0],&t[0]); shell_bandpt(j+1,a0,d[1],&t[1]);
+      shell_bandpt(j+1,a1,d[2],&t[2]); shell_bandpt(j,a1,d[3],&t[3]);
+      static const int tri[6]={0,1,2, 0,2,3};
+      for(int k=0;k<6;k++){ int c=tri[k];
+        *w++=d[c][0]; *w++=d[c][1]; *w++=d[c][2]; *w++=(float)sl; *w++=t[c]; }
+    }
+}
+/* set the legacy uniform AND the record color, so accessories drawn between
+ * capsule records keep working and shapes inherit the figure's current tint */
+static void fig_tint(float r,float g,float b){
+  figCol[0]=r; figCol[1]=g; figCol[2]=b; glUniform3f(uTint,r,g,b);
+}
+static void fig_emis(float e){ figCol[3]=e; glUniform1f(uEmis,e); }
+static void shell_begin(float k,float gloss,float rim,float rr,float rg,float rb){
+  shellN=0; shellRec=1; shellK=k; shellGloss=gloss;
+  shellRim=rim; shellRimCol[0]=rr; shellRimCol[1]=rg; shellRimCol[2]=rb;
+}
+static void shell_capsule(float ax,float ay,float az,float bx,float by,float bz,
+                          float rA,float rB){
+  if(shellN>=MAXSHAPES)return;
+  if(fabsf(ax-bx)+fabsf(ay-by)+fabsf(az-bz)<2e-3f) by+=2e-3f; /* no zero axis */
+  float*A=shellA[shellN],*B=shellB[shellN],*C=shellC[shellN];
+  A[0]=ax;A[1]=ay;A[2]=az;A[3]=rA; B[0]=bx;B[1]=by;B[2]=bz;B[3]=rB;
+  C[0]=figCol[0];C[1]=figCol[1];C[2]=figCol[2];C[3]=figCol[3];
+  shellN++;
+}
+static void shell_sph(float x,float y,float z,float r){
+  shell_capsule(x,y,z,x,y,z,r,r);
+}
+/* the set_uM(M,t)+cyl_sh(r0,r1,h) idiom as one round cone. Endpoints are inset
+ * by the radii so the hemispherical caps reach exactly the old flat ends — the
+ * capsule occupies the same extent as the cylinder it replaces. */
+static void shell_cyl(const float*M,float tx,float ty,float tz,
+                      float r0,float r1,float h){
+  float ins=1.0f; if(r0+r1>0.8f*h) ins=0.8f*h/(r0+r1);
+  float a[3],b[3];
+  m3v(M,0,-h*0.5f+r0*ins,0,a); m3v(M,0,h*0.5f-r1*ins,0,b);
+  shell_capsule(tx+a[0],ty+a[1],tz+a[2], tx+b[0],ty+b[1],tz+b[2], r0,r1);
+}
+/* per-frame prog2 state: camera, the same 8 selected lights, fog */
+static void shell_frame(const float*lp,const float*lc,int ln,
+                        float cx,float cy,float cz,const float*fog){
+  glUseProgram(prog2);
+  glUniform3f(u2Cam,cx,cy,cz);
+  glUniform1i(u2NL,ln);
+  glUniform4fv(u2Lpos,SHLIGHTS,lp);
+  glUniform3fv(u2Lcol,SHLIGHTS,lc);
+  glUniform3f(u2Fog,fog[0],fog[1],fog[2]);
+  glUniform1f(u2Alpha,1);
+  glUseProgram(prog);
+}
+static void shell_flush(void){
+  shellRec=0;
+  if(shellN<=0)return;
+  int rf=refl;
+  float A[MAXSHAPES*4],B[MAXSHAPES*4];
+  memcpy(A,shellA,(size_t)shellN*16); memcpy(B,shellB,(size_t)shellN*16);
+  if(rf)for(int i=0;i<shellN;i++){ A[i*4+1]=-A[i*4+1]; B[i*4+1]=-B[i*4+1]; }
+  glUseProgram(prog2);
+  glUniform4fv(u2SA,shellN,A);
+  glUniform4fv(u2SB,shellN,B);
+  glUniform4fv(u2SC,shellN,(float*)shellC);
+  glUniform1i(u2NS,shellN);
+  glUniform1f(u2K,shellK);
+  glUniform1i(u2Relax,rf?1:2);          /* +1 implicit step in the final eval */
+  glUniform1f(u2Gloss,shellGloss);
+  glUniform1f(u2Rim,shellRim);
+  glUniform3f(u2RimCol,shellRimCol[0],shellRimCol[1],shellRimCol[2]);
+  /* the mirror pass draws figures while draw_world's batch[] client arrays are
+   * still ENABLED with stale pointers; the upright pass with them disabled.
+   * Restore the exact enable state (pointers are re-set before every world
+   * draw, so clobbering those is fine). */
+  GLboolean va=glIsEnabled(GL_VERTEX_ARRAY), na=glIsEnabled(GL_NORMAL_ARRAY),
+            ta=glIsEnabled(GL_TEXTURE_COORD_ARRAY);
+  glEnableClientState(GL_VERTEX_ARRAY);
+  glDisableClientState(GL_NORMAL_ARRAY);
+  glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+  glVertexPointer(3,GL_FLOAT,20,shellTpl);
+  glTexCoordPointer(2,GL_FLOAT,20,shellTpl+3);
+  glDrawArrays(GL_TRIANGLES,0,shellN*SHVPS);
+  if(!va)glDisableClientState(GL_VERTEX_ARRAY);
+  if(na)glEnableClientState(GL_NORMAL_ARRAY);
+  if(!ta)glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+  glUseProgram(prog);
+  shellN=0;
 }
 
 static void box_sh(float sx,float sy,float sz){ /* shader-lit box, centred */
@@ -1774,30 +2048,9 @@ static void wedge_sh(float sx,float sy,float sz){
   glEnd();
   if(pc==2)glEndList();
 }
-/* shader-lit tapered cylinder along local Y, centred. r0=bottom r1=top radius,
- * seg sides. ONE normal per facet (SUPERHOT cut): limbs read as crystal prisms,
- * each plane catching its own band of light. */
-static void cyl_sh(float r0,float r1,float h,int seg){
-  int pc=prim_open(1,r0,r1,h,seg,0); if(pc==1)return;
-  float y0=-h*0.5f,y1=h*0.5f,dr=r1-r0;
-  float nl=sqrtf(h*h+dr*dr); if(nl<1e-6f)nl=1;
-  glBegin(GL_TRIANGLES); glTexCoord2f(0.5f,0.5f);
-  for(int i=0;i<seg;i++){
-    float a0=i*2*PI/seg,a1=(i+1)*2*PI/seg, am=(a0+a1)*0.5f;
-    float c0=cosf(a0),s0=sinf(a0),c1=cosf(a1),s1=sinf(a1);
-    float bx0=r0*c0,bz0=r0*s0,tx0=r1*c0,tz0=r1*s0;
-    float bx1=r0*c1,bz1=r0*s1,tx1=r1*c1,tz1=r1*s1;
-    glNormal3f(cosf(am)*h/nl,-dr/nl,sinf(am)*h/nl);
-    glVertex3f(bx0,y0,bz0); glVertex3f(bx1,y0,bz1); glVertex3f(tx1,y1,tz1);
-    glVertex3f(bx0,y0,bz0); glVertex3f(tx1,y1,tz1); glVertex3f(tx0,y1,tz0);
-    if(r0>1e-4f){ glNormal3f(0,-1,0);
-      glVertex3f(0,y0,0); glVertex3f(bx1,y0,bz1); glVertex3f(bx0,y0,bz0); }
-    if(r1>1e-4f){ glNormal3f(0,1,0);
-      glVertex3f(0,y1,0); glVertex3f(tx0,y1,tz0); glVertex3f(tx1,y1,tz1); }
-  }
-  glEnd();
-  if(pc==2)glEndList();
-}
+/* (the old faceted tapered-cylinder primitive is gone: every figure body part
+ * that used it is now a blend-shell round cone — see the SDF blend-shell
+ * section below) */
 /* one ellipsoid position (normal is emitted per patch, not per vertex) */
 static void spos(float rx,float ry,float rz,float ph,float th){
   glVertex3f(rx*cosf(ph)*cosf(th), ry*sinf(ph), rz*cosf(ph)*sinf(th));
@@ -1833,7 +2086,9 @@ static void put(const float*M,float bx,float by,float bz,float ax,float ay,float
 static void limb_seg(const float*L,float jx,float jy,float jz,float cdrop,
                      float r0,float r1,float h,int seg,float edrop,
                      float*nx,float*ny,float*nz){
-  put(L,jx,jy,jz,0,cdrop,0); cyl_sh(r0,r1,h,seg);
+  (void)seg;                        /* tessellation now lives in the template */
+  float c[3]; m3v(L,0,cdrop,0,c);
+  shell_cyl(L,jx+c[0],jy+c[1],jz+c[2],r0,r1,h);
   float e[3]; m3v(L,0,edrop,0,e); *nx=jx+e[0]; *ny=jy+e[1]; *nz=jz+e[2];
 }
 /* orthonormal basis (col-major) whose local -Y axis points along (dx,dy,dz):
@@ -1918,11 +2173,15 @@ static void draw_boss(Enemy*e){
   float sr=0.18f+0.10f*ph + dr*0.10f;
   float sg=0.06f           + dg*0.08f;
   float sb=0.22f-0.06f*ph  + db*0.10f;
+  float hide[3]={sr+fl,sg+fl*0.6f,sb+fl*0.7f};
   glUniform1f(uBump,0); glUniform1f(uGloss,0.5f);
-  glUniform1f(uEmis,0.10f+fl+0.05f*ph);
-  glUniform3f(uTint,sr+fl,sg+fl*0.6f,sb+fl*0.7f);
+  fig_emis(0.10f+fl+0.05f*ph);
+  fig_tint(hide[0],hide[1],hide[2]);
   glUniform1f(uRim,1.0f+0.4f*ph);
   glUniform3f(uRimCol, 0.85f+0.65f*ph, 0.22f, 1.15f-0.45f*ph);
+  /* body = blend-shell (one draw call); feet/claws/vents/brow/eyes hard-cut */
+  shell_begin(0.15f, 0.5f, 1.0f+0.4f*ph,
+              0.85f+0.65f*ph, 0.22f, 1.15f-0.45f*ph);
   float breath=1.0f+0.03f*sinf(wtime*2.2f+e->bphase);
 
   /* legs: two heavy two-bone limbs. A hip swing + knee bend drive a stride that
@@ -1938,22 +2197,41 @@ static void draw_boss(Enemy*e){
     float hx=e->x+hip[0], hy=by+1.65f-0.30f*crouch, hz=e->z+hip[2];
     float UL[9],RX[9],RZ[9],S[9];
     m3rotX(RX, sw+tuck); m3rotZ(RZ, li*0.14f); m3mul(S,RX,RZ); m3mul(UL,M,S);
+    fig_tint(hide[0],hide[1],hide[2]);
     float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.46f, 0.30f,0.24f,0.95f,8, -0.92f, &kx,&ky,&kz);
-    set_uM(UL,kx,ky,kz); sphere_sh(0.24f,0.24f,0.24f,8,5);
+    shell_sph(kx,ky,kz,0.24f);
     float LL[9],RK[9]; m3rotX(RK, sw+kb+tuck*0.9f); m3mul(S,RK,RZ); m3mul(LL,M,S);
+    fig_tint(hide[0]*0.85f,hide[1]*0.85f,hide[2]*0.85f);  /* darker shank */
     float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.42f, 0.22f,0.15f,0.86f,8, -0.84f, &ax,&ay,&az);
-    put(LL,ax,ay,az,0,-0.04f,-0.22f); wedge_sh(0.34f,0.18f,0.55f);
+    /* foot pad joins the shell: heel->toe round cone in the shank basis; at
+     * k=0.15 it fuses with the shank into a digitigrade hoof */
+    { float fa[3],fb[3]; m3v(LL,0,-0.01f,0.06f,fa); m3v(LL,0,-0.05f,-0.42f,fb);
+      shell_capsule(ax+fa[0],ay+fa[1],az+fa[2], ax+fb[0],ay+fb[1],az+fb[2],0.130f,0.095f); }
   }
-  /* thorax: barrel waist swelling into a bulbous chest */
-  float Tt[9]; memcpy(Tt,M,36); m3scl(Tt,breath,1.0f,breath*0.85f);
-  set_uM(Tt,e->x,by+2.05f,e->z); cyl_sh(0.55f,0.72f,1.15f,10);
-  set_uM(Tt,e->x,by+3.05f,e->z); sphere_sh(0.80f,0.72f,0.66f,10,7);
+  /* thorax: barrel waist swelling into a bulbous chest. The old non-uniform
+   * scaled cylinder/ellipsoid become a squat round cone + two crossed capsules
+   * (X-axis + vertical); their blend keeps the bulbous silhouette and the
+   * breath swell rides the radii. */
+  fig_tint(hide[0]*1.08f,hide[1]*1.08f,hide[2]*1.08f);
+  { float a[3],b[3];
+    /* waist: one long rising round cone whose top cap reaches into the chest
+     * bulb, so waist->chest blends as a single massive barrel (no pinch) */
+    m3v(M,0,-0.10f,0,a); m3v(M,0,0.70f,0,b);
+    shell_capsule(e->x+a[0],by+2.05f+a[1],e->z+a[2],
+                  e->x+b[0],by+2.05f+b[1],e->z+b[2],0.48f*breath,0.68f*breath);
+    m3v(M,-0.22f*breath,0,0,a); m3v(M,0.22f*breath,0,0,b);
+    shell_capsule(e->x+a[0],by+3.05f+a[1],e->z+a[2],
+                  e->x+b[0],by+3.05f+b[1],e->z+b[2],0.58f*breath,0.58f*breath);
+    m3v(M,0,-0.20f,0,a); m3v(M,0,0.14f,0,b);
+    shell_capsule(e->x+a[0],by+3.05f+a[1],e->z+a[2],
+                  e->x+b[0],by+3.05f+b[1],e->z+b[2],0.60f*breath,0.60f*breath);
+  }
   /* spine vents: a faint emissive ridge that brightens with phase */
   glUniform1f(uEmis,0.5f+0.5f*ph);
   glUniform3f(uTint,0.6f+0.5f*ph,0.9f-0.3f*ph,0.4f);
   for(int sgi=0;sgi<3;sgi++){ put(M,e->x,by+2.5f+sgi*0.45f,e->z,0,0,0.45f); box_sh(0.05f,0.12f,0.08f); }
-  glUniform1f(uEmis,0.10f+fl+0.05f*ph);
-  glUniform3f(uTint,sr+fl,sg+fl*0.6f,sb+fl*0.7f);
+  fig_emis(0.10f+fl+0.05f*ph);
+  fig_tint(hide[0],hide[1],hide[2]);
 
   /* arms: hang down-and-forward with only a slight outward splay (kills the
      T-pose), counter-swinging against the stride and never quite still; the
@@ -1972,9 +2250,11 @@ static void draw_boss(Enemy*e){
     m3rotX(RX,up);    m3mul(S,RX,RZ); m3mul(A,M,S);
     float sh[3]; m3v(M,ai*0.82f,0,0,sh);
     float shx=e->x+sh[0], shy=by+3.45f, shz=e->z+sh[2];
+    fig_tint(hide[0],hide[1],hide[2]);
     float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.46f, 0.24f,0.18f,0.95f,8,-0.92f,&ex,&ey,&ez);
-    set_uM(A,ex,ey,ez); sphere_sh(0.20f,0.20f,0.20f,8,5);
+    shell_sph(ex,ey,ez,0.20f);
     m3rotX(RE,up-eb); m3mul(S,RE,RZ); m3mul(F,M,S);
+    fig_tint(hide[0]*0.85f,hide[1]*0.85f,hide[2]*0.85f);  /* darker forearm */
     float wx,wy,wz; limb_seg(F,ex,ey,ez,-0.40f, 0.17f,0.12f,0.85f,8,-0.82f,&wx,&wy,&wz);
     for(int c=-1;c<=1;c++){ put(F,wx,wy,wz, c*0.12f,-0.18f,-0.10f); wedge_sh(0.06f,0.10f,0.46f); }
   }
@@ -1983,17 +2263,36 @@ static void draw_boss(Enemy*e){
      face and eye cluster track together instead of staring level */
   float nod=-0.10f-0.05f*ph+0.07f*sinf(e->anim)*e->moveb+0.30f*crouch;
   float Hh[9],HX[9]; m3rotX(HX,nod); m3mul(Hh,M,HX);
-  set_uM(M,e->x,by+3.78f,e->z); cyl_sh(0.26f,0.40f,0.30f,8);
-  put(Hh,e->x,by+4.15f,e->z,0,0,0); sphere_sh(0.58f,0.46f,0.62f,10,7);
-  put(Hh,e->x,by+4.15f,e->z,0,0.13f,-0.35f); bevbox_sh(0.62f,0.12f,0.30f,0.03f);  /* brow */
+  fig_tint(hide[0],hide[1],hide[2]);
+  /* thick neck column: fat capsule bridging chest top and skull underside so
+   * the head sits hunched INTO the shoulders like the legacy build */
+  { float a[3],b[3]; m3v(M,0,-0.12f,0,a); m3v(M,0,0.08f,0,b);
+    shell_capsule(e->x+a[0],by+3.78f+a[1],e->z+a[2],
+                  e->x+b[0],by+3.78f+b[1],e->z+b[2],0.30f,0.40f); }
+  /* wide skull ellipsoid as two crossed capsules in the head-look basis */
+  fig_tint(hide[0]*1.12f,hide[1]*1.12f,hide[2]*1.12f);
+  { float a[3],b[3];
+    m3v(Hh,0,0,-0.16f,a); m3v(Hh,0,0,0.16f,b);
+    shell_capsule(e->x+a[0],by+4.15f+a[1],e->z+a[2],
+                  e->x+b[0],by+4.15f+b[1],e->z+b[2],0.46f,0.46f);
+    m3v(Hh,-0.13f,0,0,a); m3v(Hh,0.13f,0,0,b);
+    shell_capsule(e->x+a[0],by+4.15f+a[1],e->z+a[2],
+                  e->x+b[0],by+4.15f+b[1],e->z+b[2],0.45f,0.45f);
+  }
+  shell_flush();                        /* the whole body, one draw call */
+  fig_tint(hide[0],hide[1],hide[2]);
+  /* brow + eye cluster ride ~0.1 further forward than on the old faceted
+   * ellipsoid: the flat facets used to cut inside the ideal surface and let
+   * these poke through; the smooth shell stays at full radius */
+  put(Hh,e->x,by+4.15f,e->z,0,0.13f,-0.50f); bevbox_sh(0.62f,0.12f,0.30f,0.03f);  /* brow */
   /* eye cluster: emerald -> furnace red across phases, flaring with the roar */
   float glow=1.0f+e->roar*2.0f+0.5f*ph;
   glUniform1f(uEmis,1.0f);
   glUniform3f(uTint,(0.5f+0.9f*ph)*glow,(1.6f-0.6f*ph)*glow,0.35f*glow);
-  float eyx[5]={-0.30f,-0.15f,0.0f,0.15f,0.30f}, eyy[5]={0.04f,0.11f,0.15f,0.11f,0.04f};
-  for(int q=0;q<5;q++){ put(Hh,e->x,by+4.15f,e->z, eyx[q],eyy[q],-0.50f); sphere_sh(0.075f,0.075f,0.05f,7,5); }
+  float eyx[5]={-0.30f,-0.15f,0.0f,0.15f,0.30f}, eyy[5]={-0.01f,0.06f,0.10f,0.06f,-0.01f};
+  for(int q=0;q<5;q++){ put(Hh,e->x,by+4.15f,e->z, eyx[q],eyy[q],-0.58f); sphere_sh(0.075f,0.075f,0.05f,7,5); }
   /* bloom feed (skip the mirror pass) */
-  if(!refl){ int gi=(int)(e-en); float o[3]; m3v(Hh,0,0.12f,-0.5f,o);
+  if(!refl){ int gi=(int)(e-en); float o[3]; m3v(Hh,0,0.12f,-0.62f,o);
     eyeGlow[gi][0]=e->x+o[0]; eyeGlow[gi][1]=by+4.15f+o[1]; eyeGlow[gi][2]=e->z+o[2];
     eyeGlow[gi][3]=0.9f+e->roar+0.5f*ph; }
 
@@ -2032,13 +2331,19 @@ static void draw_agent(Enemy*e,float dim){
     sr=0.95f+0.65f*p; sg=0.10f+0.10f*p; sb=0.06f;
     fl+=0.45f+0.35f*p;
   }
-  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f); glUniform1f(uEmis,(locked?0.80f:0.12f)+fl);
-  glUniform3f(uTint,sr+fl,sg+fl*0.9f,sb+fl*0.8f);
+  float trunk[3]={sr+fl,sg+fl*0.9f,sb+fl*0.8f};
+  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f); fig_emis((locked?0.80f:0.12f)+fl);
+  fig_tint(trunk[0],trunk[1],trunk[2]);
   /* crystalline rim: edge glow shaded by the agent's own Doppler — closing
    * agents flare blue, receding red — so the silhouette carries the mechanic.
    * Lock paints a hot red rim instead. */
   glUniform1f(uRim, locked?1.20f:0.85f);
   glUniform3f(uRimCol, locked?1.40f:dr*0.9f, locked?0.18f:dg*0.9f, locked?0.10f:db*0.9f);
+  /* the body is a blend-shell: every cyl/sphere below records a round cone;
+   * one draw call at shell_flush(). Doppler/lock/flash are already folded into
+   * trunk[], so per-shape colors carry every figure-level effect. */
+  shell_begin(0.06f, 0.6f, locked?1.20f:0.85f,
+              locked?1.40f:dr*0.9f, locked?0.18f:dg*0.9f, locked?0.10f:db*0.9f);
 
   /* legs: swing splits across forward/lateral axes, so strafing reads as
    * side-steps instead of a moonwalk; amplitude blends with moveb */
@@ -2051,26 +2356,48 @@ static void draw_agent(Enemy*e,float dim){
     float UL[9],RX[9],RZ[9],S[9];
     m3rotX(RX,sw*e->fwdb); m3rotZ(RZ,-sw*e->latb*0.7f);
     m3mul(S,RX,RZ); m3mul(UL,M,S);
+    fig_tint(trunk[0],trunk[1],trunk[2]);
     float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.23f, 0.105f,0.082f,0.48f,8, -0.46f, &kx,&ky,&kz);
-    set_uM(M,kx,ky,kz); sphere_sh(0.085f,0.085f,0.085f,8,5);    /* knee cap */
+    shell_sph(kx,ky,kz,0.085f);                                 /* knee cap */
     float LL[9],RK[9]; m3rotX(RK,sw*e->fwdb+kb); m3mul(S,RK,RZ); m3mul(LL,M,S);
+    fig_tint(trunk[0]*0.85f,trunk[1]*0.85f,trunk[2]*0.85f);     /* darker shin */
     float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.22f, 0.078f,0.052f,0.44f,8, -0.42f, &ax,&ay,&az);
-    put(M,ax,ay,az,0,-0.02f,-0.07f); wedge_sh(0.12f,0.065f,0.27f);
+    /* foot pad joins the shell: heel->toe round cone so the ankle blends into
+     * a boot instead of a hard wedge popping against the smooth shin */
+    { float fa[3],fb[3]; m3v(M,0,-0.015f,0.05f,fa); m3v(M,0,-0.035f,-0.16f,fb);
+      shell_capsule(ax+fa[0],ay+fa[1],az+fa[2], ax+fb[0],ay+fb[1],az+fb[2],0.055f,0.042f); }
   }
   /* pelvis + chest: hips wider than the waist, chest flares to the shoulders
    * — the V-taper. Depth-squashed to a slab; idle gets a breathing swell. */
   float br=1.0f+0.018f*sinf(wtime*1.8f+e->phase)*(1.0f-e->moveb);
-  float Mt[9]; memcpy(Mt,M,36); m3scl(Mt,1.0f,1.0f,0.60f);
-  set_uM(Mt,e->x,by+1.02f,e->z); cyl_sh(0.185f,0.165f,0.26f,9);
-  float Mb[9]; memcpy(Mb,Mt,36); m3scl(Mb,br,1.0f,br);
-  set_uM(Mb,e->x,by+1.40f,e->z); cyl_sh(0.175f,0.27f,0.54f,9);
+  float Mt[9]; memcpy(Mt,M,36); m3scl(Mt,1.0f,1.0f,0.60f);    /* tie offset basis */
+  /* pelvis: the old z-squashed slab cylinder as two parallel capsules — their
+   * smooth-min keeps the wide-hip slab silhouette without a scaled SDF */
+  fig_tint(trunk[0],trunk[1],trunk[2]);
+  for(int s2=-1;s2<=1;s2+=2){
+    float a[3],b[3]; m3v(M,s2*0.07f,-0.02f,0,a); m3v(M,s2*0.06f,0.02f,0,b);
+    shell_capsule(e->x+a[0],by+1.02f+a[1],e->z+a[2],
+                  e->x+b[0],by+1.02f+b[1],e->z+b[2],0.115f,0.105f);
+  }
+  /* chest: the V-taper slab as three slanted capsules that spread toward the
+   * shoulders; the blend reads as one flared torso, swelling with breath.
+   * Endpoints inset by the radii so the caps stop at the old shoulder line. */
+  fig_tint(trunk[0]*1.08f,trunk[1]*1.08f,trunk[2]*1.08f);
+  for(int s2=-1;s2<=1;s2++){
+    float a[3],b[3];
+    m3v(M,s2*0.065f*br,-0.17f,0,a); m3v(M,s2*0.115f*br,0.12f,0,b);
+    shell_capsule(e->x+a[0],by+1.40f+a[1],e->z+a[2],
+                  e->x+b[0],by+1.40f+b[1],e->z+b[2],
+                  (s2?0.095f:0.10f)*br,(s2?0.150f:0.155f)*br);
+  }
   /* shoulders: small caps on a wide frame */
-  for(int si=-1;si<=1;si+=2){ put(M,e->x,by+1.40f,e->z,si*0.29f,0.24f,0); sphere_sh(0.085f,0.085f,0.085f,8,5); }
+  for(int si=-1;si<=1;si+=2){ float o[3]; m3v(M,si*0.29f,0.24f,0,o);
+    shell_sph(e->x+o[0],by+1.40f+o[1],e->z+o[2],0.085f); }
   /* tie: a darker sliver down the chest */
   glUniform3f(uTint,0.02f,0.03f,0.025f);
   { float to[3]; m3v(Mt,0,0,-0.22f,to);
     set_uM(M,e->x+to[0],by+1.42f+to[1],e->z+to[2]); bevbox_sh(0.08f,0.42f,0.02f,0.012f); }
-  glUniform3f(uTint,sr+fl,sg+fl*0.9f,sb+fl*0.8f);
+  fig_tint(trunk[0],trunk[1],trunk[2]);
   /* arms: anticipation dip -> eased raise with overshoot -> recoil kick */
   for(int ai=0;ai<2;ai++){
     float t=e->armp, raise;
@@ -2088,23 +2415,37 @@ static void draw_agent(Enemy*e,float dim){
     float A[9],RX[9],RZ[9],S[9];
     m3rotX(RX,-raise+swA*e->fwdb); m3rotZ(RZ,-swA*e->latb*0.5f);
     m3mul(S,RX,RZ); m3mul(A,M,S);
+    fig_tint(trunk[0],trunk[1],trunk[2]);
     float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.072f,0.060f,0.38f,8, -0.37f, &ex,&ey,&ez);
-    set_uM(M,ex,ey,ez); sphere_sh(0.064f,0.064f,0.064f,8,5);   /* elbow cap */
+    shell_sph(ex,ey,ez,0.064f);                            /* elbow cap */
     float F[9],RE[9]; m3rotX(RE,-raise+swA*e->fwdb-eb); m3mul(S,RE,RZ); m3mul(F,M,S);
+    fig_tint(trunk[0]*0.85f,trunk[1]*0.85f,trunk[2]*0.85f); /* darker forearm */
     float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.17f, 0.058f,0.050f,0.36f,8, -0.36f, &hx2,&hy2,&hz2);
     set_uM(F,hx2,hy2,hz2); wedge_sh(0.072f,0.12f,0.060f);  /* cut mitt */
     if(ai&&e->type==0&&raise>0.05f){ /* pistol in the raised hand */
       glUniform3f(uTint,0.03f,0.035f,0.04f);
       put(F,hx2,hy2,hz2,0,-0.10f,-0.14f); box_sh(0.06f,0.09f,0.24f);
-      glUniform3f(uTint,sr+fl,sg+fl*0.9f,sb+fl*0.8f);
+      /* stash the gun-box front face as this agent's shot origin */
+      if(!refl){ int gi=(int)(e-en); float mo[3]; m3v(F,0,-0.10f,-0.27f,mo);
+        agentGun[gi][0]=hx2+mo[0]; agentGun[gi][1]=hy2+mo[1]; agentGun[gi][2]=hz2+mo[2];
+        agentGun[gi][3]=1.0f; }
+      fig_tint(trunk[0],trunk[1],trunk[2]);
     }
   }
   /* defined neck + cut-gem head with hard brow and jaw lines. The head rides a
    * sub-basis (Mh) that adds the smoothed head-look so the skull tracks you. */
-  set_uM(M,e->x,by+1.665f,e->z); cyl_sh(0.055f,0.070f,0.15f,8);
+  fig_tint(trunk[0],trunk[1],trunk[2]);
+  shell_cyl(M,e->x,by+1.665f,e->z,0.055f,0.070f,0.15f);
   float Mh[9],HY[9],HX[9],HL[9];
   m3rotY(HY,-e->headYaw); m3rotX(HX,e->headPitch); m3mul(HL,HY,HX); m3mul(Mh,M,HL);
-  set_uM(Mh,e->x,by+1.85f,e->z); sphere_sh(0.125f,0.16f,0.135f,9,6);
+  /* cut-gem head: the old ellipsoid as a short vertical capsule in the
+   * head-look basis, a shade lighter than the suit */
+  fig_tint(trunk[0]*1.15f,trunk[1]*1.15f,trunk[2]*1.15f);
+  { float a[3],b[3]; m3v(Mh,0,-0.038f,0,a); m3v(Mh,0,0.038f,0,b);
+    shell_capsule(e->x+a[0],by+1.85f+a[1],e->z+a[2],
+                  e->x+b[0],by+1.85f+b[1],e->z+b[2],0.122f,0.122f); }
+  shell_flush();                        /* the whole body, one draw call */
+  fig_tint(trunk[0],trunk[1],trunk[2]);
   put(Mh,e->x,by+1.85f,e->z,0,-0.12f,-0.045f); bevbox_sh(0.16f,0.09f,0.18f,0.022f);
   put(Mh,e->x,by+1.85f,e->z,0,0.075f,-0.075f); bevbox_sh(0.20f,0.035f,0.10f,0.014f);
   /* the eyes: emerald, flaring smoothly through the aim phase */
@@ -2145,7 +2486,7 @@ static void draw_player(void){
    * player_aim() uses (sin(+pyaw),-cos(pyaw)).  Use the negated look yaw for
    * the visible aiming pose so the body/gun point along the laser instead of
    * mirroring away from it. */
-  float poseYaw = combatStance ? -pyaw*PI/180.0f : avYaw;
+  float poseYaw = combatStance ? cmbYaw : avYaw;
   float spd=sqrtf(pvx*pvx+pvz*pvz);
   float run=clampf(spd/5.0f,0,1)*pmoveb;
   float fwdb=0,latb=0;
@@ -2161,9 +2502,12 @@ static void draw_player(void){
 
   glUniform1f(uBump,0);
   glUniform1f(uGloss,0.55f);
-  glUniform1f(uEmis,0.08f);
-  glUniform3f(uTint,0.04f,0.05f,0.045f);
+  fig_emis(0.08f);
+  fig_tint(0.04f,0.05f,0.045f);
   glUniform1f(uRim,0.70f); glUniform3f(uRimCol,0.10f,1.00f,0.42f);  /* emerald crystal edge */
+  /* body = blend-shell (one draw call at shell_flush); weapons, hands/feet,
+   * health spine and face plates stay hard-cut on top */
+  shell_begin(0.055f, 0.55f, 0.70f, 0.10f,1.00f,0.42f);
 
   /* legs. Walking: 2-bone IK with foot-planting — each foot's stride sweeps
    * backward at exactly the locked cadence, so the planted foot stays put on
@@ -2184,11 +2528,14 @@ static void draw_player(void){
     float hx=px+hip[0], hy=pcy+hip[1], hz=pz+hip[2];
     if(rolling){                                   /* old tucked FK curl */
       float UL[9],RX[9]; m3rotX(RX,fwdb); m3mul(UL,M,RX);
+      fig_tint(0.04f,0.05f,0.045f);
       float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.22f, 0.10f,0.076f,0.46f,8, -0.44f, &kx,&ky,&kz);
-      set_uM(M,kx,ky,kz); sphere_sh(0.08f,0.08f,0.08f,8,5);
+      shell_sph(kx,ky,kz,0.08f);
       float LL[9],RK[9]; m3rotX(RK,fwdb+1.5f); m3mul(LL,M,RK);
+      fig_tint(0.034f,0.042f,0.038f);              /* darker shin */
       float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.20f, 0.074f,0.050f,0.42f,8, -0.40f, &ax,&ay,&az);
-      set_uM(LL,ax,ay,az); wedge_sh(0.12f,0.055f,0.24f);
+      { float fa[3],fb[3]; m3v(LL,0,-0.02f,0.05f,fa); m3v(LL,0,-0.03f,-0.15f,fb);
+        shell_capsule(ax+fa[0],ay+fa[1],az+fa[2], ax+fb[0],ay+fb[1],az+fb[2],0.050f,0.038f); }
       continue;
     }
     /* stride phase: antiphase feet, triangle sweep + swing-half lift. The
@@ -2197,7 +2544,10 @@ static void draw_player(void){
     float tri   = ph<PI ? 1.0f-2.0f*ph/PI : -1.0f+2.0f*(ph-PI)/PI;
     float swing = ph<PI ? 0.0f : sinf(ph-PI);
     float strideHalf=0.33f*run;
-    float along=strideHalf*tri, lift=swing*0.14f*run;
+    /* stance half keeps the linear tri sweep (planted foot must move at
+     * constant ground speed or it skates); the swing return is a cosine ease
+     * so foot velocity is zero at BOTH reversals - no more triangle corners */
+    float along=strideHalf*(ph<PI ? tri : -cosf(ph-PI)), lift=swing*0.14f*run;
     float tgx=hx+fdx*along, tgz=hz+fdz*along, tgy=py+0.03f+lift;
     /* keep the target inside the leg's reach so the knee never snaps straight */
     float L1=0.50f,L2=0.46f, maxr=(L1+L2)*0.985f, minr=0.10f;
@@ -2208,26 +2558,42 @@ static void draw_player(void){
     /* upper leg hip->knee, lower leg knee->ankle; each limb_seg reports its end
      * joint, which we reuse for the next joint and the caps (no recomputation) */
     float UB[9]; aim_basis(kx-hx,ky-hy,kz-hz,UB);
+    fig_tint(0.04f,0.05f,0.045f);
     float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.10f,0.076f,L1*1.04f,8, -L1, &jx,&jy,&jz);
-    set_uM(M,jx,jy,jz); sphere_sh(0.08f,0.08f,0.08f,8,5);   /* knee cap at limb end */
+    shell_sph(jx,jy,jz,0.08f);                              /* knee cap at limb end */
     float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
+    fig_tint(0.034f,0.042f,0.038f);                         /* darker shin */
     float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.074f,0.050f,L2*1.04f,8, -L2, &ax,&ay,&az);
-    float FF[9]; m3rotY(FF,poseYaw);                        /* foot flat on the floor */
-    set_uM(FF,ax,py+0.027f,az); wedge_sh(0.12f,0.055f,0.26f);
+    /* boot: heel->toe round cone along the body's true forward, recorded into
+     * the shell so the ankle blends smoothly. Anchored to the ankle (ay), not
+     * pinned to the floor - the swing foot finally lifts with the stride. */
+    shell_capsule(ax-polex*0.06f, ay+0.025f, az-polez*0.06f,
+                  ax+polex*0.17f, ay+0.005f, az+polez*0.17f, 0.055f,0.040f);
   }
 
-  /* pelvis / jacket: same V-taper language as the agents */
-  float Mt[9]; memcpy(Mt,M,36); m3scl(Mt,1.0f,1.0f,0.62f);
-  glUniform3f(uTint,0.03f,0.04f,0.035f);
-  { float o[3];
-    m3v(M,0,0.49f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.175f,0.155f,0.24f,9);
-    m3v(M,0,0.87f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.165f,0.25f,0.50f,9); }
-  glUniform3f(uTint,0.05f,0.06f,0.055f);
-  for(int si=-1;si<=1;si+=2){ put(M,px,pcy,pz,si*0.27f,1.05f*tk,0); sphere_sh(0.08f,0.08f,0.08f,8,5); }
+  /* pelvis / jacket: same V-taper language as the agents — slab cylinders as
+   * parallel/slanted capsule sets, endpoints inset so caps stop at the old
+   * flat ends. All offsets ride the unscaled basis M. */
+  fig_tint(0.03f,0.04f,0.035f);
+  { float a[3],b[3];
+    for(int s2=-1;s2<=1;s2+=2){                         /* pelvis slab */
+      m3v(M,s2*0.065f,0.49f*tk-0.02f,0,a); m3v(M,s2*0.055f,0.49f*tk+0.02f,0,b);
+      shell_capsule(px+a[0],pcy+a[1],pz+a[2], px+b[0],pcy+b[1],pz+b[2],0.11f,0.10f);
+    }
+    fig_tint(0.036f,0.047f,0.042f);                     /* jacket, a shade up */
+    for(int s2=-1;s2<=1;s2++){                          /* V-taper jacket */
+      m3v(M,s2*0.06f,0.87f*tk-0.16f,0,a); m3v(M,s2*0.105f,0.87f*tk+0.11f,0,b);
+      shell_capsule(px+a[0],pcy+a[1],pz+a[2], px+b[0],pcy+b[1],pz+b[2],
+                    s2?0.09f:0.095f, s2?0.14f:0.145f);
+    }
+  }
+  fig_tint(0.05f,0.06f,0.055f);
+  for(int si=-1;si<=1;si+=2){ float o[3]; m3v(M,si*0.27f,1.05f*tk,0,o);
+    shell_sph(px+o[0],pcy+o[1],pz+o[2],0.08f); }
 
   /* shoulders and arms. right arm: pistol raise on fire, katana sweep on
    * swing — wind-up across the left shoulder, cut down and across. */
-  glUniform3f(uTint,0.04f,0.05f,0.045f);
+  fig_tint(0.04f,0.05f,0.045f);
   for(int ai=0;ai<2;ai++){
     float raise, swYaw=0;
     if(ai){
@@ -2255,10 +2621,12 @@ static void draw_player(void){
      * (the avatar's forward).  Negative raise folds it backward over the
      * shoulder, which made the pistol look 180-degrees flipped. */
     m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(A,M,S);
+    fig_tint(0.04f,0.05f,0.045f);
     float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.068f,0.056f,0.36f,8, -0.35f, &ex,&ey,&ez);
-    set_uM(M,ex,ey,ez); sphere_sh(0.060f,0.060f,0.060f,8,5);   /* elbow cap */
+    shell_sph(ex,ey,ez,0.060f);                                /* elbow cap */
     float F[9],RE[9]; m3rotX(RE,raise+sw+0.16f+(ai&&s>0?0.18f+0.18f*sinf(s*PI):0.0f));
     m3mul(S,RY,RE); m3mul(F,M,S);
+    fig_tint(0.034f,0.042f,0.038f);                            /* darker forearm */
     float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.16f, 0.054f,0.046f,0.34f,8, -0.33f, &hx2,&hy2,&hz2);
     set_uM(F,hx2,hy2,hz2); wedge_sh(0.068f,0.110f,0.055f);
     if(ai&&blade){
@@ -2270,8 +2638,8 @@ static void draw_player(void){
       put(B,hx2,hy2,hz2,0,-0.62f,0); box_sh(0.022f,1.05f,0.045f);
       glUniform3f(uTint,0.30f,2.0f,0.9f); glUniform1f(uEmis,1.0f);
       put(B,hx2,hy2,hz2,-0.014f,-0.62f,0); box_sh(0.006f,1.05f,0.03f);
-      glUniform1f(uEmis,0.08f);
-      glUniform3f(uTint,0.04f,0.05f,0.045f);
+      fig_emis(0.08f);
+      fig_tint(0.04f,0.05f,0.045f);
       if(!refl){ float bo[3]; m3v(B,0,-1.14f,0,bo);   /* blade-tip bloom feed */
         bladeGlow[0]=hx2+bo[0]; bladeGlow[1]=hy2+bo[1]; bladeGlow[2]=hz2+bo[2]; bladeGlow[3]=1.0f; }
     } else if(ai&&haspistol){
@@ -2288,8 +2656,14 @@ static void draw_player(void){
        * the hand instead of hanging below the wrist. */
       float go[3],lift[3]; m3v(GP,0,0.145f,0.020f,go); m3v(F,0,0.125f,0,lift);
       pistol_sh(GP,hx2+go[0]+lift[0],hy2+go[1]+lift[1],hz2+go[2]+lift[2],pammo);
-      glUniform1f(uEmis,0.08f);
-      glUniform3f(uTint,0.04f,0.05f,0.045f);
+      /* stash the barrel tip (gun-local (0,-0.01,-0.40), just past the muzzle
+       * block) for the laser/bullet/flash origin. Never from the tucked roll
+       * pose: the event poll runs before the next draw replaces the stash. */
+      if(!refl && !rolling){ float mo[3]; m3v(GP,0,-0.010f,-0.40f,mo);
+        gunGlow[0]=hx2+go[0]+lift[0]+mo[0]; gunGlow[1]=hy2+go[1]+lift[1]+mo[1];
+        gunGlow[2]=hz2+go[2]+lift[2]+mo[2]; gunGlow[3]=1.0f; }
+      fig_emis(0.08f);
+      fig_tint(0.04f,0.05f,0.045f);
     }
   }
 
@@ -2314,9 +2688,13 @@ static void draw_player(void){
   }
 
   /* neck / head */
-  glUniform3f(uTint,0.06f,0.07f,0.065f);
-  put(M,px,pcy,pz,0,1.10f*tk,0); cyl_sh(0.052f,0.062f,0.13f,8);
-  put(M,px,pcy,pz,0,1.29f*tk,0); sphere_sh(0.125f,0.155f,0.135f,9,6);
+  fig_tint(0.06f,0.07f,0.065f);
+  { float o[3],a[3],b[3];
+    m3v(M,0,1.10f*tk,0,o);
+    shell_cyl(M,px+o[0],pcy+o[1],pz+o[2],0.052f,0.062f,0.13f);
+    m3v(M,0,1.29f*tk-0.035f,0,a); m3v(M,0,1.29f*tk+0.035f,0,b);
+    shell_capsule(px+a[0],pcy+a[1],pz+a[2], px+b[0],pcy+b[1],pz+b[2],0.12f,0.12f); }
+  shell_flush();                        /* the whole body, one draw call */
   /* sharp collar plus distinct angular shades — no mouth/smile geometry */
   glUniform3f(uTint,0.02f,0.02f,0.02f);
   put(M,px,pcy,pz,0,1.18f*tk,0.015f); bevbox_sh(0.19f,0.040f,0.12f,0.018f);
@@ -2535,8 +2913,8 @@ static void draw_world(float camx,float camy,float camz){
   glUniform1f(uTime,wtime); glUniform1f(uRain,0); glUniform1f(uAlpha,1);
   glUniform3f(uFog,L->fog[0],L->fog[1],L->fog[2]);
   glUniform1f(uRim,0);   /* figures opt into the rim; world stays matte */
-  for(int i=0;i<nen;i++)eyeGlow[i][3]=0;  /* cleared; figures re-stash this frame */
-  bladeGlow[3]=0;
+  for(int i=0;i<nen;i++){ eyeGlow[i][3]=0; agentGun[i][3]=0; }  /* cleared; figures re-stash this frame */
+  bladeGlow[3]=0; gunGlow[3]=0;
 
   /* pick 8 nearest lights (static + temp) */
   float lp[SHLIGHTS*4], lc[SHLIGHTS*3]; int ln=0;
@@ -2558,6 +2936,7 @@ static void draw_world(float camx,float camy,float camz){
   glUniform1i(uNL,ln);
   glUniform4fv(uLpos,SHLIGHTS,lp);
   glUniform3fv(uLcol,SHLIGHTS,lc);
+  shell_frame(lp,lc,ln,camx,camy,camz,L->fog);
 
   glEnableClientState(GL_VERTEX_ARRAY);
   glEnableClientState(GL_NORMAL_ARRAY);
@@ -2943,6 +3322,7 @@ int main(int argc,char**argv){
   t0=SDL_GetTicks(); reset_game();
   printf("[dilation] world carved in %ums (%d quads)\n",SDL_GetTicks()-t0,(bn[0]+bn[1]+bn[2])/32);
   init_shaders();
+  shell_init();
   printf("[dilation] shaders up\n");
 
   music_init();   /* parse the note-string melodies into step arrays */
@@ -3142,7 +3522,25 @@ int main(int argc,char**argv){
       }
       if(frame>=138&&frame<146)ppitch=4;
       if(frame==144)shot_ppm("shot_dodge.ppm");
-      if(frame>=150){ printf("[dilation] SMOKE OK\n"); running=0; }
+      /* BOSS: stage the OVERLORD down the corridor and frame its bulk — the
+       * one figure type the earlier shots never cover. Appended strictly after
+       * all prior shots so their frand() order and bytes stay untouched. */
+      if(frame==146){
+        float yr=smkYaw*PI/180;
+        float ex=px+sinf(yr)*9.0f, ez=pz-cosf(yr)*9.0f;
+        nen=nalive=1; memset(&en[0],0,sizeof en[0]);
+        en[0].type=2; en[0].hp=60;
+        en[0].x=en[0].lx=ex; en[0].z=en[0].lz=ez; en[0].y=ground_h(ex,ez,py);
+        en[0].yaw=atan2f(px-ex,-(pz-ez))+PI;      /* squared up to the player */
+        en[0].state=0; en[0].atkCD=2.2f; en[0].jumpCD=4.5f;
+      }
+      if(frame>=146&&frame<160){                  /* look up at the figure */
+        float dx=en[0].x-px, dz=en[0].z-pz, d=sqrtf(dx*dx+dz*dz);
+        pyaw=atan2f(dx,-dz)*180/PI;
+        ppitch=-atan2f(2.2f,d)*180/PI;
+      }
+      if(frame==156)shot_ppm("shot_boss.ppm");
+      if(frame>=162){ printf("[dilation] SMOKE OK\n"); running=0; }
     }
 
     if(gstate==ST_TITLE){ titleYaw+=dt*7; pyaw=titleYaw; ppitch=4;
@@ -3183,6 +3581,11 @@ int main(int argc,char**argv){
       /* the avatar's facing eases toward the roll direction and back —
        * no yaw snap entering or leaving a sideways roll */
       avYaw=angto(avYaw, rollT>0? atan2f(rollDX,-rollDZ) : pyaw*PI/180.0f, dt*14.0f);
+      /* combat pose yaw eases toward the look yaw instead of snapping with the
+       * mouse; runs during rolls too so roll-exit resumes already converged.
+       * The gun-tip muzzle stash keeps the laser glued to the gun through the
+       * lag, so this is purely cosmetic. */
+      cmbYaw=angto(cmbYaw, -pyaw*PI/180.0f, dt*17.0f);
 
       pvy-=18.0f*dt;
       py += pvy*dt;
