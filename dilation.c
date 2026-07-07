@@ -1219,10 +1219,17 @@ static float rollT,rollCD,rollDX,rollDZ;    /* dodge roll: timer + direction  */
 static float kvx,kvz;                       /* wall-kick horizontal impulse   */
 static float pmoveb;                        /* idle<->run blend for the avatar*/
 static float avYaw;                         /* smoothed avatar facing (rad)   */
+static float cmbYaw;                        /* smoothed combat pose yaw (rad, negated convention) */
 static float camDist=3.05f,camYs=-1.0f;     /* smoothed camera boom + height  */
 static float coyT;                          /* coyote time: late edge jumps   */
 static float hurtCD;                        /* post-hit mercy window          */
 static float mzT,mzX,mzY,mzZ;               /* avatar muzzle flash            */
+/* pose-fed muzzle anchors: the figure draws stash the ACTUAL barrel-tip world
+ * position each upright frame (bladeGlow idiom); the laser/bullets/flash read
+ * it so the beam grows out of the drawn gun instead of a fixed shoulder
+ * offset. valid==0 falls back to the old rigid math (roll, katana, culled). */
+static float gunGlow[4];                    /* player pistol tip: x,y,z,valid */
+static float agentGun[MAXENEMY][4];         /* enemy pistol tips: x,y,z,valid */
 
 static float player_height(void){ return rollT>0 ? 0.85f : 1.72f; }
 static float player_camh(void){ return py + (rollT>0 ? 1.45f : 1.92f); }
@@ -1237,6 +1244,8 @@ static void reset_game(void){
   gen_level(curlevel,gseed);
   px=startx; pz=startz; pyaw=startyaw; ppitch=0; pvx=pvz=pvy=0;
   avYaw=startyaw*PI/180.0f;
+  cmbYaw=-startyaw*PI/180.0f;   /* combat pose yaw uses the negated convention */
+  gunGlow[3]=0; memset(agentGun,0,sizeof agentGun);
   py=hgt[(int)(startz/CELL)][(int)(startx/CELL)];
   php=100; pammo=6; haspistol=1; jumps=1;
   tscale=1; actT=0; mouseAcc=0;
@@ -1396,9 +1405,12 @@ static void player_aim(float*dx,float*dy,float*dz){
  * avatar's right-hand pistol so the laser/rounds read as coming from the gun,
  * while direction remains fully controlled by the player's look yaw/pitch. */
 static void player_muzzle(float*ox,float*oy,float*oz){
-  /* Keep the ballistic/laser origin near the authored right hand.  The visible
-   * pistol is attached to the hand transform in draw_player(); this fixed
-   * shoulder-space offset avoids the previous free-floating aim-basis gun. */
+  /* Preferred origin: the ACTUAL barrel tip stashed by draw_player last frame
+   * (1-frame pose latency, invisible). The beam, lock test, bullets, flash and
+   * temp light all route through here, so they stay glued to the drawn gun. */
+  if(gunGlow[3]>0){ *ox=gunGlow[0]; *oy=gunGlow[1]; *oz=gunGlow[2]; return; }
+  /* Fallback (roll, katana swing, first frame, post-reset): the old fixed
+   * shoulder-space offset near the authored right hand. */
   float yr=avYaw;
   float fx=sinf(yr), fz=-cosf(yr), rx=cosf(yr), rz=sinf(yr);
   float crouch=rollT>0?0.46f:1.0f;
@@ -1773,6 +1785,10 @@ static void update_enemies(float wdt){
            * roll under it, jump over it, or stand still and study it */
           float my=e->y+1.36f, aimY=py+1.28f;
           float hx=e->x+sinf(e->yaw)*0.45f, hz=e->z-cosf(e->yaw)*0.45f;
+          /* fire from the drawn pistol tip when the agent was rendered last
+           * frame; distance-culled shooters keep the chest-forward fallback */
+          { int gi=(int)(e-en);
+            if(agentGun[gi][3]>0){ hx=agentGun[gi][0]; my=agentGun[gi][1]; hz=agentGun[gi][2]; } }
           for(int k=-1;k<=1;k++){
             float sp=k*0.14f+(frand()-0.5f)*0.03f;
             float bdx=dx+(-dz)*sp, bdz=dz+dx*sp;
@@ -2187,7 +2203,10 @@ static void draw_boss(Enemy*e){
     float LL[9],RK[9]; m3rotX(RK, sw+kb+tuck*0.9f); m3mul(S,RK,RZ); m3mul(LL,M,S);
     fig_tint(hide[0]*0.85f,hide[1]*0.85f,hide[2]*0.85f);  /* darker shank */
     float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.42f, 0.22f,0.15f,0.86f,8, -0.84f, &ax,&ay,&az);
-    put(LL,ax,ay,az,0,-0.04f,-0.22f); wedge_sh(0.34f,0.18f,0.55f);
+    /* foot pad joins the shell: heel->toe round cone in the shank basis; at
+     * k=0.15 it fuses with the shank into a digitigrade hoof */
+    { float fa[3],fb[3]; m3v(LL,0,-0.01f,0.06f,fa); m3v(LL,0,-0.05f,-0.42f,fb);
+      shell_capsule(ax+fa[0],ay+fa[1],az+fa[2], ax+fb[0],ay+fb[1],az+fb[2],0.130f,0.095f); }
   }
   /* thorax: barrel waist swelling into a bulbous chest. The old non-uniform
    * scaled cylinder/ellipsoid become a squat round cone + two crossed capsules
@@ -2343,7 +2362,10 @@ static void draw_agent(Enemy*e,float dim){
     float LL[9],RK[9]; m3rotX(RK,sw*e->fwdb+kb); m3mul(S,RK,RZ); m3mul(LL,M,S);
     fig_tint(trunk[0]*0.85f,trunk[1]*0.85f,trunk[2]*0.85f);     /* darker shin */
     float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.22f, 0.078f,0.052f,0.44f,8, -0.42f, &ax,&ay,&az);
-    put(M,ax,ay,az,0,-0.02f,-0.07f); wedge_sh(0.12f,0.065f,0.27f);
+    /* foot pad joins the shell: heel->toe round cone so the ankle blends into
+     * a boot instead of a hard wedge popping against the smooth shin */
+    { float fa[3],fb[3]; m3v(M,0,-0.015f,0.05f,fa); m3v(M,0,-0.035f,-0.16f,fb);
+      shell_capsule(ax+fa[0],ay+fa[1],az+fa[2], ax+fb[0],ay+fb[1],az+fb[2],0.055f,0.042f); }
   }
   /* pelvis + chest: hips wider than the waist, chest flares to the shoulders
    * — the V-taper. Depth-squashed to a slab; idle gets a breathing swell. */
@@ -2403,6 +2425,10 @@ static void draw_agent(Enemy*e,float dim){
     if(ai&&e->type==0&&raise>0.05f){ /* pistol in the raised hand */
       glUniform3f(uTint,0.03f,0.035f,0.04f);
       put(F,hx2,hy2,hz2,0,-0.10f,-0.14f); box_sh(0.06f,0.09f,0.24f);
+      /* stash the gun-box front face as this agent's shot origin */
+      if(!refl){ int gi=(int)(e-en); float mo[3]; m3v(F,0,-0.10f,-0.27f,mo);
+        agentGun[gi][0]=hx2+mo[0]; agentGun[gi][1]=hy2+mo[1]; agentGun[gi][2]=hz2+mo[2];
+        agentGun[gi][3]=1.0f; }
       fig_tint(trunk[0],trunk[1],trunk[2]);
     }
   }
@@ -2460,7 +2486,7 @@ static void draw_player(void){
    * player_aim() uses (sin(+pyaw),-cos(pyaw)).  Use the negated look yaw for
    * the visible aiming pose so the body/gun point along the laser instead of
    * mirroring away from it. */
-  float poseYaw = combatStance ? -pyaw*PI/180.0f : avYaw;
+  float poseYaw = combatStance ? cmbYaw : avYaw;
   float spd=sqrtf(pvx*pvx+pvz*pvz);
   float run=clampf(spd/5.0f,0,1)*pmoveb;
   float fwdb=0,latb=0;
@@ -2508,7 +2534,8 @@ static void draw_player(void){
       float LL[9],RK[9]; m3rotX(RK,fwdb+1.5f); m3mul(LL,M,RK);
       fig_tint(0.034f,0.042f,0.038f);              /* darker shin */
       float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.20f, 0.074f,0.050f,0.42f,8, -0.40f, &ax,&ay,&az);
-      set_uM(LL,ax,ay,az); wedge_sh(0.12f,0.055f,0.24f);
+      { float fa[3],fb[3]; m3v(LL,0,-0.02f,0.05f,fa); m3v(LL,0,-0.03f,-0.15f,fb);
+        shell_capsule(ax+fa[0],ay+fa[1],az+fa[2], ax+fb[0],ay+fb[1],az+fb[2],0.050f,0.038f); }
       continue;
     }
     /* stride phase: antiphase feet, triangle sweep + swing-half lift. The
@@ -2517,7 +2544,10 @@ static void draw_player(void){
     float tri   = ph<PI ? 1.0f-2.0f*ph/PI : -1.0f+2.0f*(ph-PI)/PI;
     float swing = ph<PI ? 0.0f : sinf(ph-PI);
     float strideHalf=0.33f*run;
-    float along=strideHalf*tri, lift=swing*0.14f*run;
+    /* stance half keeps the linear tri sweep (planted foot must move at
+     * constant ground speed or it skates); the swing return is a cosine ease
+     * so foot velocity is zero at BOTH reversals - no more triangle corners */
+    float along=strideHalf*(ph<PI ? tri : -cosf(ph-PI)), lift=swing*0.14f*run;
     float tgx=hx+fdx*along, tgz=hz+fdz*along, tgy=py+0.03f+lift;
     /* keep the target inside the leg's reach so the knee never snaps straight */
     float L1=0.50f,L2=0.46f, maxr=(L1+L2)*0.985f, minr=0.10f;
@@ -2534,8 +2564,11 @@ static void draw_player(void){
     float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
     fig_tint(0.034f,0.042f,0.038f);                         /* darker shin */
     float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.074f,0.050f,L2*1.04f,8, -L2, &ax,&ay,&az);
-    float FF[9]; m3rotY(FF,poseYaw);                        /* foot flat on the floor */
-    set_uM(FF,ax,py+0.027f,az); wedge_sh(0.12f,0.055f,0.26f);
+    /* boot: heel->toe round cone along the body's true forward, recorded into
+     * the shell so the ankle blends smoothly. Anchored to the ankle (ay), not
+     * pinned to the floor - the swing foot finally lifts with the stride. */
+    shell_capsule(ax-polex*0.06f, ay+0.025f, az-polez*0.06f,
+                  ax+polex*0.17f, ay+0.005f, az+polez*0.17f, 0.055f,0.040f);
   }
 
   /* pelvis / jacket: same V-taper language as the agents — slab cylinders as
@@ -2623,6 +2656,12 @@ static void draw_player(void){
        * the hand instead of hanging below the wrist. */
       float go[3],lift[3]; m3v(GP,0,0.145f,0.020f,go); m3v(F,0,0.125f,0,lift);
       pistol_sh(GP,hx2+go[0]+lift[0],hy2+go[1]+lift[1],hz2+go[2]+lift[2],pammo);
+      /* stash the barrel tip (gun-local (0,-0.01,-0.40), just past the muzzle
+       * block) for the laser/bullet/flash origin. Never from the tucked roll
+       * pose: the event poll runs before the next draw replaces the stash. */
+      if(!refl && !rolling){ float mo[3]; m3v(GP,0,-0.010f,-0.40f,mo);
+        gunGlow[0]=hx2+go[0]+lift[0]+mo[0]; gunGlow[1]=hy2+go[1]+lift[1]+mo[1];
+        gunGlow[2]=hz2+go[2]+lift[2]+mo[2]; gunGlow[3]=1.0f; }
       fig_emis(0.08f);
       fig_tint(0.04f,0.05f,0.045f);
     }
@@ -2874,8 +2913,8 @@ static void draw_world(float camx,float camy,float camz){
   glUniform1f(uTime,wtime); glUniform1f(uRain,0); glUniform1f(uAlpha,1);
   glUniform3f(uFog,L->fog[0],L->fog[1],L->fog[2]);
   glUniform1f(uRim,0);   /* figures opt into the rim; world stays matte */
-  for(int i=0;i<nen;i++)eyeGlow[i][3]=0;  /* cleared; figures re-stash this frame */
-  bladeGlow[3]=0;
+  for(int i=0;i<nen;i++){ eyeGlow[i][3]=0; agentGun[i][3]=0; }  /* cleared; figures re-stash this frame */
+  bladeGlow[3]=0; gunGlow[3]=0;
 
   /* pick 8 nearest lights (static + temp) */
   float lp[SHLIGHTS*4], lc[SHLIGHTS*3]; int ln=0;
@@ -3542,6 +3581,11 @@ int main(int argc,char**argv){
       /* the avatar's facing eases toward the roll direction and back —
        * no yaw snap entering or leaving a sideways roll */
       avYaw=angto(avYaw, rollT>0? atan2f(rollDX,-rollDZ) : pyaw*PI/180.0f, dt*14.0f);
+      /* combat pose yaw eases toward the look yaw instead of snapping with the
+       * mouse; runs during rolls too so roll-exit resumes already converged.
+       * The gun-tip muzzle stash keeps the laser glued to the gun through the
+       * lag, so this is purely cosmetic. */
+      cmbYaw=angto(cmbYaw, -pyaw*PI/180.0f, dt*17.0f);
 
       pvy-=18.0f*dt;
       py += pvy*dt;
