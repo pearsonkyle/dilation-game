@@ -497,10 +497,20 @@ static void raise(int x,int y,int w,int h,float ht){
   for(int j=y;j<y+h;j++)for(int i=x;i<x+w;i++)
     if(i>=0&&j>=0&&i<G&&j<G){ grid[j][i]=0; hgt[j][i]=ht; }
 }
+/* nudge a point out of solid geometry to the nearest open cell's centre —
+ * TERMINAL's random monoliths could otherwise swallow a light orb or an item */
+static void free_spot(float*x,float*z){
+  int cx=(int)floorf(*x/CELL), cz=(int)floorf(*z/CELL);
+  if(!solid(cx,cz))return;
+  for(int r=1;r<4;r++)for(int dz=-r;dz<=r;dz++)for(int dx=-r;dx<=r;dx++)
+    if(!solid(cx+dx,cz+dz)){ *x=(cx+dx+0.5f)*CELL; *z=(cz+dz+0.5f)*CELL; return; }
+}
 static void add_light(float x,float y,float z,float r,float cr,float cg,float cb){
+  free_spot(&x,&z);
   if(nlights<MAXLIGHT){ Light*l=&lights[nlights++]; l->x=x;l->y=y;l->z=z;l->r=r;l->cr=cr;l->cg=cg;l->cb=cb; }
 }
 static void add_item_r(float x,float z,int type,int amt,float respawn){
+  free_spot(&x,&z);
   /* recycle a spent pickup slot — but never a timed cache that is only waiting
    * out its re-arm, or an agent drop would quietly delete an OVERLORD perch */
   for(int i=0;i<nitems;i++) if(items[i].taken&&items[i].respawn<=0){
@@ -556,15 +566,16 @@ static void gen_level(int li,unsigned seedmix){
       for(int j=12;j<38;j+=4){ fill(14,j,1,1); fill(29,j,1,1); } /* colonnades */
       raise(19,18,6,1,1.0f); raise(19,26,6,1,1.0f);              /* desks      */
       for(int j=13;j<38;j+=7){
-        add_light(14.5f*CELL,3.6f,(j+0.5f)*CELL,8.5f, 0.85f,0.95f,0.80f);
-        add_light(29.5f*CELL,3.6f,(j+0.5f)*CELL,8.5f, 0.85f,0.95f,0.80f);
+        int lj=j+(j%4==0?1:0);   /* colonnade pillars sit on rows j%4==0 */
+        add_light(14.5f*CELL,3.6f,(lj+0.5f)*CELL,8.5f, 0.85f,0.95f,0.80f);
+        add_light(29.5f*CELL,3.6f,(lj+0.5f)*CELL,8.5f, 0.85f,0.95f,0.80f);
       }
       add_light(22*CELL,4.6f,20*CELL,16.0f, 0.30f,1.30f,0.65f);  /* atrium core */
       add_light(22*CELL,3.2f, 6*CELL,11.0f, 0.60f,1.00f,0.78f);  /* mezzanine   */
       startx=22*CELL; startz=38.0f*CELL; startyaw=0;
-      add_item(22*CELL, 6*CELL,1,6);              /* ammo cache up top */
-      add_item( 7*CELL,30*CELL,0,35);
-      add_item(37*CELL,20*CELL,1,4);
+      add_item(22.5f*CELL, 6.5f*CELL,1,6);              /* ammo cache up top */
+      add_item( 7.5f*CELL,30.5f*CELL,0,35);
+      add_item(37.5f*CELL,20.5f*CELL,1,4);
       ax0=5; az0=10; ax1=39; az1=34;
     } break;
     case 1:{ /* SUBWAY: raised platforms over a track trench, a parked train
@@ -583,10 +594,10 @@ static void gen_level(int li,unsigned seedmix){
       for(int i=9;i<39;i+=9)
         add_light((i+0.5f)*CELL,3.3f,22.0f*CELL,9.5f, 0.25f,0.95f,1.05f);
       startx=5.5f*CELL; startz=13.5f*CELL; startyaw=90;
-      add_item(18*CELL,22*CELL,1,6);              /* ammo on a train roof */
-      add_item(37*CELL,30*CELL,0,35);
-      add_item(22*CELL,18*CELL,0,35);
-      add_item(28*CELL,22*CELL,1,4);
+      add_item(18.5f*CELL,22.5f*CELL,1,6);              /* ammo on a train roof */
+      add_item(37.5f*CELL,30.5f*CELL,0,35);
+      add_item(22.5f*CELL,18.5f*CELL,0,35);
+      add_item(28.5f*CELL,22.5f*CELL,1,4);
       ax0=8; az0=12; ax1=39; az1=31;
     } break;
     case 3:{ /* OVERLORD: a black amphitheatre. wide open floor so the spiral
@@ -650,10 +661,10 @@ static void gen_level(int li,unsigned seedmix){
       add_light(22*CELL,4.8f,22*CELL,15.0f, 0.25f,1.10f,1.20f);
       add_light(35*CELL,4.4f, 8*CELL, 9.0f, 0.45f,1.05f,0.95f); /* terrace */
       startx=22*CELL; startz=37.0f*CELL; startyaw=0;
-      add_item(35*CELL, 7*CELL,1,8);              /* the terrace reward */
-      add_item(10*CELL,10*CELL,0,35);
-      add_item( 8*CELL,30*CELL,1,4);
-      add_item(30*CELL,34*CELL,0,35);
+      add_item(35.5f*CELL, 7.5f*CELL,1,8);              /* the terrace reward */
+      add_item(10.5f*CELL,10.5f*CELL,0,35);
+      add_item( 8.5f*CELL,30.5f*CELL,1,4);
+      add_item(30.5f*CELL,34.5f*CELL,0,35);
       ax0=7; az0=7; ax1=38; az1=33;
     } break;
   }
@@ -1429,17 +1440,21 @@ static void spawn_parts(int n,float x,float y,float z,float spd,float cr,float c
     p->cr=cr;p->cg=cg;p->cb=cb;
   }
 }
-static void spawn_shards(float x,float y,float z,float vr){
-  /* an agent comes apart: 16 glowing facets, tinted by its final Doppler */
-  for(int i=0;i<16;i++){
+static void spawn_shards(float x,float y,float z,float vr,float scale){
+  /* a figure comes apart: glowing facets, tinted by its final Doppler.
+   * scale grows count, spread, size and speed together — 1.0 for an agent
+   * (bit-identical to the unscaled path), ~2.6 for the 4.5u OVERLORD, whose
+   * death used to reuse the mook burst: 16 tiny chips in a 0.4u box. */
+  int n=(int)(16*scale); if(n>96)n=96;
+  for(int i=0;i<n;i++){
     Shard*s=&shards[shHead]; shHead=(shHead+1)%MAXSHARD;
     float a=frand()*2*PI, b=(frand()-0.4f)*PI*0.5f;
-    float sp=1.5f+frand()*3.5f;
-    s->x=x+(frand()-0.5f)*0.4f; s->y=y+0.3f+frand()*1.5f; s->z=z+(frand()-0.5f)*0.4f;
+    float sp=(1.5f+frand()*3.5f)*(0.7f+0.3f*scale);
+    s->x=x+(frand()-0.5f)*0.4f*scale; s->y=y+(0.3f+frand()*1.5f)*scale; s->z=z+(frand()-0.5f)*0.4f*scale;
     s->vx=cosf(a)*cosf(b)*sp; s->vy=sinf(b)*sp+2.0f; s->vz=sinf(a)*cosf(b)*sp;
     s->yaw=frand()*2*PI; s->pit=frand()*2*PI;
     s->wy=(frand()-0.5f)*14; s->wp=(frand()-0.5f)*14;
-    s->sx=0.06f+frand()*0.16f; s->sy=0.06f+frand()*0.22f; s->sz=0.02f+frand()*0.05f;
+    s->sx=(0.06f+frand()*0.16f)*scale; s->sy=(0.06f+frand()*0.22f)*scale; s->sz=(0.02f+frand()*0.05f)*scale;
     s->life=s->max=1.1f+frand()*0.7f;
     /* doppler-tinted emissive: vr<0 was closing on you when it died */
     float k=clampf(vr/8.0f,-1,1);
@@ -1619,11 +1634,14 @@ static void shatter_enemy(Enemy*e){
   if(e->state==4)return;
   e->state=4; nalive--;
   float vr=radial_v(e->x,e->z,e->vx,e->vz);
-  spawn_shards(e->x,e->y,e->z,vr);
-  spawn_parts(14,e->x,e->y+1.1f,e->z,2.5f, 0.2f,1.0f,0.5f);
-  add_templ(e->x,e->y+1.2f,e->z,6.0f,0.35f, 0.3f,2.2f,1.0f);
-  sfx3(V_SHATTER,1.0f,e->x,e->y,e->z);
-  if(hitstop<0.055f)hitstop=0.055f;
+  int boss=e->type==2;
+  float sc=boss?2.6f:1.0f;
+  spawn_shards(e->x,e->y,e->z,vr,sc);
+  spawn_parts(boss?48:14,e->x,e->y+1.1f*sc,e->z,2.5f*(boss?1.8f:1.0f), 0.2f,1.0f,0.5f);
+  add_templ(e->x,e->y+1.2f*sc,e->z,6.0f*sc,boss?0.8f:0.35f, 0.3f,2.2f,1.0f);
+  sfx3(V_SHATTER,boss?0.45f:1.0f,e->x,e->y,e->z);
+  { float hs=boss?0.35f:0.055f; if(hitstop<hs)hitstop=hs; }
+  if(boss)shake=0.9f;
   /* shooters drop their sidearm — but once you're bleeding out they drop a med
    * cache instead, so a bad fight doesn't spiral into an unrecoverable one.
    * The ammo roll is drawn either way to keep the RNG stream order fixed. */
@@ -1955,7 +1973,18 @@ static void update_boss(Enemy*e,float wdt){
   float dx=px-e->x, dz=pz-e->z, d=sqrtf(dx*dx+dz*dz)+1e-4f;
   if(e->flash>0)e->flash-=wdt;
   float hpf=(float)e->hp/(float)(bossMaxHp>0?bossMaxHp:1);
-  e->bphase = hpf>0.66f?0 : hpf>0.33f?1 : 2;
+  { int nph = hpf>0.66f?0 : hpf>0.33f?1 : 2;
+    if(nph!=e->bphase){
+      /* phase escalation used to happen silently mid-volley — roar it out:
+       * flash, shockwave ring of slow rounds, shake, and a beat of quiet
+       * before the denser pattern opens up */
+      e->bphase=nph;
+      e->roar=1.0f; shake=0.75f; e->atkCD=1.0f; e->phase=1.2f;
+      add_templ(e->x,e->y+2.5f,e->z,20.0f,0.5f, 1.4f,0.4f,1.8f);
+      sfx3(V_SHATTER,0.35f,e->x,e->y+2.5f,e->z);
+      for(int k=0;k<16;k++){ float a=k*PI/8;
+        spawn_bullet(e->x,e->y+1.2f,e->z, sinf(a),0.05f,-cosf(a), 7.0f,0,-1); }
+    } }
   int   arms = e->bphase==0?3 : e->bphase==1?5 : 6;
   float spin = e->bphase==0?1.4f : e->bphase==1?2.0f : 2.6f;
   float cad  = e->bphase==0?0.55f : e->bphase==1?0.45f : 0.36f;
@@ -2640,13 +2669,15 @@ static void draw_agent(Enemy*e,float dim){
    * the tonemap saw it. Lock keeps its flash almost entirely in the red. */
   float fr_=fl, fg_=fl*0.9f, fb_=fl*0.8f;
   if(locked){
+    /* held below the ACES shoulder: the old peak (~2.2 red with 0.8 emissive)
+     * blew straight through the tonemap into cream-white at pulse maxima */
     float p=0.72f+0.28f*sinf(gtime*13.0f);
-    sr=0.95f+0.65f*p; sg=0.10f+0.10f*p; sb=0.06f;
-    float lk=0.45f+0.35f*p;
+    sr=0.80f+0.35f*p; sg=0.07f+0.06f*p; sb=0.05f;
+    float lk=0.28f+0.20f*p;
     fr_=fl+lk; fg_=(fl+lk)*0.13f; fb_=(fl+lk)*0.08f;
   }
   float tr_=sr+fr_, tg_=sg+fg_, tb_=sb+fb_;
-  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f); glUniform1f(uEmis,(locked?0.80f:0.12f)+fl);
+  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f); glUniform1f(uEmis,(locked?0.65f:0.12f)+fl);
   tintf(tr_,tg_,tb_);
   /* crystalline rim: edge glow shaded by the agent's own Doppler — closing
    * agents flare blue, receding red — so the silhouette carries the mechanic.
@@ -3035,19 +3066,26 @@ static void draw_items(void){
   float M[9];
   for(int i=0;i<nitems;i++){
     if(items[i].taken)continue;
-    float bob=floor_at(items[i].x,items[i].z)+0.45f+0.1f*sinf(wtime*2.5f+i);
+    float base=floor_at(items[i].x,items[i].z);
+    if(refl){ /* pickups were the one thing on the glossy floor with no mirror
+                 image; fade by height exactly like the figures do */
+      float rf=clampf(1.0f-base/0.9f,0,1);
+      if(rf<=0.02f)continue; figDim=rf*0.6f;
+    }
+    float bob=base+0.45f+0.1f*sinf(wtime*2.5f+i);
     m3rotY(M,wtime*1.5f+i);
     glUniform1f(uEmis,1); glUniform1f(uBump,0); glUniform1f(uGloss,0.4f);
     if(items[i].type==0){ /* health: white cross-ish twin cubes */
-      glUniform3f(uTint,1.5f,1.5f,1.6f);
+      tintf(1.5f,1.5f,1.6f);
       set_uM(M,items[i].x,bob,items[i].z); bevbox_sh(0.30f,0.10f,0.10f,0.022f);
       set_uM(M,items[i].x,bob,items[i].z); bevbox_sh(0.10f,0.30f,0.10f,0.022f);
     } else {              /* pistol pickup */
-      glUniform3f(uTint,0.25f,1.5f,0.7f);
+      tintf(0.25f,1.5f,0.7f);
       set_uM(M,items[i].x,bob,items[i].z); bevbox_sh(0.09f,0.13f,0.30f,0.020f);
       float M2[9],R[9]; m3rotX(R,PI/3); m3mul(M2,M,R);
       set_uM(M2,items[i].x,bob-0.07f,items[i].z); bevbox_sh(0.07f,0.16f,0.07f,0.018f);
     }
+    figDim=1.0f;
   }
   glUniform1f(uEmis,0);
 }
@@ -3293,10 +3331,11 @@ static void draw_world(float camx,float camy,float camz){
     }
     /* the avatar reflects too — it was the one figure on the glossy floor
      * casting no mirror image, which read as the player floating above it */
-    if(gstate==ST_PLAY){
+    if(gstate==ST_PLAY||gstate==ST_WIN){
       float pf=clampf(1.0f-py/0.9f,0,1);
       if(pf>0.02f){ figDim=pf; draw_player(); figDim=1.0f; }
     }
+    draw_items();
     draw_shards();
     refl=0;
     /* mirrored additive trails, faint */
@@ -3369,7 +3408,14 @@ static void draw_world(float camx,float camy,float camz){
     if(en[i].type==2) figure_shadow(en[i].x,en[i].y,en[i].z,1.4f,0.6f);
     else figure_shadow(en[i].x,en[i].y,en[i].z,0.52f,0.55f);
   }
-  if(gstate==ST_PLAY) figure_shadow(px,py,pz,rollT>0?0.58f:0.46f,0.60f);
+  if(gstate==ST_PLAY||gstate==ST_WIN) figure_shadow(px,py,pz,rollT>0?0.58f:0.46f,0.60f);
+  for(int i=0;i<nitems;i++){
+    if(items[i].taken)continue;
+    float ddx=items[i].x-camx, ddz=items[i].z-camz;
+    if(ddx*ddx+ddz*ddz>38.0f*38.0f)continue;
+    float bob=floor_at(items[i].x,items[i].z)+0.45f+0.1f*sinf(wtime*2.5f+i);
+    figure_shadow(items[i].x,bob,items[i].z,0.26f,0.5f);
+  }
   glEnd();
   glDisable(GL_TEXTURE_2D);
   glDisable(GL_BLEND);
@@ -3382,7 +3428,7 @@ static void draw_world(float camx,float camy,float camz){
     if(ddx*ddx+ddz*ddz>38.0f*38.0f)continue;
     if(en[i].type==2) draw_boss(&en[i]); else draw_agent(&en[i],1.0f);
   }
-  if(gstate==ST_PLAY) draw_player();
+  if(gstate==ST_PLAY||gstate==ST_WIN) draw_player();  /* victory freeze keeps the figure */
   draw_items();
   draw_shards();
   glUseProgram(0);
