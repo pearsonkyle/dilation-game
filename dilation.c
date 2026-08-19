@@ -1265,7 +1265,9 @@ static const char*COMPFS=
 "  col.b = texture2D(uScene,vUV-d*ab).b;\n"
 "  vec3 bl = texture2D(uB0,vUV).rgb\n"
 "          + texture2D(uB1,vUV).rgb*0.85\n"
-"          + texture2D(uB2,vUV).rgb*0.65;\n"
+/* anamorphic hint: the widest octave sampled through an x-compressed UV
+ * stretches ~1.8x horizontally — emitters grow subtle lens streaks */
+"          + texture2D(uB2, vec2((vUV.x-0.5)*0.55+0.5, vUV.y)).rgb*0.65;\n"
 "  col += bl*uBloom;\n"
 "  col *= uExp;\n"
 /* The time-dilation grade: frozen time drains the colour toward a cold blue
@@ -1278,9 +1280,9 @@ static const char*COMPFS=
 "  col = pow(col, vec3(1.0/2.2));\n"
 /* vignette, then a soft 4px scanline, then grain — order matters: all three
  * are display artefacts and belong after the transfer curve. */
-"  col *= mix(1.0, 0.34, smoothstep(0.06,0.62,r2));\n"
+"  col *= mix(1.0, 0.45, smoothstep(0.08,0.66,r2));\n"
 "  float sl = 0.5+0.5*cos(gl_FragCoord.y*1.5707963);\n"
-"  col *= 1.0 - 0.13*sl*sl;\n"
+"  col *= 1.0 - 0.07*sl*sl;\n"
 "  col += (h1(gl_FragCoord.xy + uTime*60.0)-0.5)*0.014;\n"
 "  col += (h1(gl_FragCoord.xy*1.7)-0.5)*(1.0/255.0);\n"
 "  gl_FragColor = vec4(col,1.0);\n"
@@ -1403,13 +1405,15 @@ static void post_end(float ts01,float dmg,float time){
   }
   glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDepthMask(GL_FALSE);
 
-  /* bright pass into the half-res head of the chain, then each octave is a
-   * plain box downsample of the octave above it followed by an H/V blur */
-  glUseProgram(progBright);
-  glUniform1i(bSrc,0);
+  /* bright pass into the half-res head of the chain; each octave then
+   * downsamples the BLURRED octave above it and blurs again. The old two-loop
+   * order box-halved UNBLURRED sources, so single-pixel emitters (bullet
+   * heads, eye slits) aliased into sparkling, crawling halos. */
   for(int i=0;i<NBLOOM;i++){
     GLuint src = i? bloomTex[i-1][0] : texScene;
     int sw = i? bloomW[i-1] : WINW, sh = i? bloomH[i-1] : WINH;
+    glUseProgram(progBright);
+    glUniform1i(bSrc,0);
     glBindFramebuffer(GL_FRAMEBUFFER,bloomFbo[i][0]);
     glViewport(0,0,bloomW[i],bloomH[i]);
     glUniform2f(bTexel,1.0f/sw,1.0f/sh);
@@ -1417,11 +1421,8 @@ static void post_end(float ts01,float dmg,float time){
     glUniform1f(bThresh,i?0.0f:1.05f); glUniform1f(bKnee,i?0.0f:0.55f);
     bind_tex(0,src);
     fsquad();
-  }
-  glUseProgram(progBlur);
-  glUniform1i(lSrc,0);
-  for(int i=0;i<NBLOOM;i++){
-    glViewport(0,0,bloomW[i],bloomH[i]);
+    glUseProgram(progBlur);
+    glUniform1i(lSrc,0);
     glBindFramebuffer(GL_FRAMEBUFFER,bloomFbo[i][1]);
     glUniform2f(lDir,1.0f/bloomW[i],0);
     bind_tex(0,bloomTex[i][0]); fsquad();
