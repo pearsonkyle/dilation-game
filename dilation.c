@@ -2636,43 +2636,67 @@ static void draw_agent(Enemy*e,float dim){
   primArm=0;
 }
 
+/* one deterministic evaluation of the avatar's whole-body stance — shared by
+ * draw_player and the sim-side muzzle/laser chain, so the drawn figure and
+ * the ballistics can never drift apart. */
+typedef struct {
+  int rolling,blade,aimStance;
+  float tuck,tk,walk,walk2,s,spd,run,fwdb,latb,absorb,poseYaw,pcy;
+  float M[9];
+} PPose;
+static void player_pose(PPose*P){
+  P->rolling = rollT>0;
+  float rp = P->rolling? sstep(1.0f-rollT/ROLL_TIME) : 0; /* roll progress    */
+  P->tuck = P->rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
+  P->tk = 1.0f-0.50f*P->tuck;                          /* anchors pull in    */
+  P->walk = sinf(bobT*7.5f); P->walk2 = sinf(bobT*7.5f+PI);
+  P->s = swingT>0? clampf(swingT/SWING_TIME,0,1) : 0;  /* katana swing phase */
+  P->blade = P->s>0 || swingCD>0;                      /* + follow-through   */
+  P->aimStance = !P->rolling && !P->blade;
+  /* ONE yaw for every stance. avYaw lives in the aim convention (forward =
+   * (sin a, -cos a), like pyaw/player_aim) and eases toward the look yaw —
+   * or toward the roll direction mid-roll — in the main loop. m3rotY() maps
+   * local -Z forward to (-sin a, -cos a), so the model always takes the
+   * NEGATED angle. The old code negated only the combat stance and fed the
+   * raw avYaw to rolls, which mirrored sideways rolls (a strafe-right dodge
+   * faced left) and popped the body by up to 180° entering/leaving them. */
+  P->poseYaw = -avYaw;
+  P->spd=sqrtf(pvx*pvx+pvz*pvz);
+  P->run=clampf(P->spd/5.0f,0,1)*pmoveb;
+  P->fwdb=0; P->latb=0;
+  if(P->spd>0.05f){
+    /* local move blends in the aim convention (the agents' formula) — these
+     * were computed with the negated yaw, so lean/sway wandered with the
+     * world heading: running forward gave fwdb=cos(2*yaw) instead of 1. */
+    float ivx=pvx/P->spd, ivz=pvz/P->spd;
+    P->fwdb=ivx*sinf(avYaw)-ivz*cosf(avYaw);
+    P->latb=ivx*cosf(avYaw)+ivz*sinf(avYaw);
+  }
+  /* landing absorb: eased square so the dip hits hard and recovers soft. The
+   * hips drop, the IK feet stay on the floor, and the knees fold to make up
+   * the difference — the same trick the boss uses on its leap recoil. */
+  P->absorb = P->rolling? 0 : landT*landT;
+  float lean = P->rolling? rp*2*PI
+             : (0.07f+0.07f*clampf(P->fwdb,0,1))*P->run + 0.20f*P->absorb;
+  float sway = P->rolling? 0
+             : (-0.10f*P->latb*P->run + 0.025f*P->walk*P->run); /* counter-tilt */
+  float R[9],X[9],Z[9],S0[9];
+  m3rotY(R,P->poseYaw); m3rotZ(Z,sway); m3rotX(X,lean); m3mul(S0,Z,X); m3mul(P->M,R,S0);
+  P->pcy=py+0.55f+0.25f*P->tuck-0.26f*P->absorb
+        + (P->rolling?0:0.025f*fabsf(P->walk)*P->run); /* ball clears floor */
+}
+
 /* third-person player avatar: compact, sleek, low-poly and readable from
  * behind. The whole figure hangs off a mid-body pivot so the dodge roll can
  * somersault it; the camera never rolls with it. */
 static void draw_player(void){
   primArm=1;
-  float M[9],R[9],X[9],Z[9],S0[9];
-  int rolling = rollT>0;
-  float rp = rolling? sstep(1.0f-rollT/ROLL_TIME) : 0; /* roll progress 0..1 */
-  float tuck = rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
-  float tk = 1.0f-0.50f*tuck;                          /* anchors pull in    */
-  float walk = sinf(bobT*7.5f), walk2 = sinf(bobT*7.5f+PI);
-  float s = swingT>0? clampf(swingT/SWING_TIME,0,1) : 0; /* katana swing phase */
-  int blade = s>0 || swingCD>0;                        /* + follow-through   */
-  int combatStance = !rolling;              /* one yaw convention for all held weapons */
-  int aimStance = !rolling && !blade;
-  /* m3rotY() maps the model's local -Z forward to world (sin(-yaw),-cos(yaw));
-   * player_aim() uses (sin(+pyaw),-cos(pyaw)).  Use the negated look yaw for
-   * the visible aiming pose so the body/gun point along the laser instead of
-   * mirroring away from it. */
-  float poseYaw = combatStance ? -pyaw*PI/180.0f : avYaw;
-  float spd=sqrtf(pvx*pvx+pvz*pvz);
-  float run=clampf(spd/5.0f,0,1)*pmoveb;
-  float fwdb=0,latb=0;
-  if(spd>0.05f){
-    float ivx=pvx/spd, ivz=pvz/spd;
-    fwdb=ivx*sinf(poseYaw)-ivz*cosf(poseYaw);
-    latb=ivx*cosf(poseYaw)+ivz*sinf(poseYaw);
-  }
-  /* landing absorb: eased square so the dip hits hard and recovers soft. The
-   * hips drop, the IK feet stay on the floor, and the knees fold to make up
-   * the difference — the same trick the boss uses on its leap recoil. */
-  float absorb = rolling? 0 : landT*landT;
-  float lean = rolling? rp*2*PI : (0.07f+0.07f*clampf(fwdb,0,1))*run + 0.20f*absorb;
-  float sway = rolling? 0 : (-0.10f*latb*run + 0.025f*walk*run);       /* shoulder counter-tilt */
-  m3rotY(R,poseYaw); m3rotZ(Z,sway); m3rotX(X,lean); m3mul(S0,Z,X); m3mul(M,R,S0);
-  float pcy=py+0.55f+0.25f*tuck-0.26f*absorb
-            + (rolling?0:0.025f*fabsf(walk)*run); /* pivot lifts so the ball clears floor */
+  PPose P; player_pose(&P);
+  int rolling=P.rolling, blade=P.blade, aimStance=P.aimStance;
+  float tuck=P.tuck, tk=P.tk, walk=P.walk, walk2=P.walk2, s=P.s, spd=P.spd,
+        run=P.run, fwdb=P.fwdb, latb=P.latb, absorb=P.absorb,
+        poseYaw=P.poseYaw, pcy=P.pcy;
+  float M[9]; memcpy(M,P.M,36);
 
   glUniform1f(uBump,0);
   glUniform1f(uGloss,0.55f);
@@ -2686,7 +2710,8 @@ static void draw_player(void){
    * keeps the old tucked FK curl. Bones are a touch longer than hip height so
    * the feet reach the ground with a real, athletic knee bend. */
   float fdx,fdz;                                  /* world ground move dir (stride) */
-  if(spd>0.2f){ fdx=pvx/spd; fdz=pvz/spd; } else { fdx=sinf(poseYaw); fdz=-cosf(poseYaw); }
+  if(spd>0.2f){ fdx=pvx/spd; fdz=pvz/spd; }
+  else { fdx=sinf(avYaw); fdz=-cosf(avYaw); }     /* aim convention, not the negated poseYaw */
   /* knee pole = the body's TRUE forward (local -Z, where the face is drawn), so
    * knees always bend forward even when backpedalling or strafing — never the
    * reversed insect-leg bend that pointing the pole along travel produced. */
@@ -3793,7 +3818,8 @@ int main(int argc,char**argv){
         bobT+=dt*(0.12f+0.62f*sp); }
       /* the avatar's facing eases toward the roll direction and back —
        * no yaw snap entering or leaving a sideways roll */
-      avYaw=angto(avYaw, rollT>0? atan2f(rollDX,-rollDZ) : pyaw*PI/180.0f, dt*14.0f);
+      avYaw=angto(avYaw, rollT>0? atan2f(rollDX,-rollDZ) : pyaw*PI/180.0f,
+                  dt*(rollT>0?20.0f:14.0f));    /* near-180° rolls converge inside the roll */
 
       pvy-=18.0f*dt;
       py += pvy*dt;
