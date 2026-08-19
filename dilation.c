@@ -123,7 +123,7 @@ static void load_gl(void){
 #define ROLL_CD    0.65f       /* dodge roll cooldown  */
 #define SWING_TIME 0.26f       /* katana active swing  */
 #define FIRE_TIME  0.34f       /* pistol refire        */
-#define GUN_SETTLE_TIME 1.0f   /* stillness before the aim settles on the look ray */
+#define GUN_SETTLE_TIME 0.22f  /* stillness before the aim settles on the look ray */
 #define GUN_MIN_LASER   1.0f   /* the pointer never shrinks below this */
 static float wallh=3.4f;  /* hall height, set per sector */
 
@@ -1313,7 +1313,7 @@ static const char*COMPFS=
 "          + texture2D(uB1,vUV).rgb*0.85\n"
 /* anamorphic hint: the widest octave sampled through an x-compressed UV
  * stretches ~1.8x horizontally — emitters grow subtle lens streaks */
-"          + texture2D(uB2, vec2((vUV.x-0.5)*0.55+0.5, vUV.y)).rgb*0.65;\n"
+"          + texture2D(uB2, vec2((vUV.x-0.5)*0.55+0.5, vUV.y)).rgb*0.50;\n"
 "  col += bl*uBloom;\n"
 "  col *= uExp;\n"
 /* The time-dilation grade: frozen time drains the colour toward a cold blue
@@ -1464,7 +1464,7 @@ static void post_end(float ts01,float dmg,float time){
     glViewport(0,0,bloomW[i],bloomH[i]);
     glUniform2f(bTexel,1.0f/sw,1.0f/sh);
     /* only the first octave thresholds; the rest just carry the energy down */
-    glUniform1f(bThresh,i?0.0f:1.05f); glUniform1f(bKnee,i?0.0f:0.55f);
+    glUniform1f(bThresh,i?0.0f:1.30f); glUniform1f(bKnee,i?0.0f:0.55f);
     bind_tex(0,src);
     fsquad();
     glUseProgram(progBlur);
@@ -1485,7 +1485,7 @@ static void post_end(float ts01,float dmg,float time){
   bind_tex(2,bloomTex[1][0]); glUniform1i(cB1,2);
   bind_tex(3,bloomTex[2][0]); glUniform1i(cB2,3);
   glUniform1f(cTime,time); glUniform1f(cTs,ts01); glUniform1f(cDmg,dmg);
-  glUniform1f(cExp,1.15f); glUniform1f(cBloom,0.62f);
+  glUniform1f(cExp,1.15f); glUniform1f(cBloom,0.48f);
   fsquad();
 
   /* leave the bloom textures bound and only restore the active unit: unbinding
@@ -3500,7 +3500,7 @@ static void draw_world(float camx,float camy,float camz){
     glUniform1f(uAlpha,0.78f); glUniform1f(uGloss,1.0f);
     glUniform3f(uTint,L->floort[0],L->floort[1],L->floort[2]);
     glUniform1f(uBump,1); glUniform1f(uEmis,0);
-    glUniform1f(uEmisM,2.5f);          /* hairline seams feed the bloom */
+    glUniform1f(uEmisM,1.8f);          /* hairline seams feed the bloom */
     float I[9]; m3id(I); set_uM(I,0,0,0);
     glVertexPointer(3,GL_FLOAT,36,batch[1]);
     glNormalPointer(GL_FLOAT,36,batch[1]+3);
@@ -3510,7 +3510,7 @@ static void draw_world(float camx,float camy,float camz){
     glUniform1f(uAlpha,1);
     /* walls (with rain) and ceiling, opaque, in the sector's climate */
     int texof[2]={TX_WALL,TX_CEIL}; int bid[2]={0,2}; float gls[2]={0.55f,0.3f};
-    float emk[2]={5.0f,1.7f};   /* wall circuit traces / ceiling light slots */
+    float emk[2]={3.5f,1.3f};   /* wall circuit traces / ceiling light slots */
     for(int b=0;b<2;b++){
       glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,texAlb[texof[b]]);
       glActiveTexture_(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,texNrm[texof[b]]);
@@ -4178,14 +4178,15 @@ int main(int argc,char**argv){
        * unfreezes time twice as hard at 30fps as at 60. */
       float look=clampf(mouseAcc*0.05f/(dt*60.0f),0,1); mouseAcc=0;
       /* gun settle: the aim is PHYSICAL. Running, rolling, flying and hard
-       * turns swing the gun with the body; only after GUN_SETTLE_TIME of
-       * stillness does the barrel ease back onto the look ray. Runs on raw
-       * dt — this is the player's own body, which never dilates. */
+       * turns swing the gun with the body; stop, and the barrel SNAPS back
+       * onto the look ray — an eased 0.22s, so the stop-time-aim-fire rhythm
+       * never waits on the gun. Runs on raw dt: this is the player's own
+       * body, which never dilates with the frozen world. */
       { int stable = !air && rollT<=0
                    && sqrtf(pvx*pvx+pvz*pvz)<0.8f && look<0.35f;
         stableT = stable? stableT+dt : 0;
-        float want=sstep(clampf((stableT-0.15f)/(GUN_SETTLE_TIME-0.15f),0,1));
-        aimSet = want>aimSet ? want : toward(aimSet,want,dt*6.0f); }
+        float want=sstep(clampf(stableT/GUN_SETTLE_TIME,0,1));
+        aimSet = want>aimSet ? want : toward(aimSet,want,dt*8.0f); }
       if(actT>0)actT-=dt;
       float target=(ml>0.01f||rollT>0||air)?1.0f:0.0f;
       if(look>target)target=look;
