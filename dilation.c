@@ -187,6 +187,18 @@ static void m3scl(float*m,float x,float y,float z){
   m[0]*=x;m[1]*=x;m[2]*=x; m[3]*=y;m[4]*=y;m[5]*=y; m[6]*=z;m[7]*=z;m[8]*=z; }
 static void m3v(const float*m,float x,float y,float z,float*o){
   o[0]=m[0]*x+m[3]*y+m[6]*z; o[1]=m[1]*x+m[4]*y+m[7]*z; o[2]=m[2]*x+m[5]*y+m[8]*z; }
+/* pre-rotate basis B (world space) so unit direction u lands on unit v —
+ * Rodrigues with the sine folded into the unnormalized axis w = u x v */
+static void m3align(float*B,float ux,float uy,float uz,float vx,float vy,float vz){
+  float wx=uy*vz-uz*vy, wy=uz*vx-ux*vz, wz=ux*vy-uy*vx;
+  float c=ux*vx+uy*vy+uz*vz, s2=wx*wx+wy*wy+wz*wz;
+  if(s2<1e-10f)return;                    /* already aligned (or antipodal) */
+  float k=(1.0f-c)/s2;
+  float R[9]={ c+k*wx*wx,  wz+k*wx*wy, -wy+k*wx*wz,
+              -wz+k*wx*wy, c+k*wy*wy,   wx+k*wy*wz,
+               wy+k*wx*wz,-wx+k*wy*wz,  c+k*wz*wz };
+  m3mul(B,R,B);
+}
 
 /* ---------------------------------------------------------------- textures
  * The construct is black-on-black: dark panel walls (the digital rain is
@@ -1460,6 +1472,9 @@ static float player_height(void){ return rollT>0 ? 0.85f : 1.72f; }
 static float player_camh(void){ return py + (rollT>0 ? 1.45f : 1.92f); }
 static float fireCD,swingT,swingCD,dmgFlash,stepT,shake,bobT,winT,gtime,wtime,msgT;
 static float gunCharge;                       /* 0..1, controls laser/shot range */
+static float aimSet=1,stableT;      /* physical aim: 0 = gun rides the running
+                                       body, 1 = settled on the look ray after
+                                       GUN_SETTLE_TIME of stillness */
 static int laserTarget=-1;                    /* living enemy currently reachable by charged beam */
 static unsigned gseed=0;                    /* xor'd into the level seed      */
 static int smoke=0;
@@ -1478,6 +1493,7 @@ static void reset_game(void){
   py=hgt[(int)(startz/CELL)][(int)(startx/CELL)];
   php=100; pammo=6; jumps=1;
   tscale=tsEff=1; actT=0; mouseAcc=0;
+  aimSet=1; stableT=GUN_SETTLE_TIME;   /* you jack in standing still: settled */
   rollT=rollCD=rollDX=rollDZ=kvx=kvz=pmoveb=0;
   coyT=hurtCD=mzT=landT=hitstop=0;
   camDist=3.05f; camYs=-1.0f;
@@ -1638,36 +1654,133 @@ static void player_aim(float*dx,float*dy,float*dz){
   float yr=pyaw*PI/180, pr=ppitch*PI/180;
   *dx=sinf(yr)*cosf(pr); *dy=-sinf(pr); *dz=-cosf(yr)*cosf(pr);
 }
-/* Diegetic aiming: the cursor lives in-world now.  The muzzle is kept near the
- * avatar's right-hand pistol so the laser/rounds read as coming from the gun,
- * while direction remains fully controlled by the player's look yaw/pitch. */
-static void player_muzzle(float*ox,float*oy,float*oz){
-  /* Keep the ballistic/laser origin near the authored right hand.  The visible
-   * pistol is attached to the hand transform in draw_player(); this fixed
-   * shoulder-space offset avoids the previous free-floating aim-basis gun. */
-  float yr=avYaw;
-  float fx=sinf(yr), fz=-cosf(yr), rx=cosf(yr), rz=sinf(yr);
-  float crouch=rollT>0?0.46f:1.0f;
-  float dx,dy,dz; player_aim(&dx,&dy,&dz);
-  *ox=px+rx*0.36f+fx*0.34f+dx*0.10f;
-  *oy=py+0.74f+0.78f*crouch+dy*0.10f;
-  *oz=pz+rz*0.36f+fz*0.34f+dz*0.10f;
+/* one deterministic evaluation of the avatar's whole-body stance — shared by
+ * draw_player and the sim-side aiming chain below, so the drawn figure and
+ * the ballistics can never drift apart. */
+typedef struct {
+  int rolling,blade,aimStance;
+  float tuck,tk,walk,walk2,s,spd,run,fwdb,latb,absorb,poseYaw,pcy;
+  float M[9];
+} PPose;
+static void player_pose(PPose*P){
+  P->rolling = rollT>0;
+  float rp = P->rolling? sstep(1.0f-rollT/ROLL_TIME) : 0; /* roll progress    */
+  P->tuck = P->rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
+  P->tk = 1.0f-0.50f*P->tuck;                          /* anchors pull in    */
+  P->walk = sinf(bobT*7.5f); P->walk2 = sinf(bobT*7.5f+PI);
+  P->s = swingT>0? clampf(swingT/SWING_TIME,0,1) : 0;  /* katana swing phase */
+  P->blade = P->s>0 || swingCD>0;                      /* + follow-through   */
+  P->aimStance = !P->rolling && !P->blade;
+  /* ONE yaw for every stance. avYaw lives in the aim convention (forward =
+   * (sin a, -cos a), like pyaw/player_aim) and eases toward the look yaw —
+   * or toward the roll direction mid-roll — in the main loop. m3rotY() maps
+   * local -Z forward to (-sin a, -cos a), so the model always takes the
+   * NEGATED angle. The old code negated only the combat stance and fed the
+   * raw avYaw to rolls, which mirrored sideways rolls (a strafe-right dodge
+   * faced left) and popped the body by up to 180° entering/leaving them. */
+  P->poseYaw = -avYaw;
+  P->spd=sqrtf(pvx*pvx+pvz*pvz);
+  P->run=clampf(P->spd/5.0f,0,1)*pmoveb;
+  P->fwdb=0; P->latb=0;
+  if(P->spd>0.05f){
+    /* local move blends in the aim convention (the agents' formula) — these
+     * were computed with the negated yaw, so lean/sway wandered with the
+     * world heading: running forward gave fwdb=cos(2*yaw) instead of 1. */
+    float ivx=pvx/P->spd, ivz=pvz/P->spd;
+    P->fwdb=ivx*sinf(avYaw)-ivz*cosf(avYaw);
+    P->latb=ivx*cosf(avYaw)+ivz*sinf(avYaw);
+  }
+  /* landing absorb: eased square so the dip hits hard and recovers soft. The
+   * hips drop, the IK feet stay on the floor, and the knees fold to make up
+   * the difference — the same trick the boss uses on its leap recoil. */
+  P->absorb = P->rolling? 0 : landT*landT;
+  float lean = P->rolling? rp*2*PI
+             : (0.07f+0.07f*clampf(P->fwdb,0,1))*P->run + 0.20f*P->absorb;
+  float sway = P->rolling? 0
+             : (-0.10f*P->latb*P->run + 0.025f*P->walk*P->run); /* counter-tilt */
+  float R[9],X[9],Z[9],S0[9];
+  m3rotY(R,P->poseYaw); m3rotZ(Z,sway); m3rotX(X,lean); m3mul(S0,Z,X); m3mul(P->M,R,S0);
+  P->pcy=py+0.55f+0.25f*P->tuck-0.26f*P->absorb
+        + (P->rolling?0:0.025f*fabsf(P->walk)*P->run); /* ball clears floor */
 }
+
+/* the right arm + pistol, solved once for BOTH the renderer and the sim.
+ * PHYSICAL AIMING: the gun is a thing the body carries, not a crosshair.
+ * aimSet blends a low running carry — swinging with the stride, barely
+ * pitch-aware — into the settled aim pose, and a final alignment rotates the
+ * grip basis onto mix(barrel, look-ray, aimSet): at full settle the barrel
+ * IS the look ray, mid-run it points wherever the pumping arm has it.
+ * Bullets, laser, lock-on and muzzle flash all read this one basis, so what
+ * the gun visibly points at is always exactly where the round will go. */
+typedef struct {
+  float A[9],F[9],GP[9];          /* upper arm / forearm / gun grip bases */
+  float sx,sy,sz;                 /* shoulder joint (world)               */
+  float gx,gy,gz;                 /* gun origin (world)                   */
+  float tipx,tipy,tipz;           /* barrel tip — muzzle                  */
+  float bdx,bdy,bdz;              /* barrel direction (unit)              */
+} ArmR;
+static void player_arm_r(const PPose*P,ArmR*o){
+  float fr=clampf(fireCD/FIRE_TIME,0,1);
+  float raise,swYaw,sw;
+  if(P->rolling){ raise=0.35f+0.95f*P->tuck; swYaw=0; sw=1.0f; }
+  else {
+    float prad=ppitch*PI/180.0f;
+    float rs=1.18f+0.12f*sstep(fr)-prad*0.90f;    /* settled: on the look ray */
+    float rc=0.55f+0.30f*sstep(fr)-prad*0.30f;    /* carry: low, half-hearted */
+    raise = rc+(rs-rc)*aimSet;
+    swYaw = 0.06f*(1.0f-aimSet)+(-0.12f-0.05f*P->latb)*aimSet;
+    float aimDamp=1.0f+(0.18f-1.0f)*aimSet;       /* settle kills the pumping */
+    sw = P->walk2*0.42f*P->run*aimDamp*clampf(1.3f-raise,0,1);
+    raise += 0.42f*P->absorb*(1.0f-aimSet);       /* landings jolt the carry  */
+  }
+  float sh[3]; m3v(P->M,0.27f,1.05f*P->tk,0,sh);
+  o->sx=px+sh[0]; o->sy=P->pcy+sh[1]; o->sz=pz+sh[2];
+  float RX[9],RY[9],S[9],e[3],h[3];
+  m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(o->A,P->M,S);
+  m3v(o->A,0,-0.35f,0,e);
+  float ex=o->sx+e[0], ey=o->sy+e[1], ez=o->sz+e[2];
+  float RE[9]; m3rotX(RE,raise+sw+0.16f); m3mul(S,RY,RE); m3mul(o->F,P->M,S);
+  m3v(o->F,0,-0.33f,0,h);
+  float hx=ex+h[0], hy=ey+h[1], hz=ez+h[2];
+  /* grip: pistol_sh() barrels down local -Z; roll the basis into the palm */
+  float GY[9],GX[9],GZ[9],GT[9];
+  m3rotY(GY,0.04f); m3rotX(GX,-PI*0.5f-0.06f); m3rotZ(GZ,0.04f);
+  m3mul(GT,GY,GX); m3mul(GT,GT,GZ); m3mul(o->GP,o->F,GT);
+  /* aim alignment: rotate the grip so the barrel lands on the blend between
+   * where the pose has it and where the camera looks. At aimSet=1 the barrel
+   * is exactly the look ray — zero divergence between beam and bullet. */
+  { float b[3]; m3v(o->GP,0,0,-1,b);
+    float ax,ay,az; player_aim(&ax,&ay,&az);
+    float mx=b[0]+(ax-b[0])*aimSet, my_=b[1]+(ay-b[1])*aimSet, mz_=b[2]+(az-b[2])*aimSet;
+    float il=1.0f/sqrtf(mx*mx+my_*my_+mz_*mz_+1e-9f);
+    m3align(o->GP, b[0],b[1],b[2], mx*il,my_*il,mz_*il); }
+  /* anchor the grip into the palm (inverse of pistol_sh's grip offset), with
+   * a small forearm-up lift that seats it visibly in the hand */
+  float go[3],lift[3]; m3v(o->GP,0,0.145f,0.020f,go); m3v(o->F,0,0.125f,0,lift);
+  o->gx=hx+go[0]+lift[0]; o->gy=hy+go[1]+lift[1]; o->gz=hz+go[2]+lift[2];
+  float t[3]; m3v(o->GP,0,-0.010f,-0.40f,t);
+  o->tipx=o->gx+t[0]; o->tipy=o->gy+t[1]; o->tipz=o->gz+t[2];
+  float b2[3]; m3v(o->GP,0,0,-1,b2);
+  o->bdx=b2[0]; o->bdy=b2[1]; o->bdz=b2[2];
+}
+
 static void player_laser(float*mx,float*my,float*mz,float*dx,float*dy,float*dz,
                          float*hx,float*hy,float*hz,float*dist){
-  player_muzzle(mx,my,mz);
-  player_aim(dx,dy,dz);
-  /* The laser is the capacitor gauge: it grows outward strictly by charge.
-   * Bullets still collide with walls/floors normally; this distance is their
-   * energy budget, not a geometry-clamped crosshair hit. */
-  float d=pammo>0 ? GUN_MAX_RANGE*clampf(gunCharge,0,1) : 0.0f;
+  PPose P; player_pose(&P);
+  ArmR a; player_arm_r(&P,&a);
+  *mx=a.tipx; *my=a.tipy; *mz=a.tipz;
+  *dx=a.bdx;  *dy=a.bdy;  *dz=a.bdz;
+  /* The laser is the capacitor gauge: it grows outward by charge, but never
+   * below GUN_MIN_LASER — the pointer is the aim, so it must always be
+   * visible, swaying with the carried gun and all. Bullets still collide
+   * with geometry normally; this distance is their energy budget. */
+  float d=pammo>0 ? fmaxf(GUN_MIN_LASER, GUN_MAX_RANGE*clampf(gunCharge,0,1)) : 0.0f;
   *hx=*mx+*dx*d; *hy=*my+*dy*d; *hz=*mz+*dz*d; *dist=d;
 }
 static int laser_target(void){
-  if(gstate!=ST_PLAY||pammo<=0||rollT>0||swingT>0||swingCD>0||gunCharge<=0.001f)return -1;
+  if(gstate!=ST_PLAY||pammo<=0||rollT>0||swingT>0||swingCD>0)return -1;
   float mx,my,mz,dx,dy,dz,hx,hy,hz,range;
   player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&range);
-  if(range<0.08f)return -1;
   float wall=ray_wall(mx,my,mz,dx,dy,dz,range);
   int best=-1; float bestt=range+1.0f;
   for(int i=0;i<nen;i++){
@@ -1694,11 +1807,15 @@ static int laser_target(void){
 static void fire(void){
   if(fireCD>0||rollT>0)return;
   if(pammo<=0){ sfx(V_CLICK); fireCD=0.3f; gunCharge=0; return; }
-  fireCD=FIRE_TIME; actT=0.22f;
-  pammo--;
-  sfx(V_SHOT);
+  /* sample the barrel FIRST: the round leaves the gun as it was at trigger
+   * pull — where the gun physically points, not where the camera looks —
+   * before the recoil state (fireCD raise, settle knock) kicks the pose */
   float mx,my,mz,dx,dy,dz,hx,hy,hz,ld;
   player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&ld);
+  fireCD=FIRE_TIME; actT=0.22f;
+  pammo--;
+  aimSet*=0.75f;        /* recoil unsettles the aim: follow-ups want a beat */
+  sfx(V_SHOT);
   /* a round is never wasted: even an uncharged pistol carries point-blank
    * reach, so spending the ammo always buys you something */
   if(ld<GUN_MIN_RANGE)ld=GUN_MIN_RANGE;
@@ -2636,56 +2753,6 @@ static void draw_agent(Enemy*e,float dim){
   primArm=0;
 }
 
-/* one deterministic evaluation of the avatar's whole-body stance — shared by
- * draw_player and the sim-side muzzle/laser chain, so the drawn figure and
- * the ballistics can never drift apart. */
-typedef struct {
-  int rolling,blade,aimStance;
-  float tuck,tk,walk,walk2,s,spd,run,fwdb,latb,absorb,poseYaw,pcy;
-  float M[9];
-} PPose;
-static void player_pose(PPose*P){
-  P->rolling = rollT>0;
-  float rp = P->rolling? sstep(1.0f-rollT/ROLL_TIME) : 0; /* roll progress    */
-  P->tuck = P->rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
-  P->tk = 1.0f-0.50f*P->tuck;                          /* anchors pull in    */
-  P->walk = sinf(bobT*7.5f); P->walk2 = sinf(bobT*7.5f+PI);
-  P->s = swingT>0? clampf(swingT/SWING_TIME,0,1) : 0;  /* katana swing phase */
-  P->blade = P->s>0 || swingCD>0;                      /* + follow-through   */
-  P->aimStance = !P->rolling && !P->blade;
-  /* ONE yaw for every stance. avYaw lives in the aim convention (forward =
-   * (sin a, -cos a), like pyaw/player_aim) and eases toward the look yaw —
-   * or toward the roll direction mid-roll — in the main loop. m3rotY() maps
-   * local -Z forward to (-sin a, -cos a), so the model always takes the
-   * NEGATED angle. The old code negated only the combat stance and fed the
-   * raw avYaw to rolls, which mirrored sideways rolls (a strafe-right dodge
-   * faced left) and popped the body by up to 180° entering/leaving them. */
-  P->poseYaw = -avYaw;
-  P->spd=sqrtf(pvx*pvx+pvz*pvz);
-  P->run=clampf(P->spd/5.0f,0,1)*pmoveb;
-  P->fwdb=0; P->latb=0;
-  if(P->spd>0.05f){
-    /* local move blends in the aim convention (the agents' formula) — these
-     * were computed with the negated yaw, so lean/sway wandered with the
-     * world heading: running forward gave fwdb=cos(2*yaw) instead of 1. */
-    float ivx=pvx/P->spd, ivz=pvz/P->spd;
-    P->fwdb=ivx*sinf(avYaw)-ivz*cosf(avYaw);
-    P->latb=ivx*cosf(avYaw)+ivz*sinf(avYaw);
-  }
-  /* landing absorb: eased square so the dip hits hard and recovers soft. The
-   * hips drop, the IK feet stay on the floor, and the knees fold to make up
-   * the difference — the same trick the boss uses on its leap recoil. */
-  P->absorb = P->rolling? 0 : landT*landT;
-  float lean = P->rolling? rp*2*PI
-             : (0.07f+0.07f*clampf(P->fwdb,0,1))*P->run + 0.20f*P->absorb;
-  float sway = P->rolling? 0
-             : (-0.10f*P->latb*P->run + 0.025f*P->walk*P->run); /* counter-tilt */
-  float R[9],X[9],Z[9],S0[9];
-  m3rotY(R,P->poseYaw); m3rotZ(Z,sway); m3rotX(X,lean); m3mul(S0,Z,X); m3mul(P->M,R,S0);
-  P->pcy=py+0.55f+0.25f*P->tuck-0.26f*P->absorb
-        + (P->rolling?0:0.025f*fabsf(P->walk)*P->run); /* ball clears floor */
-}
-
 /* third-person player avatar: compact, sleek, low-poly and readable from
  * behind. The whole figure hangs off a mid-body pivot so the dodge roll can
  * somersault it; the camera never rolls with it. */
@@ -2771,10 +2838,23 @@ static void draw_player(void){
   tintf(0.05f,0.06f,0.055f);
   for(int si=-1;si<=1;si+=2){ put(M,px,pcy,pz,si*0.27f,1.05f*tk,0); sphere_sh(0.08f,0.08f,0.08f,8,5); }
 
-  /* shoulders and arms. right arm: pistol raise on fire, katana sweep on
-   * swing — wind-up across the left shoulder, cut down and across. */
+  /* shoulders and arms. right arm: pistol carried/aimed via the SHARED solver
+   * (player_arm_r — the same transform the laser and bullets read), katana
+   * sweep on swing — wind-up across the left shoulder, cut down and across. */
   tintf(0.04f,0.05f,0.045f);
+  if(!blade){
+    ArmR a; player_arm_r(&P,&a);
+    float ex,ey,ez; limb_seg(a.A,a.sx,a.sy,a.sz,-0.18f, 0.068f,0.056f,0.36f,8, -0.35f, &ex,&ey,&ez);
+    set_uM(M,ex,ey,ez); sphere_sh(0.060f,0.060f,0.060f,8,5);   /* elbow cap */
+    float hx2,hy2,hz2; limb_seg(a.F,ex,ey,ez,-0.16f, 0.054f,0.046f,0.34f,8, -0.33f, &hx2,&hy2,&hz2);
+    set_uM(a.F,hx2,hy2,hz2); wedge_sh(0.068f,0.110f,0.055f);
+    tintf(0.03f,0.035f,0.04f);
+    pistol_sh(a.GP,a.gx,a.gy,a.gz,pammo);
+    glUniform1f(uEmis,0.08f);
+    tintf(0.04f,0.05f,0.045f);
+  }
   for(int ai=0;ai<2;ai++){
+    if(ai&&!blade)continue;            /* drawn above, off the shared solver */
     float raise, swYaw=0;
     if(ai){
       float fr=clampf(fireCD/FIRE_TIME,0,1);
@@ -2821,22 +2901,6 @@ static void draw_player(void){
       put(B,hx2,hy2,hz2,0,-0.62f,0); box_sh(0.022f,1.05f,0.045f);
       tintf(0.30f,2.0f,0.9f); glUniform1f(uEmis,1.0f);
       put(B,hx2,hy2,hz2,-0.014f,-0.62f,0); box_sh(0.006f,1.05f,0.03f);
-      glUniform1f(uEmis,0.08f);
-      tintf(0.04f,0.05f,0.045f);
-    } else if(ai){
-      tintf(0.03f,0.035f,0.04f);
-      float GP[9],GY[9],GX[9],GZ[9],GT[9];
-      /* pistol_sh() barrels down local -Z; the hand/forearm grip runs along
-       * local -Y, so roll the weapon basis 90deg into the palm instead of
-       * letting the barrel stand upright toward the ceiling. */
-      m3rotY(GY,0.04f); m3rotX(GX,-PI*0.5f-0.06f); m3rotZ(GZ,0.04f);
-      m3mul(GT,GY,GX); m3mul(GT,GT,GZ); m3mul(GP,F,GT);
-      /* Anchor the grip into the palm: pistol_sh() places the grip at
-       * local (0,-0.145,-0.020), so offset the gun origin by the inverse of
-       * that grip vector.  A small forearm-up lift keeps it seated visibly in
-       * the hand instead of hanging below the wrist. */
-      float go[3],lift[3]; m3v(GP,0,0.145f,0.020f,go); m3v(F,0,0.125f,0,lift);
-      pistol_sh(GP,hx2+go[0]+lift[0],hy2+go[1]+lift[1],hz2+go[2]+lift[2],pammo);
       glUniform1f(uEmis,0.08f);
       tintf(0.04f,0.05f,0.045f);
     }
@@ -3036,12 +3100,20 @@ static void draw_player_laser(void){
   if(gstate!=ST_PLAY||pammo<=0||rollT>0||swingT>0||swingCD>0)return;
   float mx,my,mz,dx,dy,dz,hx,hy,hz,ld;
   player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&ld);
+  /* the VISIBLE beam stops on geometry — the dot lands on the wall/floor the
+   * gun is pointed at ("know where it's aimed"), even while the round's
+   * energy budget (ld from player_laser) is what the sim actually uses */
+  float vfull=ray_wall(mx,my,mz,dx,dy,dz,GUN_MAX_RANGE);
+  if(dy<-1e-4f){ float tf=(my-(floor_at(mx+dx*vfull,mz+dz*vfull)+0.02f))/-dy;
+                 if(tf>0&&tf<vfull)vfull=tf; }
+  if(dy> 1e-4f){ float tc=(wallh-0.03f-my)/dy; if(tc>0&&tc<vfull)vfull=tc; }
+  if(vfull<ld){ ld=vfull; hx=mx+dx*ld; hy=my+dy*ld; hz=mz+dz*ld; }
   float charge=clampf(gunCharge,0,1);
   int locked = laserTarget>=0;
   /* Keep the charge read stable: length carries the information, not flicker. */
   float grow=sstep(charge);
   float pulse=0.98f+0.02f*sinf(gtime*6.0f);
-  float fullx=mx+dx*GUN_MAX_RANGE, fully=my+dy*GUN_MAX_RANGE, fullz=mz+dz*GUN_MAX_RANGE;
+  float fullx=mx+dx*vfull, fully=my+dy*vfull, fullz=mz+dz*vfull;
   float ghost=0.030f;
   /* Faint full-length rail so the growing active segment has a clear direction. */
   glLineWidth(0.75f);
@@ -3843,6 +3915,15 @@ int main(int argc,char**argv){
       /* mouseAcc is pixels-per-FRAME: normalize by dt or the same physical turn
        * unfreezes time twice as hard at 30fps as at 60. */
       float look=clampf(mouseAcc*0.05f/(dt*60.0f),0,1); mouseAcc=0;
+      /* gun settle: the aim is PHYSICAL. Running, rolling, flying and hard
+       * turns swing the gun with the body; only after GUN_SETTLE_TIME of
+       * stillness does the barrel ease back onto the look ray. Runs on raw
+       * dt — this is the player's own body, which never dilates. */
+      { int stable = !air && rollT<=0
+                   && sqrtf(pvx*pvx+pvz*pvz)<0.8f && look<0.35f;
+        stableT = stable? stableT+dt : 0;
+        float want=sstep(clampf((stableT-0.15f)/(GUN_SETTLE_TIME-0.15f),0,1));
+        aimSet = want>aimSet ? want : toward(aimSet,want,dt*6.0f); }
       if(actT>0)actT-=dt;
       float target=(ml>0.01f||rollT>0||air)?1.0f:0.0f;
       if(look>target)target=look;
