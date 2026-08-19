@@ -2388,6 +2388,19 @@ static void bevbox_sh(float sx,float sy,float sz,float bev){
   glEnd();
   if(pc==2)glEndList();
 }
+/* one triangle with its true face normal (outward via the centroid test) —
+ * wedge_sh's tapered sides are non-planar and their old axis-aligned normals
+ * sat 15-25 degrees off, firing the rim/GGX on the wrong facets */
+static void tri_n(float ax,float ay,float az,float bx,float by,float bz,
+                  float cx,float cy,float cz){
+  float ux=bx-ax,uy=by-ay,uz=bz-az, vx=cx-ax,vy=cy-ay,vz=cz-az;
+  float nx=uy*vz-uz*vy, ny=uz*vx-ux*vz, nz=ux*vy-uy*vx;
+  float mx=(ax+bx+cx),my_=(ay+by+cy),mz=(az+bz+cz);   /* 3x centroid */
+  if(nx*mx+ny*my_+nz*mz<0){ nx=-nx;ny=-ny;nz=-nz; }
+  float il=1.0f/sqrtf(nx*nx+ny*ny+nz*nz+1e-12f);
+  glNormal3f(nx*il,ny*il,nz*il);
+  glVertex3f(ax,ay,az); glVertex3f(bx,by,bz); glVertex3f(cx,cy,cz);
+}
 /* Angular tapered block: a cheap prism for hands/feet/gun facets so the
  * humanoids read as cut polygon mannequins instead of stacked cuboids. */
 static void wedge_sh(float sx,float sy,float sz){
@@ -2399,14 +2412,17 @@ static void wedge_sh(float sx,float sy,float sz){
   glVertex3f(-x,-y,-z); glVertex3f(x,-y,-z); glVertex3f(x,-y,z); glVertex3f(-x,-y,z);
   glNormal3f(0,1,0);
   glVertex3f(-tx,y,-tzb); glVertex3f(-tx*0.82f,y,tzf); glVertex3f(tx*0.82f,y,tzf); glVertex3f(tx,y,-tzb);
-  glNormal3f(0,0,1);
-  glVertex3f(-x,-y,z); glVertex3f(x,-y,z); glVertex3f(tx*0.82f,y,tzf); glVertex3f(-tx*0.82f,y,tzf);
-  glNormal3f(0,0,-1);
-  glVertex3f(x,-y,-z); glVertex3f(-x,-y,-z); glVertex3f(-tx,y,-tzb); glVertex3f(tx,y,-tzb);
-  glNormal3f(1,0,0);
-  glVertex3f(x,-y,z); glVertex3f(x,-y,-z); glVertex3f(tx,y,-tzb); glVertex3f(tx*0.82f,y,tzf);
-  glNormal3f(-1,0,0);
-  glVertex3f(-x,-y,-z); glVertex3f(-x,-y,z); glVertex3f(-tx*0.82f,y,tzf); glVertex3f(-tx,y,-tzb);
+  glEnd();
+  glBegin(GL_TRIANGLES); glTexCoord2f(0.5f,0.5f);
+  /* each warped side split into two triangles with their own true normals */
+  tri_n(-x,-y,z,  x,-y,z,  tx*0.82f,y,tzf);            /* front +z  */
+  tri_n(-x,-y,z,  tx*0.82f,y,tzf, -tx*0.82f,y,tzf);
+  tri_n( x,-y,-z, -x,-y,-z, -tx,y,-tzb);               /* back  -z  */
+  tri_n( x,-y,-z, -tx,y,-tzb,  tx,y,-tzb);
+  tri_n( x,-y,z,  x,-y,-z,  tx,y,-tzb);                /* right +x  */
+  tri_n( x,-y,z,  tx,y,-tzb, tx*0.82f,y,tzf);
+  tri_n(-x,-y,-z, -x,-y,z,  -tx*0.82f,y,tzf);          /* left  -x  */
+  tri_n(-x,-y,-z, -tx*0.82f,y,tzf, -tx,y,-tzb);
   glEnd();
   if(pc==2)glEndList();
 }
@@ -2574,10 +2590,10 @@ static void draw_boss(Enemy*e){
     float hx=e->x+hip[0], hy=by+1.65f-0.30f*crouch, hz=e->z+hip[2];
     float UL[9],RX[9],RZ[9],S[9];
     m3rotX(RX, sw+tuck); m3rotZ(RZ, li*0.14f); m3mul(S,RX,RZ); m3mul(UL,M,S);
-    float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.46f, 0.30f,0.24f,0.95f,8, -0.92f, &kx,&ky,&kz);
-    set_uM(UL,kx,ky,kz); sphere_sh(0.24f,0.24f,0.24f,8,5);
+    float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.46f, 0.30f,0.24f,0.95f,10, -0.92f, &kx,&ky,&kz);
+    set_uM(UL,kx,ky,kz); sphere_sh(0.24f,0.24f,0.24f,9,6);
     float LL[9],RK[9]; m3rotX(RK, sw+kb+tuck*0.9f); m3mul(S,RK,RZ); m3mul(LL,M,S);
-    float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.42f, 0.22f,0.15f,0.86f,8, -0.84f, &ax,&ay,&az);
+    float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.42f, 0.22f,0.15f,0.86f,10, -0.84f, &ax,&ay,&az);
     put(LL,ax,ay,az,0,-0.04f,-0.22f); wedge_sh(0.34f,0.18f,0.55f);
   }
   /* thorax: barrel waist swelling into a bulbous chest. Everything above the
@@ -2616,10 +2632,10 @@ static void draw_boss(Enemy*e){
     m3rotX(RX,up);    m3mul(S,RX,RZ); m3mul(A,M,S);
     float sh[3]; m3v(M,ai*0.82f,1.80f,0,sh);
     float shx=e->x+sh[0], shy=pvY+sh[1], shz=e->z+sh[2];
-    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.46f, 0.24f,0.18f,0.95f,8,-0.92f,&ex,&ey,&ez);
-    set_uM(A,ex,ey,ez); sphere_sh(0.20f,0.20f,0.20f,8,5);
+    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.46f, 0.24f,0.18f,0.95f,10,-0.92f,&ex,&ey,&ez);
+    set_uM(A,ex,ey,ez); sphere_sh(0.20f,0.20f,0.20f,9,6);
     m3rotX(RE,up-eb); m3mul(S,RE,RZ); m3mul(F,M,S);
-    float wx,wy,wz; limb_seg(F,ex,ey,ez,-0.40f, 0.17f,0.12f,0.85f,8,-0.82f,&wx,&wy,&wz);
+    float wx,wy,wz; limb_seg(F,ex,ey,ez,-0.40f, 0.17f,0.12f,0.85f,10,-0.82f,&wx,&wy,&wz);
     for(int c=-1;c<=1;c++){ put(F,wx,wy,wz, c*0.12f,-0.18f,-0.10f); wedge_sh(0.06f,0.10f,0.46f); }
   }
   /* neck + wide skull on a low hunting carriage: the head sits in its own
@@ -2751,10 +2767,10 @@ static void draw_agent(Enemy*e,float dim){
     else if(dd<minr&&dd>1e-4f){ float k=minr/dd; tgx=hx+dxv*k;tgy=hy+dyv*k;tgz=hz+dzv*k; }
     float kx,ky,kz; ik2(hx,hy,hz,tgx,tgy,tgz,L1,L2,polex,polez,&kx,&ky,&kz);
     float UB[9]; aim_basis(kx-hx,ky-hy,kz-hz,UB);
-    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.105f,0.082f,L1*1.04f,8, -L1, &jx,&jy,&jz);
-    set_uM(M,jx,jy,jz); sphere_sh(0.085f,0.085f,0.085f,8,5);    /* knee cap */
+    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.105f,0.082f,L1*1.04f,10, -L1, &jx,&jy,&jz);
+    set_uM(M,jx,jy,jz); sphere_sh(0.085f,0.085f,0.085f,9,6);    /* knee cap */
     float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
-    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.078f,0.052f,L2*1.04f,8, -L2, &ax,&ay,&az);
+    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.078f,0.052f,L2*1.04f,10, -L2, &ax,&ay,&az);
     float FF[9],FR[9],FX[9]; m3rotY(FR,-e->yaw);
     m3rotX(FX,0.30f*swing*arun);     /* light dorsiflexion through the swing */
     m3mul(FF,FR,FX);
@@ -2777,7 +2793,7 @@ static void draw_agent(Enemy*e,float dim){
     set_uM(Mb,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.175f,0.27f,0.54f,9);
   glUniform3f(uNSc,1,1,1);
   /* shoulders: small caps on a wide frame */
-  for(int si=-1;si<=1;si+=2){ put(M,e->x,pvY,e->z,si*0.29f,0.62f,0); sphere_sh(0.085f,0.085f,0.085f,8,5); }
+  for(int si=-1;si<=1;si+=2){ put(M,e->x,pvY,e->z,si*0.29f,0.62f,0); sphere_sh(0.085f,0.085f,0.085f,9,6); }
   /* tie: a darker sliver down the chest */
   tintf(0.02f,0.03f,0.025f);
   put(M,e->x,pvY,e->z, 0,0.40f,-0.132f); bevbox_sh(0.08f,0.42f,0.02f,0.012f);
@@ -2814,10 +2830,10 @@ static void draw_agent(Enemy*e,float dim){
     float A[9],RX[9],RZ[9],S[9];
     m3rotX(RX,-raise+swA*e->fwdb); m3rotZ(RZ,-swA*e->latb*0.5f);
     m3mul(S,RX,RZ); m3mul(A,M,S);
-    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.072f,0.060f,0.38f,8, -0.37f, &ex,&ey,&ez);
-    set_uM(M,ex,ey,ez); sphere_sh(0.064f,0.064f,0.064f,8,5);   /* elbow cap */
+    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.072f,0.060f,0.38f,10, -0.37f, &ex,&ey,&ez);
+    set_uM(M,ex,ey,ez); sphere_sh(0.064f,0.064f,0.064f,9,6);   /* elbow cap */
     float F[9],RE[9]; m3rotX(RE,-raise+swA*e->fwdb-eb); m3mul(S,RE,RZ); m3mul(F,M,S);
-    float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.17f, 0.058f,0.050f,0.36f,8, -0.36f, &hx2,&hy2,&hz2);
+    float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.17f, 0.058f,0.050f,0.36f,10, -0.36f, &hx2,&hy2,&hz2);
     set_uM(F,hx2,hy2,hz2); wedge_sh(0.072f,0.12f,0.060f);  /* cut mitt */
     if(ai&&e->type==0&&raise>0.05f){ /* pistol in the raised hand */
       tintf(0.03f,0.035f,0.04f);
@@ -2901,10 +2917,10 @@ static void draw_player(void){
        * unfold as the avatar comes back to its feet. */
       float hipc=0.30f+1.10f*tuck, knee=0.55f+1.30f*tuck;
       float UL[9],RX[9]; m3rotX(RX,hipc); m3mul(UL,M,RX);
-      float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.22f, 0.10f,0.076f,0.46f,8, -0.44f, &kx,&ky,&kz);
-      set_uM(M,kx,ky,kz); sphere_sh(0.08f,0.08f,0.08f,8,5);
+      float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.22f, 0.10f,0.076f,0.46f,10, -0.44f, &kx,&ky,&kz);
+      set_uM(M,kx,ky,kz); sphere_sh(0.08f,0.08f,0.08f,9,6);
       float LL[9],RK[9]; m3rotX(RK,hipc+knee); m3mul(LL,M,RK);
-      float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.20f, 0.074f,0.050f,0.42f,8, -0.40f, &ax,&ay,&az);
+      float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.20f, 0.074f,0.050f,0.42f,10, -0.40f, &ax,&ay,&az);
       set_uM(LL,ax,ay,az); wedge_sh(0.12f,0.055f,0.24f);
       continue;
     }
@@ -2933,10 +2949,13 @@ static void draw_player(void){
     /* upper leg hip->knee, lower leg knee->ankle; each limb_seg reports its end
      * joint, which we reuse for the next joint and the caps (no recomputation) */
     float UB[9]; aim_basis(kx-hx,ky-hy,kz-hz,UB);
-    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.10f,0.076f,L1*1.04f,8, -L1, &jx,&jy,&jz);
-    set_uM(M,jx,jy,jz); sphere_sh(0.08f,0.08f,0.08f,8,5);   /* knee cap at limb end */
+    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.10f,0.076f,L1*1.04f,10, -L1, &jx,&jy,&jz);
+    set_uM(M,jx,jy,jz); sphere_sh(0.08f,0.08f,0.08f,9,6);   /* knee cap at limb end */
     float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
-    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.074f,0.050f,L2*1.04f,8, -L2, &ax,&ay,&az);
+    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.074f,0.050f,L2*1.04f,10, -L2, &ax,&ay,&az);
+    glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);   /* shin light strip */
+    put(LB,jx,jy,jz, li?0.043f:-0.043f,-0.24f,0); box_sh(0.007f,0.22f,0.007f);
+    glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
     float FF[9],FR[9],FX[9]; m3rotY(FR,poseYaw);
     m3rotX(FX,0.30f*swing*run);      /* light dorsiflexion through the swing */
     m3mul(FF,FR,FX);
@@ -2953,8 +2972,23 @@ static void draw_player(void){
     m3v(M,0,0.49f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.175f,0.155f,0.24f,9);
     m3v(M,0,0.87f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.165f,0.25f,0.50f,9); }
   glUniform3f(uNSc,1,1,1);
+  /* coat tails — the agents' best silhouette trick, now on the avatar: two
+   * hanging panels that kick out with the stride */
+  if(!rolling){
+    float flap=0.22f*run+0.16f*walk*run;
+    float CT[9],RXc[9]; m3rotX(RXc,-flap); m3mul(CT,M,RXc);
+    tintf(0.024f,0.032f,0.028f);
+    for(int ci=-1;ci<=1;ci+=2){
+      float o[3]; m3v(CT,ci*0.092f,-0.26f,0.118f,o);
+      set_uM(CT,px+o[0],pcy+0.49f*tk+o[1],pz+o[2]); bevbox_sh(0.175f,0.48f,0.042f,0.018f);
+    }
+  }
+  /* TRON belt bar: a thin emissive line across the waist front */
+  glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);
+  put(M,px,pcy,pz,0,0.49f*tk,-0.112f); box_sh(0.16f,0.012f,0.010f);
+  glUniform1f(uEmis,0.08f);
   tintf(0.05f,0.06f,0.055f);
-  for(int si=-1;si<=1;si+=2){ put(M,px,pcy,pz,si*0.27f,1.05f*tk,0); sphere_sh(0.08f,0.08f,0.08f,8,5); }
+  for(int si=-1;si<=1;si+=2){ put(M,px,pcy,pz,si*0.27f,1.05f*tk,0); sphere_sh(0.08f,0.08f,0.08f,9,6); }
 
   /* shoulders and arms. right arm: pistol carried/aimed via the SHARED solver
    * (player_arm_r — the same transform the laser and bullets read), katana
@@ -2962,10 +2996,13 @@ static void draw_player(void){
   tintf(0.04f,0.05f,0.045f);
   if(!blade){
     ArmR a; player_arm_r(&P,&a);
-    float ex,ey,ez; limb_seg(a.A,a.sx,a.sy,a.sz,-0.18f, 0.068f,0.056f,0.36f,8, -0.35f, &ex,&ey,&ez);
-    set_uM(M,ex,ey,ez); sphere_sh(0.060f,0.060f,0.060f,8,5);   /* elbow cap */
-    float hx2,hy2,hz2; limb_seg(a.F,ex,ey,ez,-0.16f, 0.054f,0.046f,0.34f,8, -0.33f, &hx2,&hy2,&hz2);
+    float ex,ey,ez; limb_seg(a.A,a.sx,a.sy,a.sz,-0.18f, 0.068f,0.056f,0.36f,10, -0.35f, &ex,&ey,&ez);
+    set_uM(M,ex,ey,ez); sphere_sh(0.060f,0.060f,0.060f,9,6);   /* elbow cap */
+    float hx2,hy2,hz2; limb_seg(a.F,ex,ey,ez,-0.16f, 0.054f,0.046f,0.34f,10, -0.33f, &hx2,&hy2,&hz2);
     set_uM(a.F,hx2,hy2,hz2); wedge_sh(0.068f,0.110f,0.055f);
+    glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);   /* forearm light strip */
+    put(a.F,ex,ey,ez, 0.046f,-0.16f,0); box_sh(0.008f,0.20f,0.008f);
+    glUniform1f(uEmis,0.08f);
     tintf(0.03f,0.035f,0.04f);
     pistol_sh(a.GP,a.gx,a.gy,a.gz,pammo);
     glUniform1f(uEmis,0.08f);
@@ -2989,7 +3026,7 @@ static void draw_player(void){
       else if(blade){ raise=0.52f+0.26f*swRel; swYaw=0.42f+0.32f*swRel; }
       /* swRel=1 is exactly the end-of-cut pose (0.78/0.74): the arm now
        * eases into the carry instead of snapping the frame the cut ends */
-    } else raise = 0.0f;
+    } else raise = 0.10f + 0.055f*sinf(gtime*1.5f)*(1.0f-run); /* low-ready + breath */
     /* the free arm swings out to balance the landing; the weapon arm holds
      * its aim so the laser never jumps when you touch down */
     if(!(ai&&(aimStance||blade))) raise += 0.42f*absorb;
@@ -3006,12 +3043,15 @@ static void draw_player(void){
      * (the avatar's forward).  Negative raise folds it backward over the
      * shoulder, which made the pistol look 180-degrees flipped. */
     m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(A,M,S);
-    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.068f,0.056f,0.36f,8, -0.35f, &ex,&ey,&ez);
-    set_uM(M,ex,ey,ez); sphere_sh(0.060f,0.060f,0.060f,8,5);   /* elbow cap */
+    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.068f,0.056f,0.36f,10, -0.35f, &ex,&ey,&ez);
+    set_uM(M,ex,ey,ez); sphere_sh(0.060f,0.060f,0.060f,9,6);   /* elbow cap */
     float F[9],RE[9]; m3rotX(RE,raise+sw+0.16f+(ai&&s>0?0.18f+0.18f*sinf(s*PI):0.0f));
     m3mul(S,RY,RE); m3mul(F,M,S);
-    float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.16f, 0.054f,0.046f,0.34f,8, -0.33f, &hx2,&hy2,&hz2);
+    float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.16f, 0.054f,0.046f,0.34f,10, -0.33f, &hx2,&hy2,&hz2);
     set_uM(F,hx2,hy2,hz2); wedge_sh(0.068f,0.110f,0.055f);
+    glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);   /* forearm light strip */
+    put(F,ex,ey,ez, ai?0.046f:-0.046f,-0.16f,0); box_sh(0.008f,0.20f,0.008f);
+    glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
     if(ai&&blade){
       /* the katana: dark blade, emissive emerald edge, square tsuba */
       float B[9],RB[9]; m3rotX(RB,1.35f); m3mul(B,F,RB);
@@ -3106,15 +3146,23 @@ static void draw_items(void){
     float bob=base+0.45f+0.1f*sinf(wtime*2.5f+i);
     m3rotY(M,wtime*1.5f+i);
     glUniform1f(uEmis,1); glUniform1f(uBump,0); glUniform1f(uGloss,0.4f);
-    if(items[i].type==0){ /* health: white cross-ish twin cubes */
+    if(items[i].type==0){ /* health: a true 3-axis cross (was flat edge-on) */
       tintf(1.5f,1.5f,1.6f);
       set_uM(M,items[i].x,bob,items[i].z); bevbox_sh(0.30f,0.10f,0.10f,0.022f);
       set_uM(M,items[i].x,bob,items[i].z); bevbox_sh(0.10f,0.30f,0.10f,0.022f);
+      set_uM(M,items[i].x,bob,items[i].z); bevbox_sh(0.10f,0.10f,0.30f,0.022f);
     } else {              /* pistol pickup */
       tintf(0.25f,1.5f,0.7f);
       set_uM(M,items[i].x,bob,items[i].z); bevbox_sh(0.09f,0.13f,0.30f,0.020f);
       float M2[9],R[9]; m3rotX(R,PI/3); m3mul(M2,M,R);
       set_uM(M2,items[i].x,bob-0.07f,items[i].z); bevbox_sh(0.07f,0.16f,0.07f,0.018f);
+    }
+    /* counter-rotating halo plates on world-time: they freeze with the world */
+    for(int k=0;k<3;k++){
+      float H[9]; m3rotY(H,-wtime*2.2f+i*0.7f+k*2.0943951f);
+      float o[3]; m3v(H,0.30f,0,0,o);
+      if(items[i].type==0) tintf(1.1f,1.1f,1.2f); else tintf(0.18f,1.2f,0.50f);
+      set_uM(H,items[i].x+o[0],bob+o[1],items[i].z+o[2]); box_sh(0.02f,0.012f,0.14f);
     }
     figDim=1.0f;
   }
@@ -3135,14 +3183,20 @@ static void draw_shards(void){
   glUniform1f(uEmis,0);
 }
 
-static void billboard(float x,float y,float z,float s,float r,float g,float b,float a,float ryaw){
-  float yr=ryaw*PI/180;
-  float rx=cosf(yr), rz=sinf(yr);
+/* camera basis for billboards, refreshed once per frame from pyaw+ppitch.
+ * The old sprites rotated only about Y, so every glow quad went edge-on the
+ * moment you looked down — fatal in a game built on platforms and leaps. */
+static float bbRx=1,bbRz=0, bbUx=0,bbUy=1,bbUz=0;
+static void bb_quad(float x,float y,float z,float hr,float hu,
+                    float r,float g,float b,float a){
   glColor4f(r,g,b,a);
-  glTexCoord2f(0,0); glVertex3f(x-rx*s,y-s,z-rz*s);
-  glTexCoord2f(1,0); glVertex3f(x+rx*s,y-s,z+rz*s);
-  glTexCoord2f(1,1); glVertex3f(x+rx*s,y+s,z+rz*s);
-  glTexCoord2f(0,1); glVertex3f(x-rx*s,y+s,z-rz*s);
+  glTexCoord2f(0,0); glVertex3f(x-bbRx*hr-bbUx*hu, y-bbUy*hu, z-bbRz*hr-bbUz*hu);
+  glTexCoord2f(1,0); glVertex3f(x+bbRx*hr-bbUx*hu, y-bbUy*hu, z+bbRz*hr-bbUz*hu);
+  glTexCoord2f(1,1); glVertex3f(x+bbRx*hr+bbUx*hu, y+bbUy*hu, z+bbRz*hr+bbUz*hu);
+  glTexCoord2f(0,1); glVertex3f(x-bbRx*hr+bbUx*hu, y+bbUy*hu, z-bbRz*hr+bbUz*hu);
+}
+static void billboard(float x,float y,float z,float s,float r,float g,float b,float a){
+  bb_quad(x,y,z,s,s,r,g,b,a);
 }
 
 /* contact shadows: a soft dark disc laid flat on the floor under every figure,
@@ -3198,8 +3252,8 @@ static void draw_bullets(float my){
   for(int i=0;i<MAXBUL;i++){
     Bullet*b=&bul[i]; if(!b->on)continue;
     float r=bcol[i][0],g=bcol[i][1],bl=bcol[i][2];
-    billboard(b->x,my*b->y,b->z,0.09f,r,g,bl,0.95f,pyaw+90);
-    billboard(b->x,my*b->y,b->z,0.22f,r*0.4f,g*0.4f,bl*0.4f,0.5f,pyaw+90);
+    billboard(b->x,my*b->y,b->z,0.09f,r,g,bl,0.95f);
+    billboard(b->x,my*b->y,b->z,0.22f,r*0.4f,g*0.4f,bl*0.4f,0.5f);
   }
   glEnd();
   glDisable(GL_TEXTURE_2D);
@@ -3268,11 +3322,11 @@ static void draw_player_laser(void){
   for(int q=1;q<=ticks;q++){
     float f=(float)q/(ticks+1), a=(0.08f+0.18f*f)*(0.35f+0.65f*grow);
     billboard(mx+(hx-mx)*f,my+(hy-my)*f,mz+(hz-mz)*f,0.020f+0.035f*grow,
-      locked?0.95f:0.04f,locked?0.13f:0.70f+0.65f*grow,locked?0.08f:0.28f,a,pyaw+90);
+      locked?0.95f:0.04f,locked?0.13f:0.70f+0.65f*grow,locked?0.08f:0.28f,a);
   }
   /* Leading cap: mostly constant size; position moving outward is the reload read. */
-  billboard(hx,hy,hz,0.080f+0.055f*grow,locked?1.90f:0.28f,locked?0.28f:1.90f,locked?0.12f:0.78f,0.84f,pyaw+90);
-  billboard(hx,hy,hz,0.190f+0.090f*grow,locked?0.75f:0.04f,locked?0.10f:0.75f,locked?0.06f:0.28f,0.28f,pyaw+90);
+  billboard(hx,hy,hz,0.080f+0.055f*grow,locked?1.90f:0.28f,locked?0.28f:1.90f,locked?0.12f:0.78f,0.84f);
+  billboard(hx,hy,hz,0.190f+0.090f*grow,locked?0.75f:0.04f,locked?0.10f:0.75f,locked?0.06f:0.28f,0.28f);
   glEnd();
   glDisable(GL_TEXTURE_2D);
 }
@@ -3286,17 +3340,49 @@ static void draw_slash(void){
   float cut=sstep(s);
   float aS=yr+0.66f, aE=aS-1.42f*cut;   /* right-shoulder -> left-hip, like the arm */
   float cy=py+1.34f;
-  glBegin(GL_TRIANGLE_STRIP);
-  for(int k=0;k<=16;k++){
-    float f=k/16.0f, a=aS+(aE-aS)*f;
-    float yk=cy+0.24f-0.58f*f;                /* high right -> low left diagonal */
-    float al=0.62f*f*f*(0.35f+0.65f*cut);
-    float sa=sinf(a),ca=-cosf(a);
-    glColor4f(0.20f*al,1.00f*al,0.45f*al,al);
-    glVertex3f(px+sa*0.54f,yk,pz+ca*0.54f);
-    glVertex3f(px+sa*1.48f,yk-0.08f,pz+ca*1.48f);
+  /* two layers: a wide soft wake under a narrow boosted core */
+  for(int layer=0;layer<2;layer++){
+    float r0=layer?0.60f:0.50f, r1=layer?1.42f:1.62f;
+    glBegin(GL_TRIANGLE_STRIP);
+    for(int k=0;k<=16;k++){
+      float f=k/16.0f, a=aS+(aE-aS)*f;
+      float yk=cy+0.24f-0.58f*f;              /* high right -> low left diagonal */
+      float al=0.62f*f*f*(0.35f+0.65f*cut)*(layer?1.25f:0.45f);
+      float sa=sinf(a),ca=-cosf(a);
+      if(layer) glColor4f(0.20f*al,1.00f*al,0.45f*al,al);
+      else      glColor4f(0.10f*al,0.55f*al,0.30f*al,al);
+      glVertex3f(px+sa*r0,yk,pz+ca*r0);
+      glVertex3f(px+sa*r1,yk-0.08f,pz+ca*r1);
+    }
+    glEnd();
   }
-  glEnd();
+}
+
+/* upload the 8 nearest lights (static + temp) to (x,z). Once per frame for
+ * the world batches — and once per FIGURE, so an agent 25u away is lit by
+ * the emitters around IT, not whichever eight happen to hug the camera. */
+static void set_lights(float x,float z){
+  float lp[SHLIGHTS*4]={0}, lc[SHLIGHTS*3]={0}; int ln=0;
+  typedef struct{float d2;int i;int tmp;}LS; LS sl[MAXLIGHT+MAXTEMPL]; int sn=0;
+  for(int i=0;i<nlights;i++){ float dx=lights[i].x-x,dz=lights[i].z-z;
+    sl[sn++] = (LS){dx*dx+dz*dz,i,0}; }
+  for(int i=0;i<MAXTEMPL;i++) if(templ_[i].life>0){ float dx=templ_[i].x-x,dz=templ_[i].z-z;
+    sl[sn++] = (LS){dx*dx+dz*dz,i,1}; }
+  /* only the nearest SHLIGHTS matter, so stop after that many selection passes */
+  int nsel=sn<SHLIGHTS?sn:SHLIGHTS;
+  for(int a=0;a<nsel;a++)for(int b=a+1;b<sn;b++) if(sl[b].d2<sl[a].d2){LS t=sl[a];sl[a]=sl[b];sl[b]=t;}
+  for(int k=0;k<sn && ln<SHLIGHTS;k++){
+    if(sl[k].tmp){ TempL*t=&templ_[sl[k].i];
+      lp[ln*4]=t->x;lp[ln*4+1]=t->y;lp[ln*4+2]=t->z;lp[ln*4+3]=t->r;
+      lc[ln*3]=t->cr;lc[ln*3+1]=t->cg;lc[ln*3+2]=t->cb;
+    } else { Light*l=&lights[sl[k].i];
+      lp[ln*4]=l->x;lp[ln*4+1]=l->y;lp[ln*4+2]=l->z;lp[ln*4+3]=l->r;
+      lc[ln*3]=l->cr;lc[ln*3+1]=l->cg;lc[ln*3+2]=l->cb; }
+    ln++;
+  }
+  glUniform1i(uNL,ln);
+  glUniform4fv(uLpos,SHLIGHTS,lp);
+  glUniform3fv(uLcol,SHLIGHTS,lc);
 }
 
 static void draw_world(float camx,float camy,float camz){
@@ -3314,29 +3400,7 @@ static void draw_world(float camx,float camy,float camz){
    * program has to tonemap on its own or the frame reaches the window unlit */
   glUniform1f(uTonemap, postOK?0.0f:1.0f);
 
-  /* pick 8 nearest lights (static + temp) */
-  float lp[SHLIGHTS*4]={0}, lc[SHLIGHTS*3]={0}; int ln=0;
-  typedef struct{float d2;int i;int tmp;}LS; LS sl[MAXLIGHT+MAXTEMPL]; int sn=0;
-  for(int i=0;i<nlights;i++){ float dx=lights[i].x-camx,dz=lights[i].z-camz;
-    sl[sn++] = (LS){dx*dx+dz*dz,i,0}; }
-  for(int i=0;i<MAXTEMPL;i++) if(templ_[i].life>0){ float dx=templ_[i].x-camx,dz=templ_[i].z-camz;
-    sl[sn++] = (LS){dx*dx+dz*dz,i,1}; }
-  /* only the nearest SHLIGHTS matter, so stop after that many selection passes
-   * instead of fully sorting all ~80 candidates every frame */
-  int nsel=sn<SHLIGHTS?sn:SHLIGHTS;
-  for(int a=0;a<nsel;a++)for(int b=a+1;b<sn;b++) if(sl[b].d2<sl[a].d2){LS t=sl[a];sl[a]=sl[b];sl[b]=t;}
-  for(int k=0;k<sn && ln<SHLIGHTS;k++){
-    if(sl[k].tmp){ TempL*t=&templ_[sl[k].i];
-      lp[ln*4]=t->x;lp[ln*4+1]=t->y;lp[ln*4+2]=t->z;lp[ln*4+3]=t->r;
-      lc[ln*3]=t->cr;lc[ln*3+1]=t->cg;lc[ln*3+2]=t->cb;
-    } else { Light*l=&lights[sl[k].i];
-      lp[ln*4]=l->x;lp[ln*4+1]=l->y;lp[ln*4+2]=l->z;lp[ln*4+3]=l->r;
-      lc[ln*3]=l->cr;lc[ln*3+1]=l->cg;lc[ln*3+2]=l->cb; }
-    ln++;
-  }
-  glUniform1i(uNL,ln);
-  glUniform4fv(uLpos,SHLIGHTS,lp);
-  glUniform3fv(uLcol,SHLIGHTS,lc);
+  set_lights(camx,camz);
 
   glEnableClientState(GL_VERTEX_ARRAY);
   glEnableClientState(GL_NORMAL_ARRAY);
@@ -3360,6 +3424,7 @@ static void draw_world(float camx,float camy,float camz){
       float rf=clampf(1.0f-en[i].y/0.9f,0,1);
       if(rf<=0.02f)continue;
       figDim=rf;
+      set_lights(en[i].x,en[i].z);
       if(en[i].type==2) draw_boss(&en[i]); else draw_agent(&en[i],0.6f);
       figDim=1.0f;
     }
@@ -3367,8 +3432,9 @@ static void draw_world(float camx,float camy,float camz){
      * casting no mirror image, which read as the player floating above it */
     if(gstate==ST_PLAY||gstate==ST_WIN){
       float pf=clampf(1.0f-py/0.9f,0,1);
-      if(pf>0.02f){ figDim=pf; draw_player(); figDim=1.0f; }
+      if(pf>0.02f){ figDim=pf; set_lights(px,pz); draw_player(); figDim=1.0f; }
     }
+    set_lights(camx,camz);
     draw_items();
     draw_shards();
     refl=0;
@@ -3464,9 +3530,11 @@ static void draw_world(float camx,float camy,float camz){
   for(int i=0;i<nen;i++){       /* beyond ~36u the fog has swallowed them */
     float ddx=en[i].x-camx, ddz=en[i].z-camz;
     if(ddx*ddx+ddz*ddz>38.0f*38.0f)continue;
+    set_lights(en[i].x,en[i].z);   /* lit by the emitters around THEM */
     if(en[i].type==2) draw_boss(&en[i]); else draw_agent(&en[i],1.0f);
   }
-  if(gstate==ST_PLAY||gstate==ST_WIN) draw_player();  /* victory freeze keeps the figure */
+  if(gstate==ST_PLAY||gstate==ST_WIN){ set_lights(px,pz); draw_player(); }
+  set_lights(camx,camz);
   draw_items();
   draw_shards();
   glUseProgram(0);
@@ -3478,11 +3546,13 @@ static void draw_world(float camx,float camy,float camz){
   glBegin(GL_QUADS);
   for(int i=0;i<nlights;i++)
     billboard(lights[i].x,lights[i].y,lights[i].z,0.30f,
-      lights[i].cr*0.22f,lights[i].cg*0.22f,lights[i].cb*0.22f,1,pyaw+90);
-  if(mzT>0){ /* the avatar's muzzle flash */
+      lights[i].cr*0.22f,lights[i].cg*0.22f,lights[i].cb*0.22f,1);
+  if(mzT>0){ /* the avatar's muzzle flash: core + 4-point star spikes */
     float a=mzT/0.06f;
-    billboard(mzX,mzY,mzZ,0.10f+0.10f*a, 0.9f,1.8f,1.0f,a,pyaw+90);
-    billboard(mzX,mzY,mzZ,0.30f, 0.25f,0.9f,0.45f,a*0.5f,pyaw+90);
+    billboard(mzX,mzY,mzZ,0.10f+0.10f*a, 0.9f,1.8f,1.0f,a);
+    billboard(mzX,mzY,mzZ,0.30f, 0.25f,0.9f,0.45f,a*0.5f);
+    bb_quad(mzX,mzY,mzZ,0.55f*a,0.030f, 0.7f,1.9f,1.0f,a*0.8f);
+    bb_quad(mzX,mzY,mzZ,0.030f,0.30f*a, 0.7f,1.9f,1.0f,a*0.6f);
   }
   /* agent muzzle flashes: amber against the player's emerald, so at a glance
    * you can tell who fired. They live on world time, so a flash caught at
@@ -3490,28 +3560,28 @@ static void draw_world(float camx,float camy,float camz){
   for(int i=0;i<nen;i++){
     if(en[i].mzT<=0)continue;
     float a=clampf(en[i].mzT/0.07f,0,1);
-    billboard(en[i].mzx,en[i].mzy,en[i].mzz,0.09f+0.09f*a, 1.9f,1.0f,0.35f,a,pyaw+90);
-    billboard(en[i].mzx,en[i].mzy,en[i].mzz,0.28f, 0.90f,0.40f,0.12f,a*0.5f,pyaw+90);
+    billboard(en[i].mzx,en[i].mzy,en[i].mzz,0.09f+0.09f*a, 1.9f,1.0f,0.35f,a);
+    billboard(en[i].mzx,en[i].mzy,en[i].mzz,0.28f, 0.90f,0.40f,0.12f,a*0.5f);
+    bb_quad(en[i].mzx,en[i].mzy,en[i].mzz,0.40f*a,0.022f, 1.9f,1.0f,0.35f,a*0.7f);
+    bb_quad(en[i].mzx,en[i].mzy,en[i].mzz,0.022f,0.22f*a, 1.9f,1.0f,0.35f,a*0.5f);
   }
   /* a soft aura over each pickup — the eye/blade halos are gone: real bloom
    * picks those up straight off the emissive geometry now */
   for(int i=0;i<nitems;i++){
     if(items[i].taken)continue;
     float bob=floor_at(items[i].x,items[i].z)+0.45f+0.1f*sinf(wtime*2.5f+i);
-    if(items[i].type==0) billboard(items[i].x,bob,items[i].z,0.34f, 0.7f,0.7f,0.78f,0.5f,pyaw+90);
-    else                 billboard(items[i].x,bob,items[i].z,0.34f, 0.12f,0.8f,0.38f,0.5f,pyaw+90);
+    if(items[i].type==0) billboard(items[i].x,bob,items[i].z,0.34f, 0.7f,0.7f,0.78f,0.5f);
+    else                 billboard(items[i].x,bob,items[i].z,0.34f, 0.12f,0.8f,0.38f,0.5f);
   }
-  glEnd();
-  glDisable(GL_TEXTURE_2D);
-  glPointSize(4);
-  glBegin(GL_POINTS);
+  /* particles as small glow sprites: fixed 4px GL_POINTS neither scaled
+   * with distance nor matched the sprite language of every other emitter */
   for(int i=0;i<MAXPART;i++){
     Part*p=&parts[i]; if(p->life<=0)continue;
     float a=p->life/p->max;
-    glColor4f(p->cr,p->cg,p->cb,a);
-    glVertex3f(p->x,p->y,p->z);
+    bb_quad(p->x,p->y,p->z,0.045f,0.045f,p->cr,p->cg,p->cb,a);
   }
   glEnd();
+  glDisable(GL_TEXTURE_2D);
   draw_bullets(1.0f);
   draw_lasers();
   draw_player_laser();
@@ -4200,6 +4270,9 @@ int main(int argc,char**argv){
     glRotatef(pyaw+shx,0,1,0);
     glTranslatef(-camx,-camy,-camz);
 
+    { float yrb=pyaw*PI/180.0f, prb=ppitch*PI/180.0f;   /* billboard basis */
+      bbRx=cosf(yrb); bbRz=sinf(yrb);
+      bbUx=sinf(yrb)*sinf(prb); bbUy=cosf(prb); bbUz=-cosf(yrb)*sinf(prb); }
     draw_world(camx,camy,camz);
     /* tonemap + bloom + grade. ts01 is the timescale remapped to 0..1 so the
      * composite can grade toward the frozen look without knowing about MINTS. */
