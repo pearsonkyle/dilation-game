@@ -1466,11 +1466,13 @@ static float coyT;                          /* coyote time: late edge jumps   */
 static float hurtCD;                        /* post-hit mercy window          */
 static float mzT,mzX,mzY,mzZ;               /* avatar muzzle flash            */
 static float landT;                         /* landing absorb 1->0, knee dip  */
+static float airB;                          /* smoothed airborne blend 0..1   */
 static float hitstop;                       /* impact freeze: pins the world  */
 
 static float player_height(void){ return rollT>0 ? 0.85f : 1.72f; }
 static float player_camh(void){ return py + (rollT>0 ? 1.45f : 1.92f); }
 static float fireCD,swingT,swingCD,dmgFlash,stepT,shake,bobT,winT,gtime,wtime,msgT;
+static float swRel,swStow;   /* katana exit blends: end-of-cut->carry, carry->pistol */
 static float gunCharge;                       /* 0..1, controls laser/shot range */
 static float aimSet=1,stableT;      /* physical aim: 0 = gun rides the running
                                        body, 1 = settled on the look ray after
@@ -1495,9 +1497,10 @@ static void reset_game(void){
   tscale=tsEff=1; actT=0; mouseAcc=0;
   aimSet=1; stableT=GUN_SETTLE_TIME;   /* you jack in standing still: settled */
   rollT=rollCD=rollDX=rollDZ=kvx=kvz=pmoveb=0;
-  coyT=hurtCD=mzT=landT=hitstop=0;
+  coyT=hurtCD=mzT=landT=hitstop=airB=0;
   camDist=3.05f; camYs=-1.0f;
   fireCD=swingT=swingCD=dmgFlash=stepT=shake=bobT=winT=wtime=0;
+  swRel=swStow=0;
   gunCharge=0;
   msgT=3.0f;
   laserTarget=-1;
@@ -1659,7 +1662,7 @@ static void player_aim(float*dx,float*dy,float*dz){
  * the ballistics can never drift apart. */
 typedef struct {
   int rolling,blade,aimStance;
-  float tuck,tk,walk,walk2,s,spd,run,fwdb,latb,absorb,poseYaw,pcy;
+  float tuck,tk,walk,armw,s,spd,run,fwdb,latb,absorb,poseYaw,pcy;
   float M[9];
 } PPose;
 static void player_pose(PPose*P){
@@ -1667,7 +1670,11 @@ static void player_pose(PPose*P){
   float rp = P->rolling? sstep(1.0f-rollT/ROLL_TIME) : 0; /* roll progress    */
   P->tuck = P->rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
   P->tk = 1.0f-0.50f*P->tuck;                          /* anchors pull in    */
-  P->walk = sinf(bobT*7.5f); P->walk2 = sinf(bobT*7.5f+PI);
+  P->walk = sinf(bobT*7.5f);
+  /* contralateral arm phase: the arms were driven by sin (peaking at ph=PI/2),
+   * 90 degrees out of phase with the legs' triangle stride (peaking at ph=0).
+   * cos peaks with the stride: right arm forward as the LEFT leg plants. */
+  P->armw = cosf(bobT*7.5f);
   P->s = swingT>0? clampf(swingT/SWING_TIME,0,1) : 0;  /* katana swing phase */
   P->blade = P->s>0 || swingCD>0;                      /* + follow-through   */
   P->aimStance = !P->rolling && !P->blade;
@@ -1695,7 +1702,8 @@ static void player_pose(PPose*P){
    * the difference — the same trick the boss uses on its leap recoil. */
   P->absorb = P->rolling? 0 : landT*landT;
   float lean = P->rolling? rp*2*PI
-             : (0.07f+0.07f*clampf(P->fwdb,0,1))*P->run + 0.20f*P->absorb;
+             : (0.07f+0.07f*clampf(P->fwdb,0,1))*P->run + 0.20f*P->absorb
+               + 0.10f*airB;                      /* slight airborne pitch-in */
   float sway = P->rolling? 0
              : (-0.10f*P->latb*P->run + 0.025f*P->walk*P->run); /* counter-tilt */
   float R[9],X[9],Z[9],S0[9];
@@ -1730,8 +1738,13 @@ static void player_arm_r(const PPose*P,ArmR*o){
     raise = rc+(rs-rc)*aimSet;
     swYaw = 0.06f*(1.0f-aimSet)+(-0.12f-0.05f*P->latb)*aimSet;
     float aimDamp=1.0f+(0.18f-1.0f)*aimSet;       /* settle kills the pumping */
-    sw = P->walk2*0.42f*P->run*aimDamp*clampf(1.3f-raise,0,1);
+    sw = P->armw*0.42f*P->run*aimDamp*clampf(1.3f-raise,0,1);
     raise += 0.42f*P->absorb*(1.0f-aimSet);       /* landings jolt the carry  */
+    /* re-stow: the frame the katana leaves the hand the arm was at the
+     * 0.52/0.42 carry — ease from there into the pistol pose. The alignment
+     * below keeps the barrel exact regardless of the blended raise. */
+    raise += (0.52f-raise)*swStow;
+    swYaw += (0.42f-swYaw)*swStow;
   }
   float sh[3]; m3v(P->M,0.27f,1.05f*P->tk,0,sh);
   o->sx=px+sh[0]; o->sy=P->pcy+sh[1]; o->sz=pz+sh[2];
@@ -1805,7 +1818,7 @@ static int laser_target(void){
   return best;
 }
 static void fire(void){
-  if(fireCD>0||rollT>0)return;
+  if(fireCD>0||rollT>0||swingT>0)return;   /* that hand is holding a katana */
   if(pammo<=0){ sfx(V_CLICK); fireCD=0.3f; gunCharge=0; return; }
   /* sample the barrel FIRST: the round leaves the gun as it was at trigger
    * pull — where the gun physically points, not where the camera looks —
@@ -2171,8 +2184,12 @@ static void update_enemies(float wdt){
         if(e->state_t>aimTime){
           /* a three-round fan, aimed at your stance RIGHT NOW —
            * roll under it, jump over it, or stand still and study it */
-          float my=e->y+1.36f, aimY=py+1.28f;
-          float hx=e->x+sinf(e->yaw)*0.45f, hz=e->z-cosf(e->yaw)*0.45f;
+          /* fire from the drawn RIGHT hand (shoulder +0.29 lateral, arm
+           * raised forward), not the old chest-centreline point — the flash
+           * and rounds now leave the pistol the pose is holding */
+          float my=e->y+1.62f, aimY=py+1.28f;
+          float hx=e->x+sinf(e->yaw)*0.55f+cosf(e->yaw)*0.29f;
+          float hz=e->z-cosf(e->yaw)*0.55f+sinf(e->yaw)*0.29f;
           for(int k=-1;k<=1;k++){
             float sp=k*0.14f+(frand()-0.5f)*0.03f;
             float bdx=dx+(-dz)*sp, bdz=dz+dx*sp;
@@ -2196,12 +2213,21 @@ static void update_enemies(float wdt){
           move_circ(&e->x,&e->z,-dz/d*sgn*1.8f*wdt,dx/d*sgn*1.8f*wdt,0.32f,e->y); }
         if(e->state_t>0){ e->state=0; e->state_t=0; }
         break;
-      case 3: /* striker lunge */
+      case 3: /* striker lunge: wind up, then hurl the body through the blow */
         e->yaw=atan2f(dx,-dz);
         e->state_t+=wdt;
-        if(e->state_t>=lungeWind && !e->struck){
-          if(d<2.0f && fabsf(py-e->y)<1.3f)hurt_player(26);
-          e->struck=1;
+        if(e->state_t>=lungeWind){
+          /* root motion through the strike: the throw pose used to play out
+           * at a standstill — now the body carries the blow. Same edge guard
+           * as the walk, so a dash never strands an agent off a roof. */
+          float ox=e->x,oz=e->z;
+          move_circ(&e->x,&e->z, dx/d*7.0f*wdt, dz/d*7.0f*wdt, 0.32f, e->y);
+          if(e->y-ground_h(e->x,e->z,e->y) > 0.65f){ e->x=ox; e->z=oz; }
+          if(!e->struck){
+            float ndx=px-e->x, ndz=pz-e->z, nd=sqrtf(ndx*ndx+ndz*ndz);
+            if(nd<2.0f && fabsf(py-e->y)<1.3f)hurt_player(26);
+            e->struck=1;
+          }
         }
         /* The old version dropped straight into cooldown on the strike frame,
          * which made draw_agent's forward-thrust pose unreachable — every lunge
@@ -2500,14 +2526,20 @@ static void draw_boss(Enemy*e){
     float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.42f, 0.22f,0.15f,0.86f,8, -0.84f, &ax,&ay,&az);
     put(LL,ax,ay,az,0,-0.04f,-0.22f); wedge_sh(0.34f,0.18f,0.55f);
   }
-  /* thorax: barrel waist swelling into a bulbous chest */
+  /* thorax: barrel waist swelling into a bulbous chest. Everything above the
+   * hips hangs off ONE pivot through the lean basis, so the hunting hunch,
+   * the leap rear-back and the landing bow actually carry the mass forward
+   * and down instead of rotating each part around its own fixed point. */
+  float pvY=by+1.65f;
   float Tt[9]; memcpy(Tt,M,36); m3scl(Tt,breath,1.0f,breath*0.85f);
-  set_uM(Tt,e->x,by+2.05f,e->z); cyl_sh(0.55f,0.72f,1.15f,10);
-  set_uM(Tt,e->x,by+3.05f,e->z); sphere_sh(0.80f,0.72f,0.66f,10,7);
+  { float o[3]; m3v(M,0,0.40f,0,o);
+    set_uM(Tt,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.55f,0.72f,1.15f,10);
+  { float o[3]; m3v(M,0,1.40f,0,o);
+    set_uM(Tt,e->x+o[0],pvY+o[1],e->z+o[2]); } sphere_sh(0.80f,0.72f,0.66f,10,7);
   /* spine vents: a faint emissive ridge that brightens with phase */
   glUniform1f(uEmis,0.5f+0.5f*ph);
   tintf(0.6f+0.5f*ph,0.9f-0.3f*ph,0.4f);
-  for(int sgi=0;sgi<3;sgi++){ put(M,e->x,by+2.5f+sgi*0.45f,e->z,0,0,0.45f); box_sh(0.05f,0.12f,0.08f); }
+  for(int sgi=0;sgi<3;sgi++){ put(M,e->x,pvY,e->z,0,0.85f+sgi*0.45f,0.45f); box_sh(0.05f,0.12f,0.08f); }
   glUniform1f(uEmis,0.10f+fl+0.05f*ph);
   tintf(sr+fl,sg+fl*0.6f,sb+fl*0.7f);
 
@@ -2526,8 +2558,8 @@ static void draw_boss(Enemy*e){
     float A[9],F[9],RX[9],RE[9],RZ[9],S[9];
     m3rotZ(RZ,ai*0.26f);
     m3rotX(RX,up);    m3mul(S,RX,RZ); m3mul(A,M,S);
-    float sh[3]; m3v(M,ai*0.82f,0,0,sh);
-    float shx=e->x+sh[0], shy=by+3.45f, shz=e->z+sh[2];
+    float sh[3]; m3v(M,ai*0.82f,1.80f,0,sh);
+    float shx=e->x+sh[0], shy=pvY+sh[1], shz=e->z+sh[2];
     float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.46f, 0.24f,0.18f,0.95f,8,-0.92f,&ex,&ey,&ez);
     set_uM(A,ex,ey,ez); sphere_sh(0.20f,0.20f,0.20f,8,5);
     m3rotX(RE,up-eb); m3mul(S,RE,RZ); m3mul(F,M,S);
@@ -2539,23 +2571,25 @@ static void draw_boss(Enemy*e){
      face and eye cluster track together instead of staring level */
   float nod=-0.10f-0.05f*ph+0.07f*sinf(e->anim)*e->moveb+0.30f*crouch;
   float Hh[9],HX[9]; m3rotX(HX,nod); m3mul(Hh,M,HX);
-  set_uM(M,e->x,by+3.78f,e->z); cyl_sh(0.26f,0.40f,0.30f,8);
-  put(Hh,e->x,by+4.15f,e->z,0,0,0); sphere_sh(0.58f,0.46f,0.62f,10,7);
-  put(Hh,e->x,by+4.15f,e->z,0,0.13f,-0.35f); bevbox_sh(0.62f,0.12f,0.30f,0.03f);  /* brow */
+  put(M,e->x,pvY,e->z,0,2.13f,0); cyl_sh(0.26f,0.40f,0.30f,8);
+  float hb[3]; m3v(M,0,2.50f,0,hb);
+  float hcx=e->x+hb[0], hcy=pvY+hb[1], hcz=e->z+hb[2];   /* skull centre */
+  put(Hh,hcx,hcy,hcz,0,0,0); sphere_sh(0.58f,0.46f,0.62f,10,7);
+  put(Hh,hcx,hcy,hcz,0,0.13f,-0.35f); bevbox_sh(0.62f,0.12f,0.30f,0.03f);  /* brow */
   /* swept horn crown: gives the skull a read from behind and above, where the
    * eye cluster is hidden and the boss was otherwise just a large lump */
   for(int hi=-1;hi<=1;hi+=2){
     float HR[9],RZh[9],RXh[9],Sh2[9],o[3];
     m3rotZ(RZh,hi*0.62f); m3rotX(RXh,0.30f); m3mul(Sh2,RZh,RXh); m3mul(HR,Hh,Sh2);
     m3v(Hh,hi*0.34f,0.36f,0.02f,o);
-    set_uM(HR,e->x+o[0],by+4.15f+o[1],e->z+o[2]); cyl_sh(0.125f,0.012f,0.66f,6);
+    set_uM(HR,hcx+o[0],hcy+o[1],hcz+o[2]); cyl_sh(0.125f,0.012f,0.66f,6);
   }
   /* eye cluster: emerald -> furnace red across phases, flaring with the roar */
   float glow=1.0f+e->roar*2.0f+0.5f*ph;
   glUniform1f(uEmis,1.0f);
   tintf((0.5f+0.9f*ph)*glow,(1.6f-0.6f*ph)*glow,0.35f*glow);
   float eyx[5]={-0.30f,-0.15f,0.0f,0.15f,0.30f}, eyy[5]={0.04f,0.11f,0.15f,0.11f,0.04f};
-  for(int q=0;q<5;q++){ put(Hh,e->x,by+4.15f,e->z, eyx[q],eyy[q],-0.50f); sphere_sh(0.075f,0.075f,0.05f,7,5); }
+  for(int q=0;q<5;q++){ put(Hh,hcx,hcy,hcz, eyx[q],eyy[q],-0.50f); sphere_sh(0.075f,0.075f,0.05f,7,5); }
   glUniform1f(uEmis,0); glUniform1f(uRim,0);
   primArm=0;
 }
@@ -2568,7 +2602,7 @@ static void draw_agent(Enemy*e,float dim){
   primArm=1;
   float M[9],R[9],X[9];
   float by=e->y;
-  float walk = sinf(e->anim), walk2=sinf(e->anim+PI);
+  float walk = sinf(e->anim), armw = cosf(e->anim); /* armw: contralateral arm phase */
   /* the striker's lunge, split into anticipation and blow. The windup length
    * tracks the AI's own difficulty-scaled lungeWind instead of the hardcoded
    * 0.32 that used to sit exactly ON the state change, and both halves ease
@@ -2645,8 +2679,8 @@ static void draw_agent(Enemy*e,float dim){
     if(pl>1e-4f){ polex/=pl; polez/=pl; } else { polex=0; polez=-1; } }
   for(int li=0;li<2;li++){
     float side=li?0.14f:-0.14f;
-    float hip[3]; m3v(M,side,0,0,hip);
-    float hx=e->x+hip[0], hy=by+0.92f+hip[1], hz=e->z+hip[2];
+    float hip[3]; m3v(M,side,-0.10f,0,hip);           /* through the pelvis pivot */
+    float hx=e->x+hip[0], hy=by+1.02f+hip[1], hz=e->z+hip[2];
     float ph=fmodf(e->anim+(li?PI:0.0f), 2*PI); if(ph<0)ph+=2*PI;
     float tri   = ph<PI ? 1.0f-2.0f*ph/PI : -1.0f+2.0f*(ph-PI)/PI;
     float swing = ph<PI ? 0.0f : sinf(ph-PI);
@@ -2663,22 +2697,30 @@ static void draw_agent(Enemy*e,float dim){
     set_uM(M,jx,jy,jz); sphere_sh(0.085f,0.085f,0.085f,8,5);    /* knee cap */
     float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
     float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.078f,0.052f,L2*1.04f,8, -L2, &ax,&ay,&az);
-    float FF[9]; m3rotY(FF,-e->yaw);                            /* foot stays flat */
-    set_uM(FF,ax,by+0.027f,az); wedge_sh(0.12f,0.065f,0.27f);
+    float FF[9],FR[9],FX[9]; m3rotY(FR,-e->yaw);
+    m3rotX(FX,0.30f*swing*arun);     /* light dorsiflexion through the swing */
+    m3mul(FF,FR,FX);
+    set_uM(FF,ax,ay-0.003f,az); wedge_sh(0.12f,0.065f,0.27f);  /* solved ankle */
   }
   /* pelvis + chest: hips wider than the waist, chest flares to the shoulders
    * — the V-taper. Depth-squashed to a slab; idle gets a breathing swell. */
   float br=1.0f+0.018f*sinf(wtime*1.8f+e->phase)*(1.0f-e->moveb);
   float Mt[9]; memcpy(Mt,M,36); m3scl(Mt,1.0f,1.0f,0.60f);
-  set_uM(Mt,e->x,by+1.02f,e->z); cyl_sh(0.185f,0.165f,0.26f,9);
+  /* the whole upper body hangs off ONE pelvis pivot: every part above it is
+   * an offset THROUGH the lean basis M, so a striker's 0.62-rad lunge lean
+   * (and the idle weight shift) translates the chest and head instead of
+   * spinning each piece in place around its own fixed world point */
+  float pvY=by+1.02f;
+  { float o[3]; m3v(M,0,0,0,o);
+    set_uM(Mt,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.185f,0.165f,0.26f,9);
   float Mb[9]; memcpy(Mb,Mt,36); m3scl(Mb,br,1.0f,br);
-  set_uM(Mb,e->x,by+1.40f,e->z); cyl_sh(0.175f,0.27f,0.54f,9);
+  { float o[3]; m3v(M,0,0.38f,0,o);
+    set_uM(Mb,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.175f,0.27f,0.54f,9);
   /* shoulders: small caps on a wide frame */
-  for(int si=-1;si<=1;si+=2){ put(M,e->x,by+1.40f,e->z,si*0.29f,0.24f,0); sphere_sh(0.085f,0.085f,0.085f,8,5); }
+  for(int si=-1;si<=1;si+=2){ put(M,e->x,pvY,e->z,si*0.29f,0.62f,0); sphere_sh(0.085f,0.085f,0.085f,8,5); }
   /* tie: a darker sliver down the chest */
   tintf(0.02f,0.03f,0.025f);
-  { float to[3]; m3v(Mt,0,0,-0.22f,to);
-    set_uM(M,e->x+to[0],by+1.42f+to[1],e->z+to[2]); bevbox_sh(0.08f,0.42f,0.02f,0.012f); }
+  put(M,e->x,pvY,e->z, 0,0.40f,-0.132f); bevbox_sh(0.08f,0.42f,0.02f,0.012f);
   /* coat tails: two hanging panels off the back of the waist. They kick out with
    * the stride, which is what finally sells the agents as figures in long coats
    * rather than mannequins — the silhouette moves even when the limbs are still. */
@@ -2705,10 +2747,10 @@ static void draw_agent(Enemy*e,float dim){
      * by any raised arm, which owns its own eased motion. */
     raise += 0.055f*sinf(wtime*1.5f+e->phase+ai*2.1f)
              *(1.0f-e->moveb)*clampf(1.0f-raise*1.5f,0,1);
-    float swA=(ai?walk2:walk)*0.4f*e->moveb*clampf(1.0f-raise*2.0f,0,1);
+    float swA=(ai?armw:-armw)*0.4f*e->moveb*clampf(1.0f-raise*2.0f,0,1);
     float eb=0.30f+0.55f*sstep(clampf(raise/1.45f,0,1));
-    float sh[3]; m3v(M,ai?0.29f:-0.29f,0.24f,0,sh);
-    float shx=e->x+sh[0],shy=by+1.40f+sh[1],shz=e->z+sh[2];
+    float sh[3]; m3v(M,ai?0.29f:-0.29f,0.62f,0,sh);
+    float shx=e->x+sh[0],shy=pvY+sh[1],shz=e->z+sh[2];
     float A[9],RX[9],RZ[9],S[9];
     m3rotX(RX,-raise+swA*e->fwdb); m3rotZ(RZ,-swA*e->latb*0.5f);
     m3mul(S,RX,RZ); m3mul(A,M,S);
@@ -2725,27 +2767,29 @@ static void draw_agent(Enemy*e,float dim){
   }
   /* defined neck + cut-gem head with hard brow and jaw lines. The head rides a
    * sub-basis (Mh) that adds the smoothed head-look so the skull tracks you. */
-  set_uM(M,e->x,by+1.665f,e->z); cyl_sh(0.055f,0.070f,0.15f,8);
+  put(M,e->x,pvY,e->z, 0,0.645f,0); cyl_sh(0.055f,0.070f,0.15f,8);
   float Mh[9],HY[9],HX[9],HL[9];
   m3rotY(HY,-e->headYaw); m3rotX(HX,e->headPitch); m3mul(HL,HY,HX); m3mul(Mh,M,HL);
-  set_uM(Mh,e->x,by+1.85f,e->z); sphere_sh(0.125f,0.16f,0.135f,9,6);
-  put(Mh,e->x,by+1.85f,e->z,0,-0.12f,-0.045f); bevbox_sh(0.16f,0.09f,0.18f,0.022f);
-  put(Mh,e->x,by+1.85f,e->z,0,0.075f,-0.075f); bevbox_sh(0.20f,0.035f,0.10f,0.014f);
+  float hb[3]; m3v(M,0,0.83f,0,hb);
+  float hcx=e->x+hb[0], hcy=pvY+hb[1], hcz=e->z+hb[2];   /* head centre */
+  set_uM(Mh,hcx,hcy,hcz); sphere_sh(0.125f,0.16f,0.135f,9,6);
+  put(Mh,hcx,hcy,hcz,0,-0.12f,-0.045f); bevbox_sh(0.16f,0.09f,0.18f,0.022f);
+  put(Mh,hcx,hcy,hcz,0,0.075f,-0.075f); bevbox_sh(0.20f,0.035f,0.10f,0.014f);
   /* the shades. Rails above and below, temple arms down the sides, and the eyes
    * reduced to two burning slits sitting in the gap between the rails — the one
    * silhouette cue that reads "agent" at any distance, in any lighting. */
   tintf(0.014f,0.016f,0.018f);
-  put(Mh,e->x,by+1.85f,e->z, 0, 0.050f,-0.112f); bevbox_sh(0.245f,0.022f,0.055f,0.010f);
-  put(Mh,e->x,by+1.85f,e->z, 0,-0.014f,-0.112f); bevbox_sh(0.245f,0.020f,0.055f,0.010f);
+  put(Mh,hcx,hcy,hcz, 0, 0.050f,-0.112f); bevbox_sh(0.245f,0.022f,0.055f,0.010f);
+  put(Mh,hcx,hcy,hcz, 0,-0.014f,-0.112f); bevbox_sh(0.245f,0.020f,0.055f,0.010f);
   for(int s=-1;s<=1;s+=2){
-    put(Mh,e->x,by+1.85f,e->z, s*0.120f,0.032f,-0.045f); bevbox_sh(0.026f,0.020f,0.110f,0.008f);
+    put(Mh,hcx,hcy,hcz, s*0.120f,0.032f,-0.045f); bevbox_sh(0.026f,0.020f,0.110f,0.008f);
   }
   /* the eyes: emerald, flaring smoothly through the aim phase */
   float flare = 1.0f+e->flare*2.5f;
   glUniform1f(uEmis,1);
   tintf((0.25f+0.9f*(flare-1))*dim,1.8f*flare*dim,(0.8f*flare)*dim);
   for(int s=-1;s<=1;s+=2){
-    put(Mh,e->x,by+1.85f,e->z,s*0.058f,0.018f,-0.128f);
+    put(Mh,hcx,hcy,hcz,s*0.058f,0.018f,-0.128f);
     box_sh(0.088f,0.026f,0.022f);
   }
   glUniform1f(uEmis,0);
@@ -2760,7 +2804,7 @@ static void draw_player(void){
   primArm=1;
   PPose P; player_pose(&P);
   int rolling=P.rolling, blade=P.blade, aimStance=P.aimStance;
-  float tuck=P.tuck, tk=P.tk, walk=P.walk, walk2=P.walk2, s=P.s, spd=P.spd,
+  float tuck=P.tuck, tk=P.tk, walk=P.walk, armw=P.armw, s=P.s, spd=P.spd,
         run=P.run, fwdb=P.fwdb, latb=P.latb, absorb=P.absorb,
         poseYaw=P.poseYaw, pcy=P.pcy;
   float M[9]; memcpy(M,P.M,36);
@@ -2809,9 +2853,17 @@ static void draw_player(void){
     float ph=fmodf(bobT*7.5f + (li?PI:0.0f), 2*PI); if(ph<0)ph+=2*PI;
     float tri   = ph<PI ? 1.0f-2.0f*ph/PI : -1.0f+2.0f*(ph-PI)/PI;
     float swing = ph<PI ? 0.0f : sinf(ph-PI);
-    float strideHalf=0.33f*run;
-    float along=strideHalf*tri, lift=swing*0.14f*run;
-    float tgx=hx+fdx*along, tgz=hz+fdz*along, tgy=py+0.03f+lift;
+    /* half-stride solved from the cadence law (bobT rate is 0.9+4.65*sp), so
+     * the stance foot's backward sweep cancels the travel at EVERY speed —
+     * the fixed 0.33*run only locked at full sprint and skated below it.
+     * Same law the agents already walk on (see draw_agent). Airborne, the
+     * stride collapses and the feet tuck up under the body instead of
+     * pedalling a full ground cycle against nothing. */
+    float strideHalf=0.5f*PI*spd/(0.9f+4.65f*spd);
+    if(strideHalf>0.36f)strideHalf=0.36f;
+    strideHalf*=(1.0f-airB);
+    float along=strideHalf*tri, lift=swing*0.14f*run*(1.0f-airB);
+    float tgx=hx+fdx*along, tgz=hz+fdz*along, tgy=py+0.03f+lift+0.26f*airB;
     /* keep the target inside the leg's reach so the knee never snaps straight */
     float L1=0.50f,L2=0.46f, maxr=(L1+L2)*0.985f, minr=0.10f;
     float dxv=tgx-hx,dyv=tgy-hy,dzv=tgz-hz, dd=sqrtf(dxv*dxv+dyv*dyv+dzv*dzv);
@@ -2825,8 +2877,12 @@ static void draw_player(void){
     set_uM(M,jx,jy,jz); sphere_sh(0.08f,0.08f,0.08f,8,5);   /* knee cap at limb end */
     float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
     float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.074f,0.050f,L2*1.04f,8, -L2, &ax,&ay,&az);
-    float FF[9]; m3rotY(FF,poseYaw);                        /* foot flat on the floor */
-    set_uM(FF,ax,py+0.027f,az); wedge_sh(0.12f,0.055f,0.26f);
+    float FF[9],FR[9],FX[9]; m3rotY(FR,poseYaw);
+    m3rotX(FX,0.30f*swing*run);      /* light dorsiflexion through the swing */
+    m3mul(FF,FR,FX);
+    /* the ankle the IK actually solved — the foot used to stay welded to
+     * floor height while the shin lifted, detaching at every swing */
+    set_uM(FF,ax,ay-0.003f,az); wedge_sh(0.12f,0.055f,0.26f);
   }
 
   /* pelvis / jacket: same V-taper language as the agents */
@@ -2868,7 +2924,9 @@ static void draw_player(void){
         raise = 1.08f + 0.32f*sinf(s*PI) - 0.30f*cut;
         swYaw = -0.62f + 1.36f*cut;
       }
-      else if(blade){ raise=0.52f; swYaw=0.42f; }
+      else if(blade){ raise=0.52f+0.26f*swRel; swYaw=0.42f+0.32f*swRel; }
+      /* swRel=1 is exactly the end-of-cut pose (0.78/0.74): the arm now
+       * eases into the carry instead of snapping the frame the cut ends */
     } else raise = 0.0f;
     /* the free arm swings out to balance the landing; the weapon arm holds
      * its aim so the laser never jumps when you touch down */
@@ -2876,7 +2934,7 @@ static void draw_player(void){
     /* both arms hug the tucked knees — but ride the curl in and out instead of
      * snapping to the hug on the frame the roll starts */
     if(rolling){ raise=0.35f+0.95f*tuck; swYaw=0; }
-    float armStride=ai?walk2:walk;
+    float armStride=ai?armw:-armw;   /* contralateral: opposes the same-side leg */
     float aimDamp=ai&&aimStance?0.18f:1.0f;
     float sw = rolling? 1.0f : armStride*0.34f*run*aimDamp*clampf(1.0f-raise*1.25f,0,1);
     float sh[3]; m3v(M,ai?0.27f:-0.27f,1.05f*tk,0,sh);
@@ -2909,7 +2967,7 @@ static void draw_player(void){
   /* the katana when it is NOT in hand: slung diagonally across the back in a
    * dark saya with a lit seam. Previously the blade simply blinked out of
    * existence between swings, which read as the avatar having no weapon at all. */
-  if(!blade&&!rolling){
+  if(!blade&&!rolling&&swStow<0.35f){
     float SB[9],RZs[9],RXs[9],S1[9],o[3];
     m3rotZ(RZs,0.62f); m3rotX(RXs,0.14f); m3mul(S1,RZs,RXs); m3mul(SB,M,S1);
     m3v(M,0.02f,0.86f*tk,0.20f,o);
@@ -3085,10 +3143,11 @@ static void draw_lasers(void){
   for(int i=0;i<nen;i++){
     Enemy*e=&en[i];
     if(e->type==2||e->state!=1||e->armp<0.6f)continue;  /* boss leaps reuse state 1 */
-    float hx=e->x+sinf(e->yaw)*0.45f, hz=e->z-cosf(e->yaw)*0.45f;
+    float hx=e->x+sinf(e->yaw)*0.55f+cosf(e->yaw)*0.29f;
+    float hz=e->z-cosf(e->yaw)*0.55f+sinf(e->yaw)*0.29f;
     float a=0.10f+0.10f*sinf(wtime*30+e->phase)+0.25f*e->armp*e->state_t;
     glColor4f(1.6f*a,0.6f*a,0.2f*a,a);
-    glVertex3f(hx,e->y+1.36f,hz);
+    glVertex3f(hx,e->y+1.62f,hz);
     glVertex3f(px,py+1.28f,pz);
   }
   glEnd();
@@ -3156,7 +3215,7 @@ static void draw_slash(void){
   float s=clampf(swingT/SWING_TIME,0,1);
   float yr=pyaw*PI/180.0f;
   float cut=sstep(s);
-  float aS=yr-0.76f, aE=aS+1.42f*cut;
+  float aS=yr+0.66f, aE=aS-1.42f*cut;   /* right-shoulder -> left-hip, like the arm */
   float cy=py+1.34f;
   glBegin(GL_TRIANGLE_STRIP);
   for(int k=0;k<=16;k++){
@@ -3911,6 +3970,7 @@ int main(int argc,char**argv){
       }
       int air = py>gh+0.01f;
       coyT = air? coyT-dt : 0.12f;
+      airB = toward(airB, air?1.0f:0.0f, dt*7.0f);   /* pose blend, raw dt */
 
       /* mouseAcc is pixels-per-FRAME: normalize by dt or the same physical turn
        * unfreezes time twice as hard at 30fps as at 60. */
@@ -3955,12 +4015,16 @@ int main(int argc,char**argv){
         gunCharge=clampf(gunCharge+dt*chargeDrive/GUN_CHARGE_TIME,0,1);
       } else gunCharge=0;
       laserTarget=laser_target();
-      if(swingCD>0)swingCD-=dt;
+      if(swingCD>0){ swingCD-=dt;
+        if(swingCD<=0)swStow=1.0f;      /* katana leaves the hand: ease back */
+      }
       if(swingT>0){
         float pt=swingT; swingT+=dt;
         if(pt<0.10f&&swingT>=0.10f)katana_strike();  /* one strike per swing */
-        if(swingT>SWING_TIME)swingT=0;
+        if(swingT>SWING_TIME){ swingT=0; swRel=1.0f; } /* cut ends: ease down */
       }
+      if(swRel>0){ swRel-=dt*4.0f; if(swRel<0)swRel=0; }
+      if(swStow>0){ swStow-=dt*3.0f; if(swStow<0)swStow=0; }
       if(landT>0){ landT-=dt*3.6f; if(landT<0)landT=0; }
       if(dmgFlash>0)dmgFlash-=dt;
       if(hurtCD>0)hurtCD-=dt;
@@ -4020,8 +4084,12 @@ int main(int argc,char**argv){
     { float zn=0.08f, t=zn*tanf(35*PI/180), a=(float)WINW/WINH;
       glFrustum(-t*a,t*a,-t,t,zn,80.0f); }
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
-    float shx=shake>0?(vrand()-0.5f)*shake*6:0;
-    float shy=shake>0?(vrand()-0.5f)*shake*6:0;
+    /* smoothed shake: per-frame white noise read as flicker, not impact.
+     * The offset chases a random target, so it jolts and settles instead. */
+    static float shxS=0,shyS=0;
+    shxS=toward(shxS, shake>0?(vrand()-0.5f)*shake*7.0f:0.0f, dt*30.0f);
+    shyS=toward(shyS, shake>0?(vrand()-0.5f)*shake*7.0f:0.0f, dt*30.0f);
+    float shx=shxS, shy=shyS;
     float yr=pyaw*PI/180.0f;
     float fx=sinf(yr), fz=-cosf(yr), rx=cosf(yr), rz=sinf(yr);
     /* third-person boom with occlusion: cast at the desired offset, snap IN
@@ -4039,7 +4107,10 @@ int main(int argc,char**argv){
     if(tgt<camDist)camDist=tgt; else camDist=toward(camDist,tgt,dt*5.0f);
     float camx=px+ux*camDist;
     float camz=pz+uz*camDist;
-    float camy=clampf(camYs+(gstate==ST_PLAY?sinf(bobT*7.0f)*0.02f:0.0f),
+    /* one dip per FOOTFALL (2x the per-leg rate — plants land at phase 0 and
+     * PI), phase-locked with the stride and the step SFX; the old 7.0 beat
+     * against the legs' 7.5 and drifted in and out of sync */
+    float camy=clampf(camYs+(gstate==ST_PLAY?sinf(bobT*15.0f)*0.016f:0.0f),
                       0.25f,wallh-0.15f);
     glRotatef(ppitch+shy,1,0,0);
     glRotatef(pyaw+shx,0,1,0);
