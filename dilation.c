@@ -263,9 +263,15 @@ static void gen_textures(void){
      * so a long wall stops reading as the same panel wallpapered 40 times */
     float pv=hash2(x>>7,y>>6,313u);
     hh[y*TS+x]=bevel*0.9f*(pv>0.86f?0.55f:1.0f)+grain*0.1f;
-    /* faint traced circuitry inside the panel */
-    float tr = fbm(u*2.0f,v*0.3f,3,8,909u);
-    float circuit = (tr>0.49f&&tr<0.515f)?0.5f:0.0f;
+    /* traced circuitry inside the panel: crisp rectilinear dashes on an 8px
+     * grid — hashed live rows/columns with hashed segment breaks, like PCB
+     * traces. The old fbm iso-band drew wandering organic contour lines,
+     * which read as glowing goo once the emissive mask lit them up. Kept off
+     * the panel seams by the bevel gate. */
+    int gx=x>>3, gy=y>>3;
+    int hline = hash2(gy,y>>6,417u)>0.80f && hash2(gx,gy,913u)>0.35f && (y&7)==3;
+    int vline = hash2(gx,x>>7,517u)>0.88f && hash2(gy,gx,113u)>0.40f && (x&7)==3;
+    float circuit = ((hline||vline) && bevel>0.45f) ? 0.5f : 0.0f;
     float base = (0.030f + grain*0.014f)*(0.75f+0.50f*pv);
     if(bevel<0.4f) base*=0.45f;                   /* seams nearly black  */
     putrgb(&alb[(y*TS+x)*4],
