@@ -5,7 +5,7 @@
 A single-file SUPERHOT × *Matrix* × **TRON** homage in the demoscene tradition: one C file,
 no assets on disk, no engine. Every texture, level, mesh, sound, and font is
 synthesized at startup or runtime. Stripped down to immediate-mode OpenGL 2 and
-SDL2, the whole game is one `.c` file and compiles to under ~150Kb.
+SDL2, the whole game is one `.c` file and compiles to ~155Kb.
 
 Rendering is deferred through an HDR post stack: the scene draws into a
 multisampled `RGBA16F` target and comes back out through a three-octave bloom
@@ -20,7 +20,7 @@ GL 2.1 driver from 2006.
 | Features | Image |
 | --- | --- |
 | **Locomotion** - Run, dodge, double-jump or wall-kick your way around enemies and incoming fire. | ![Run](screenshots/shot_run_pose.png) |
-| **Pistol** - The laser pointer indicates where you're aiming but also charges as you move and dictates the distance you can shoot. Enemies will be highlighted when within range. | ![Lock-on](screenshots/shot_lockon.png) |
+| **Pistol** - The aim is physical: the gun is a thing your body carries, and the laser pointer is its barrel. Run and the beam swings with your stride; hold still for a second and it settles onto your look ray. Rounds go where the barrel points — fire mid-sprint with the gun swung low and the shot goes into the floor. The beam also charges as you move, dictating shot range; enemies highlight when within reach, and the pointer never shrinks below 1m so you always see where the gun is pointed. | ![Lock-on](screenshots/shot_lockon.png) |
 | **Katana** - Deflect incoming bullets with your katana or take out enemies at close range. | ![Katana](screenshots/shot_katana_pose.png) |
 | **Dodge roll** - `SHIFT` / `CTRL` / `C` rolls you sideways evading enemy fire | ![Dodge roll](screenshots/shot_dodge.png) |
 | **Shatter** - Defeating enemies sometimes leaves behind health packs or ammo. | ![Shatter](screenshots/shot_shatter.png) |
@@ -53,7 +53,7 @@ clang -Os dilation.c -o dilation -I/opt/homebrew/include -L/opt/homebrew/lib \
 | Mouse | Look |
 | `SPACE` | Jump — press again in the air for a double jump; into a wall to kick off |
 | `SHIFT` / `CTRL` / `C` | Dodge roll |
-| Left mouse | Fire (range grows the more you move) |
+| Left mouse | Fire — shots follow the barrel; stand still ~1s to settle the aim (range grows the more you move) |
 | Right mouse | Katana — kills up close, deflects bullets |
 | `1`–`4` / `←` `→` | Select sector (title screen) |
 | `M` | Mute / unmute |
