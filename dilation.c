@@ -373,8 +373,8 @@ typedef struct {
   int state;                    /* 0 advance 1 aim 2 cooldown 3 lunge 4 dead*/
   int struck;                   /* lunge: the blow has already landed        */
   int hp;                       /* 0 = one-shot (normal); >1 boss health     */
-  /* boss-only (type==2): leap physics + spiral/attack clocks + phase 0..2    */
-  float vy,spiralA,atkCD,jumpCD,roar; int bphase;
+  /* boss-only (type==2): leap physics + spiral/attack/melee clocks + phase   */
+  float vy,spiralA,atkCD,jumpCD,roar,melT; int bphase;
 } Enemy;
 static Enemy en[MAXENEMY]; static int nen, nalive;
 
@@ -1932,9 +1932,26 @@ static void update_boss(Enemy*e,float wdt){
     else { mx=-dz/d; mz=dx/d; }
     float spd=1.6f+e->bphase*0.7f;
     move_circ(&e->x,&e->z, mx*spd*wdt, mz*spd*wdt, 0.9f, e->y);
-    /* melee swat up close */
-    if(d<3.2f && fabsf(py-e->y)<2.5f){ e->state=3; hurt_player(e->bphase==2?34:26); }
-    else if(e->state==3) e->state=0;
+    /* melee swat: a real swing, not the old contact aura (which ticked
+     * 26-34 damage per mercy window with zero telegraph, and out-ranged the
+     * katana). Entering reach starts a wound-up state-3 swat — the existing
+     * lean/claw-hook pose IS the telegraph — and the blow lands only if the
+     * player is still inside 2.6u when it falls, comfortably inside the
+     * katana's 3.0 reach so a counter window exists. Then the arm needs a
+     * recovery before the next swing. All on world-time: freezing time
+     * freezes the wind-up mid-swing, exactly like a hanging bullet. */
+    if(e->state==3){
+      e->melT-=wdt;
+      if(e->melT<=0){
+        if(d<2.6f && fabsf(py-e->y)<2.5f) hurt_player(e->bphase==2?34:26);
+        e->state=0; e->melT=1.2f;
+      }
+    } else {
+      if(e->melT>0) e->melT-=wdt;
+      if(e->melT<=0 && d<3.0f && fabsf(py-e->y)<2.5f){
+        e->state=3; e->melT=e->bphase==2?0.32f:0.45f;
+      }
+    }
   }
 
   /* keep the boss off the player: back it out when they overlap (same
@@ -1988,6 +2005,11 @@ static void update_enemies(float wdt){
                     wdt*(e->state==1?7.0f:3.5f));
     if(e->recoil>0){ e->recoil-=wdt*3.5f; if(e->recoil<0)e->recoil=0; }
     if(e->mzT>0){ e->mzT-=wdt; if(e->mzT<0)e->mzT=0; }
+    /* the gun arm eases down in every state that isn't actively aiming —
+     * state 1 overwrites this absolutely each frame. The LOS-abort path
+     * (aim -> advance) used to skip the decay entirely, leaving the agent
+     * patrolling with its arm welded at full raise, pistol out, forever. */
+    e->armp-=wdt*2; if(e->armp<0)e->armp=0;
 
     float dx=px-e->x, dz=pz-e->z, d=sqrtf(dx*dx+dz*dz);
     if(d<1e-4f)d=1e-4f;   /* every branch below divides by d; a perfect overlap
@@ -2046,14 +2068,16 @@ static void update_enemies(float wdt){
           e->mzT=0.07f; e->mzx=hx; e->mzy=my; e->mzz=hz;
           sfx3(V_ESHOT,0.9f+frand()*0.2f,hx,my,hz);
           add_templ(hx,my,hz,4.0f,0.10f, 2.0f,1.2f,0.5f);
-          e->state=2; e->state_t=0;
+          e->state=2; e->state_t=-(coolBase+frand()*0.5f);
         } break;
-      case 2: /* cooldown: drift sideways */
+      case 2: /* cooldown: drift sideways. Duration was rolled at entry (the
+                 state_t below starts negative) — re-rolling frand() every
+                 frame biased the length AND drew from the sim stream at a
+                 framerate-dependent rate. */
         e->state_t+=wdt;
-        e->armp-=wdt*2; if(e->armp<0)e->armp=0;
         { float sgn=sinf(e->phase*9)>0?1:-1;
           move_circ(&e->x,&e->z,-dz/d*sgn*1.8f*wdt,dx/d*sgn*1.8f*wdt,0.32f,e->y); }
-        if(e->state_t>coolBase+frand()*0.5f){ e->state=0; e->state_t=0; }
+        if(e->state_t>0){ e->state=0; e->state_t=0; }
         break;
       case 3: /* striker lunge */
         e->yaw=atan2f(dx,-dz);
@@ -2066,7 +2090,8 @@ static void update_enemies(float wdt){
          * which made draw_agent's forward-thrust pose unreachable — every lunge
          * you ever saw was pure wind-up. Hold the state through a short
          * follow-through so the blow itself reads. */
-        if(e->state_t>lungeWind+0.18f){ e->state=2; e->state_t=0.4f; e->struck=0; }
+        if(e->state_t>lungeWind+0.18f){ e->state=2;
+          e->state_t=0.4f-(coolBase+frand()*0.5f); e->struck=0; }
         break;
     }
     if(e->state!=4 && d<0.7f && d>0.001f && fabsf(py-e->y)<1.5f){
@@ -3415,6 +3440,12 @@ static void draw_hud(void){
 }
 
 /* ---------------------------------------------------------------- screenshot */
+/* Captures are REQUESTED from the choreography (pendingShot) and taken right
+ * before SwapWindow, while the back buffer still holds the fully rendered
+ * frame. Reading it at the top of the next loop, after the swap, worked only
+ * because tested drivers happen to preserve the back buffer — post-swap its
+ * contents are undefined per spec (and GL_FRONT is empty under Xvfb). */
+static const char*pendingShot=0;
 static void shot_ppm(const char*path){
   unsigned char*buf=malloc(WINW*WINH*3);
   glPixelStorei(GL_PACK_ALIGNMENT,1);
@@ -3613,8 +3644,8 @@ int main(int argc,char**argv){
     if(titlecap){
       gstate=ST_TITLE;
       if(frame>=6 && frame%3==0){
-        char nm[64]; snprintf(nm,sizeof nm,"titlecap_%04d.ppm",(frame-6)/3);
-        shot_ppm(nm);
+        static char nm[64]; snprintf(nm,sizeof nm,"titlecap_%04d.ppm",(frame-6)/3);
+        pendingShot=nm;
       }
       frame++;
       if(frame>=366){ printf("[dilation] TITLECAP wrote %d frames\n",(frame-6)/3); running=0; }
@@ -3624,7 +3655,7 @@ int main(int argc,char**argv){
      * stage an agent, trade fire, shatter it, screenshot the lot. */
     if(smoke){
       frame++;
-      if(frame==25)shot_ppm("shot_title.ppm");
+      if(frame==25)pendingShot="shot_title.ppm";
       if(frame==30){
         reset_game(); gstate=ST_PLAY;
         float best=0,besta=0;
@@ -3649,7 +3680,7 @@ int main(int argc,char**argv){
             en[0].type=0; en[0].state=1; en[0].state_t=0.3f; break; }
         }
       }
-      if(frame==58)shot_ppm("shot_run_pose.ppm");
+      if(frame==58)pendingShot="shot_run_pose.ppm";
       if(frame>=70&&frame<80&&nen>0){ /* track it for the camera */
         float dx=en[0].x-px, dz=en[0].z-pz;
         float d=sqrtf(dx*dx+dz*dz);
@@ -3657,12 +3688,12 @@ int main(int argc,char**argv){
         ppitch=atan2f(EYE-1.3f,d)*180/PI;
       }
       if(frame==76)fire();
-      if(frame==82)shot_ppm("shot_gun_pose.ppm");
-      if(frame==84)shot_ppm("shot_game.ppm");
+      if(frame==82)pendingShot="shot_gun_pose.ppm";
+      if(frame==84)pendingShot="shot_game.ppm";
       if(frame==100&&nen>0)shatter_enemy(&en[0]);
-      if(frame==106)shot_ppm("shot_shatter.ppm");
+      if(frame==106)pendingShot="shot_shatter.ppm";
       if(frame==112)katana();
-      if(frame==118)shot_ppm("shot_katana_pose.ppm");
+      if(frame==118)pendingShot="shot_katana_pose.ppm";
 
       /* Extended choreography: the pistol's charge gauge, a charged lock-on,
        * and a dodge roll. All staged strictly AFTER the six baseline shots
@@ -3680,7 +3711,7 @@ int main(int argc,char**argv){
       /* CHARGE: a half-filled green beam grows down the empty corridor — the
        * range gauge filling from motion, no agent in reach yet. */
       if(frame>=122&&frame<130){ pyaw=smkYaw; ppitch=3; gunCharge=0.60f; }
-      if(frame==129)shot_ppm("shot_charge.ppm");
+      if(frame==129)pendingShot="shot_charge.ppm";
       /* LOCK-ON: stage an agent in that corridor and fully charge — the beam
        * reaches it and both the beam and the agent flare red (locked). */
       if(frame==130){
@@ -3698,7 +3729,7 @@ int main(int argc,char**argv){
         en[0].state=1; en[0].state_t=0; en[0].flash=0;
         gunCharge=1.0f;
       }
-      if(frame==137)shot_ppm("shot_lockon.ppm");
+      if(frame==137)pendingShot="shot_lockon.ppm";
       /* DODGE ROLL: the agent's round streaks down the old sightline; the
        * player rolls sideways so the bullet passes through the vacated spot. */
       if(frame==138){
@@ -3716,7 +3747,7 @@ int main(int argc,char**argv){
         spawn_bullet(bx,my,bz,bdx,ty-my,bdz,8.0f,0,-1);
       }
       if(frame>=138&&frame<146)ppitch=4;
-      if(frame==144)shot_ppm("shot_dodge.ppm");
+      if(frame==144)pendingShot="shot_dodge.ppm";
       if(frame>=150){ printf("[dilation] SMOKE OK\n"); running=0; }
     }
 
@@ -3913,6 +3944,7 @@ int main(int argc,char**argv){
     post_end(clampf((tsEff-MINTS)/(1.0f-MINTS),0,1), clampf(dmgFlash,0,1), gtime);
     draw_hud();
 
+    if(pendingShot){ shot_ppm(pendingShot); pendingShot=0; }
     SDL_GL_SwapWindow(win);
   }
 
