@@ -119,6 +119,12 @@ static void load_gl(void){
 #define GUN_IDLE_CHARGE 0.03f  /* tiny capacitor leak; movement does the work */
 #define PLAYER_MAX_AMMO 18
 #define PLAYER_BULLET_SPEED 21.5f
+#define ROLL_TIME  0.42f       /* dodge roll duration */
+#define ROLL_CD    0.65f       /* dodge roll cooldown  */
+#define SWING_TIME 0.26f       /* katana active swing  */
+#define FIRE_TIME  0.34f       /* pistol refire        */
+#define GUN_SETTLE_TIME 1.0f   /* stillness before the aim settles on the look ray */
+#define GUN_MIN_LASER   1.0f   /* the pointer never shrinks below this */
 static float wallh=3.4f;  /* hall height, set per sector */
 
 /* ---------------------------------------------------------------- rng/noise */
@@ -389,7 +395,7 @@ typedef struct {
 } Shard;
 static Shard shards[MAXSHARD]; static int shHead=0;
 
-/* level definitions: three hand-tuned sectors, each with its own climate —
+/* level definitions: four hand-tuned sectors, each with its own climate —
  * same Matrix family, different temperature. */
 typedef struct {
   const char*name; int style; unsigned seed;
@@ -1101,14 +1107,18 @@ static GLuint shader(GLenum ty,const char*src){
     fprintf(stderr,"[dilation] shader fail:\n%s\n",log); exit(1); }
   return s;
 }
-static void init_shaders(void){
-  prog=glCreateProgram();
-  glAttachShader(prog,shader(GL_VERTEX_SHADER,VS));
-  glAttachShader(prog,shader(GL_FRAGMENT_SHADER,FS));
-  glLinkProgram(prog);
-  GLint ok; glGetProgramiv(prog,GL_LINK_STATUS,&ok);
-  if(!ok){ char log[2048]; glGetProgramInfoLog(prog,2048,0,log);
+static GLuint mkprog(const char*vs,const char*fs){
+  GLuint p=glCreateProgram();
+  glAttachShader(p,shader(GL_VERTEX_SHADER,vs));
+  glAttachShader(p,shader(GL_FRAGMENT_SHADER,fs));
+  glLinkProgram(p);
+  GLint ok; glGetProgramiv(p,GL_LINK_STATUS,&ok);
+  if(!ok){ char log[2048]; glGetProgramInfoLog(p,2048,0,log);
     fprintf(stderr,"[dilation] link fail:\n%s\n",log); exit(1); }
+  return p;
+}
+static void init_shaders(void){
+  prog=mkprog(VS,FS);
   uCam=glGetUniformLocation(prog,"uCam");   uNL =glGetUniformLocation(prog,"uNL");
   uLpos=glGetUniformLocation(prog,"uLpos[0]"); uLcol=glGetUniformLocation(prog,"uLcol[0]");
   uM3 =glGetUniformLocation(prog,"uM3");    uT  =glGetUniformLocation(prog,"uT");
@@ -1144,7 +1154,7 @@ static int bloomW[NBLOOM], bloomH[NBLOOM];
 static GLuint progBright, progBlur, progComp;
 static GLint  bSrc,bTexel,bThresh,bKnee;
 static GLint  lSrc,lDir;
-static GLint  cScene,cB0,cB1,cB2,cRes,cTime,cTs,cDmg,cExp,cBloom;
+static GLint  cScene,cB0,cB1,cB2,cTime,cTs,cDmg,cExp,cBloom;
 
 static const char*PVS=
 "#version 120\n"
@@ -1188,7 +1198,7 @@ static const char*BLURFS=
 static const char*COMPFS=
 "#version 120\n"
 "uniform sampler2D uScene,uB0,uB1,uB2;\n"
-"uniform vec2 uRes; uniform float uTime,uTs,uDmg,uExp,uBloom;\n"
+"uniform float uTime,uTs,uDmg,uExp,uBloom;\n"
 "varying vec2 vUV;\n"
 "float h1(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }\n"
 /* Narkowicz ACES fit: keeps saturation in the shoulder, which matters when the
@@ -1229,16 +1239,6 @@ static const char*COMPFS=
 "  gl_FragColor = vec4(col,1.0);\n"
 "}\n";
 
-static GLuint mkprog(const char*vs,const char*fs){
-  GLuint p=glCreateProgram();
-  glAttachShader(p,shader(GL_VERTEX_SHADER,vs));
-  glAttachShader(p,shader(GL_FRAGMENT_SHADER,fs));
-  glLinkProgram(p);
-  GLint ok; glGetProgramiv(p,GL_LINK_STATUS,&ok);
-  if(!ok){ char log[2048]; glGetProgramInfoLog(p,2048,0,log);
-    fprintf(stderr,"[dilation] link fail:\n%s\n",log); exit(1); }
-  return p;
-}
 /* colour texture for a render target; `hdr` picks RGBA16F over RGBA8 */
 static GLuint mkrt(int w,int h,int hdr){
   GLuint t; glGenTextures(1,&t); glBindTexture(GL_TEXTURE_2D,t);
@@ -1317,7 +1317,6 @@ static void init_post(int msaa){
   cB0=glGetUniformLocation(progComp,"uB0");
   cB1=glGetUniformLocation(progComp,"uB1");
   cB2=glGetUniformLocation(progComp,"uB2");
-  cRes=glGetUniformLocation(progComp,"uRes");
   cTime=glGetUniformLocation(progComp,"uTime");
   cTs=glGetUniformLocation(progComp,"uTs");
   cDmg=glGetUniformLocation(progComp,"uDmg");
@@ -1391,7 +1390,6 @@ static void post_end(float ts01,float dmg,float time){
   bind_tex(1,bloomTex[0][0]); glUniform1i(cB0,1);
   bind_tex(2,bloomTex[1][0]); glUniform1i(cB1,2);
   bind_tex(3,bloomTex[2][0]); glUniform1i(cB2,3);
-  glUniform2f(cRes,WINW,WINH);
   glUniform1f(cTime,time); glUniform1f(cTs,ts01); glUniform1f(cDmg,dmg);
   glUniform1f(cExp,1.15f); glUniform1f(cBloom,0.62f);
   fsquad();
@@ -1441,10 +1439,12 @@ static void spawn_shards(float x,float y,float z,float vr){
 /* ---------------------------------------------------------------- game state */
 enum { ST_TITLE, ST_PLAY, ST_DEAD, ST_WIN };
 static int gstate=ST_TITLE;
-static float px,pz,py,pyaw,ppitch,php;
+static float py,ppitch,php;   /* px,pz,pyaw live with the audio block above */
 static float pvx,pvz,pvy;                   /* player velocity, for Doppler   */
 static int   pammo,jumps;                   /* finite pistol ammo; pickups keep you moving */
 static float tscale=1, actT, mouseAcc;
+static float tsEff=1;                       /* tscale with the hitstop dip folded
+                                               in — what wdt/audio/grade consume */
 static float rollT,rollCD,rollDX,rollDZ;    /* dodge roll: timer + direction  */
 static float kvx,kvz;                       /* wall-kick horizontal impulse   */
 static float pmoveb;                        /* idle<->run blend for the avatar*/
@@ -1465,13 +1465,19 @@ static unsigned gseed=0;                    /* xor'd into the level seed      */
 static int smoke=0;
 static int titlecap=0;   /* --titlecap: dump a numbered title-screen frame sequence for the README GIF */
 
+/* title-screen sector preview: selecting with 1-4/arrows used to only set
+ * curlevel, so the title kept rendering the OLD geometry tinted in the NEW
+ * sector's climate under the new name. Regenerating on selection turns the
+ * title into a real preview of the chosen sector (agents, lights and all). */
+static void preview_level(void){ gen_level(curlevel,gseed); laserTarget=-1; }
+
 static void reset_game(void){
   gen_level(curlevel,gseed);
   px=startx; pz=startz; pyaw=startyaw; ppitch=0; pvx=pvz=pvy=0;
   avYaw=startyaw*PI/180.0f;
   py=hgt[(int)(startz/CELL)][(int)(startx/CELL)];
   php=100; pammo=6; jumps=1;
-  tscale=1; actT=0; mouseAcc=0;
+  tscale=tsEff=1; actT=0; mouseAcc=0;
   rollT=rollCD=rollDX=rollDZ=kvx=kvz=pmoveb=0;
   coyT=hurtCD=mzT=landT=hitstop=0;
   camDist=3.05f; camYs=-1.0f;
@@ -1688,7 +1694,7 @@ static int laser_target(void){
 static void fire(void){
   if(fireCD>0||rollT>0)return;
   if(pammo<=0){ sfx(V_CLICK); fireCD=0.3f; gunCharge=0; return; }
-  fireCD=0.34f; actT=0.22f;
+  fireCD=FIRE_TIME; actT=0.22f;
   pammo--;
   sfx(V_SHOT);
   float mx,my,mz,dx,dy,dz,hx,hy,hz,ld;
@@ -1952,7 +1958,7 @@ static void update_enemies(float wdt){
   float lungeWind=0.32f-0.045f*diff;
   int maxAim=4+(curlevel>=2);
   int aimers=0;
-  for(int i=0;i<nen;i++) if(en[i].state==1)aimers++;
+  for(int i=0;i<nen;i++) if(en[i].state==1&&en[i].type!=2)aimers++; /* boss leaps reuse state 1 */
   for(int i=0;i<nen;i++){
     Enemy*e=&en[i];
     if(e->type==2){ if(e->state!=4)update_boss(e,wdt); continue; }
@@ -2451,7 +2457,7 @@ static void draw_agent(Enemy*e,float dim){
   float sg=(0.090f+e->hue*0.3f)*(1-mixk)+dg*0.22f*mixk;
   float sb= 0.085f            *(1-mixk)+db*0.22f*mixk;
   float fl=e->flash>0?0.6f:0.0f;
-  int locked = (laserTarget>=0 && laserTarget<nen && e==&en[laserTarget]);
+  int locked = (gstate==ST_PLAY && laserTarget>=0 && laserTarget<nen && e==&en[laserTarget]);
   /* body tint, resolved once. The hit flash is warm-white, but a LOCKED agent
    * has to stay unmistakably RED: bleeding the flash into green and blue the
    * same way pushed it straight through pink into featureless white as soon as
@@ -2612,11 +2618,11 @@ static void draw_player(void){
   primArm=1;
   float M[9],R[9],X[9],Z[9],S0[9];
   int rolling = rollT>0;
-  float rp = rolling? sstep(1.0f-rollT/0.42f) : 0;     /* roll progress 0..1 */
+  float rp = rolling? sstep(1.0f-rollT/ROLL_TIME) : 0; /* roll progress 0..1 */
   float tuck = rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
   float tk = 1.0f-0.50f*tuck;                          /* anchors pull in    */
   float walk = sinf(bobT*7.5f), walk2 = sinf(bobT*7.5f+PI);
-  float s = swingT>0? clampf(swingT/0.26f,0,1) : 0;    /* katana swing phase */
+  float s = swingT>0? clampf(swingT/SWING_TIME,0,1) : 0; /* katana swing phase */
   int blade = s>0 || swingCD>0;                        /* + follow-through   */
   int combatStance = !rolling;              /* one yaw convention for all held weapons */
   int aimStance = !rolling && !blade;
@@ -2721,7 +2727,7 @@ static void draw_player(void){
   for(int ai=0;ai<2;ai++){
     float raise, swYaw=0;
     if(ai){
-      float fr=clampf(fireCD/0.34f,0,1);
+      float fr=clampf(fireCD/FIRE_TIME,0,1);
       raise = aimStance ? (1.18f+0.12f*sstep(fr)) : (fr>0 ? (0.92f+0.42f*sstep(fr)) : 0.12f);
       if(aimStance) swYaw = -0.12f-0.05f*latb;     /* bring pistol across centerline, not off-wrist */
       if(s>0){
@@ -3025,7 +3031,7 @@ static void draw_player_laser(void){
  * strongest at the blade and fading along the arc behind it */
 static void draw_slash(void){
   if(swingT<=0)return;
-  float s=clampf(swingT/0.26f,0,1);
+  float s=clampf(swingT/SWING_TIME,0,1);
   float yr=pyaw*PI/180.0f;
   float cut=sstep(s);
   float aS=yr-0.76f, aE=aS+1.42f*cut;
@@ -3056,7 +3062,7 @@ static void draw_world(float camx,float camy,float camz){
   glUniform1f(uTonemap, postOK?0.0f:1.0f);
 
   /* pick 8 nearest lights (static + temp) */
-  float lp[SHLIGHTS*4], lc[SHLIGHTS*3]; int ln=0;
+  float lp[SHLIGHTS*4]={0}, lc[SHLIGHTS*3]={0}; int ln=0;
   typedef struct{float d2;int i;int tmp;}LS; LS sl[MAXLIGHT+MAXTEMPL]; int sn=0;
   for(int i=0;i<nlights;i++){ float dx=lights[i].x-camx,dz=lights[i].z-camz;
     sl[sn++] = (LS){dx*dx+dz*dz,i,0}; }
@@ -3291,7 +3297,7 @@ static void draw_hud(void){
 
   if(gstate==ST_PLAY||gstate==ST_WIN){
     if(rollCD>0){ /* minimal remaining HUD: roll recharge */
-      float k=1.0f-rollCD/0.65f;
+      float k=1.0f-rollCD/ROLL_CD;
       glColor4f(0.4f,0.9f,0.6f,0.55f);
       glBegin(GL_QUADS);
       glVertex2f(WINW/2-28,WINH-42);glVertex2f(WINW/2-28+56*k,WINH-42);
@@ -3475,7 +3481,8 @@ int main(int argc,char**argv){
   printf("[dilation] MSAA: %dx\n",msaa);
   SDL_GL_SetSwapInterval(smoke||titlecap?0:1);
   load_gl();
-  printf("[dilation] GL: %s / %s\n",glGetString(GL_RENDERER),glGetString(GL_VERSION));
+  printf("[dilation] GL: %s / %s\n",
+    (const char*)glGetString(GL_RENDERER),(const char*)glGetString(GL_VERSION));
 
   t0=SDL_GetTicks(); gen_textures();
   printf("[dilation] textures synthesized in %ums\n",SDL_GetTicks()-t0);
@@ -3507,7 +3514,11 @@ int main(int argc,char**argv){
   glClearColor(0.004f,0.012f,0.008f,1);
 
   int running=1, frame=0, wdown=0,adown=0,sdown=0,ddown=0;
-  unsigned last=SDL_GetTicks();
+  /* sub-ms clock: SDL_GetTicks is millisecond-grained, and two frames inside
+   * the same millisecond gave dt==0 — which turned pvx into 0/0 NaN and
+   * poisoned bobT (and with it the camera) until the next reset. */
+  Uint64 lastPC=SDL_GetPerformanceCounter();
+  double pcHz=(double)SDL_GetPerformanceFrequency();
   float titleYaw=0;
   gstate=ST_TITLE;
 
@@ -3517,11 +3528,15 @@ int main(int argc,char**argv){
       if(ev.type==SDL_QUIT)running=0;
       else if(ev.type==SDL_KEYDOWN||ev.type==SDL_KEYUP){
         int d=ev.type==SDL_KEYDOWN;
+        /* one-shot actions must ignore OS auto-repeat: a held SPACE was
+         * re-entering the jump branch ~30x/s and silently spending the double
+         * jump the moment the feet left the ground. WASD latches keep `d`. */
+        int once=d&&!ev.key.repeat;
         switch(ev.key.keysym.sym){
           case SDLK_w:wdown=d;break; case SDLK_a:adown=d;break;
           case SDLK_s:sdown=d;break; case SDLK_d:ddown=d;break;
           case SDLK_SPACE:
-            if(d&&gstate==ST_PLAY&&rollT<=0){
+            if(once&&gstate==ST_PLAY&&rollT<=0){
               float gh=ground_h(px,pz,py), wnx,wnz;
               if(py<=gh+0.001f||coyT>0){ /* coyote: late edge jumps count */
                 pvy=7.5f; jumps=1; actT=0.20f; coyT=0; sfx(V_JUMP);
@@ -3539,7 +3554,7 @@ int main(int argc,char**argv){
             } break;
           case SDLK_LCTRL: case SDLK_RCTRL: case SDLK_c:
           case SDLK_LSHIFT: case SDLK_RSHIFT:
-            if(d&&gstate==ST_PLAY&&rollCD<=0&&rollT<=0
+            if(once&&gstate==ST_PLAY&&rollCD<=0&&rollT<=0
                &&py<=ground_h(px,pz,py)+0.05f){
               /* dodge roll along current input, or straight ahead */
               float mx,mz;
@@ -3548,20 +3563,20 @@ int main(int argc,char**argv){
               if(ml2<0.01f){ float yr2=pyaw*PI/180;
                 mx=sinf(yr2); mz=-cosf(yr2); ml2=1; }
               rollDX=mx/ml2; rollDZ=mz/ml2;
-              rollT=0.42f; rollCD=0.65f; actT=0.42f;
+              rollT=ROLL_TIME; rollCD=ROLL_CD; actT=ROLL_TIME;
               sfx(V_ROLL);
             } break;
           case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4:
-            if(d&&gstate==ST_TITLE){ curlevel=ev.key.keysym.sym-SDLK_1;
-              if(curlevel>=NLEVEL)curlevel=NLEVEL-1; sfx(V_CLICK); }
+            if(once&&gstate==ST_TITLE){ curlevel=ev.key.keysym.sym-SDLK_1;
+              if(curlevel>=NLEVEL)curlevel=NLEVEL-1; preview_level(); sfx(V_CLICK); }
             break;
-          case SDLK_m: if(d){ g_mute=!g_mute; printf("[dilation] audio %s\n",g_mute?"muted":"unmuted"); } break;
-          case SDLK_LEFT: if(d&&gstate==ST_TITLE){ curlevel=(curlevel+NLEVEL-1)%NLEVEL; sfx(V_CLICK); } break;
-          case SDLK_RIGHT:if(d&&gstate==ST_TITLE){ curlevel=(curlevel+1)%NLEVEL; sfx(V_CLICK); } break;
+          case SDLK_m: if(once){ g_mute=!g_mute; printf("[dilation] audio %s\n",g_mute?"muted":"unmuted"); } break;
+          case SDLK_LEFT: if(once&&gstate==ST_TITLE){ curlevel=(curlevel+NLEVEL-1)%NLEVEL; preview_level(); sfx(V_CLICK); } break;
+          case SDLK_RIGHT:if(once&&gstate==ST_TITLE){ curlevel=(curlevel+1)%NLEVEL; preview_level(); sfx(V_CLICK); } break;
           case SDLK_ESCAPE:
-            if(d){
+            if(once){
               if(gstate==ST_TITLE)running=0;
-              else { gstate=ST_TITLE; SDL_SetRelativeMouseMode(SDL_FALSE); }
+              else { gstate=ST_TITLE; laserTarget=-1; SDL_SetRelativeMouseMode(SDL_FALSE); }
             } break;
         }
       }
@@ -3585,10 +3600,11 @@ int main(int argc,char**argv){
         katana();
     }
 
-    unsigned now=SDL_GetTicks();
-    float dt=(smoke||titlecap)?1.0f/60:(now-last)/1000.0f;
-    last=now;
+    Uint64 nowPC=SDL_GetPerformanceCounter();
+    float dt=(smoke||titlecap)?1.0f/60:(float)((nowPC-lastPC)/pcHz);
+    lastPC=nowPC;
     if(dt>0.05f)dt=0.05f;
+    if(dt<1e-5f)dt=1e-5f;
     gtime+=dt;
 
     /* title capture: hold the title screen and dump a numbered frame sequence
@@ -3691,7 +3707,7 @@ int main(int argc,char**argv){
          * The old 0.5 sat PAST the roll's own duration, so draw_player clamped
          * the progress to zero and the regression shot only ever showed the
          * frame-one pose — the one place a broken tuck could hide. */
-        rollT=0.21f; rollCD=0.6f;
+        rollT=ROLL_TIME*0.5f; rollCD=0.6f;
         rollDX=cosf(yr); rollDZ=sinf(yr);             /* strafe-right dodge      */
         float dx=px-en[0].x, dz=pz-en[0].z, dd=sqrtf(dx*dx+dz*dz)+1e-6f;
         float bdx=dx/dd, bdz=dz/dd;                    /* agent -> player          */
@@ -3705,7 +3721,7 @@ int main(int argc,char**argv){
     }
 
     if(gstate==ST_TITLE){ titleYaw+=dt*7; pyaw=titleYaw; ppitch=4;
-      px=startx; pz=startz; tscale=1; wtime=gtime; }
+      px=startx; pz=startz; tscale=tsEff=1; wtime=gtime; }
 
     /* THE mechanic: world time follows your motion. walking, looking and
      * acting each push the target timescale toward 1; stillness lets it
@@ -3724,8 +3740,13 @@ int main(int argc,char**argv){
       } else if(ml>0.01f){
         mx/=ml;mz/=ml;
         move_circ(&px,&pz,mx*5.0f*dt,mz*5.0f*dt,0.34f,py);
-        stepT-=dt;
-        if(stepT<=0&&py<=ground_h(px,pz,py)+0.01f){ sfx(V_STEP); stepT=0.40f; }
+        /* footsteps on the stride's actual foot-plants (phase 0 and PI are the
+         * two stance strikes), not the old fixed 0.40s timer that drifted
+         * against the visible gait. stepT holds the previous half-cycle phase;
+         * a wrap means a foot just planted. */
+        float sph=fmodf(bobT*7.5f,PI);
+        if(sph<stepT && py<=ground_h(px,pz,py)+0.01f) sfx(V_STEP);
+        stepT=sph;
       }
       if(kvx*kvx+kvz*kvz>0.01f){   /* wall-kick momentum, easing off */
         move_circ(&px,&pz,kvx*dt,kvz*dt,0.34f,py);
@@ -3762,7 +3783,9 @@ int main(int argc,char**argv){
       int air = py>gh+0.01f;
       coyT = air? coyT-dt : 0.12f;
 
-      float look=clampf(mouseAcc*0.05f,0,1); mouseAcc=0;
+      /* mouseAcc is pixels-per-FRAME: normalize by dt or the same physical turn
+       * unfreezes time twice as hard at 30fps as at 60. */
+      float look=clampf(mouseAcc*0.05f/(dt*60.0f),0,1); mouseAcc=0;
       if(actT>0)actT-=dt;
       float target=(ml>0.01f||rollT>0||air)?1.0f:0.0f;
       if(look>target)target=look;
@@ -3773,10 +3796,13 @@ int main(int argc,char**argv){
        * whose whole language is timescale, the punch belongs in tscale rather
        * than in a camera kick — the shards hang in the air for a beat and the
        * SFX pitch-bend follows it down for free. Runs on raw dt: this is feel,
-       * not simulation, and it must not scale with the thing it is freezing. */
-      if(hitstop>0){ hitstop-=dt; if(hitstop<0)hitstop=0; tscale*=0.16f; }
-      if(smoke)tscale=1;          /* determinism for the harness */
-      wdt=dt*tscale;
+       * not simulation, and it must not scale with the thing it is freezing.
+       * The dip is applied to a DERIVED value: multiplying the stored tscale
+       * compounded per frame, freezing ~10x deeper at 300fps than at 30. */
+      tsEff=tscale;
+      if(hitstop>0){ hitstop-=dt; if(hitstop<0)hitstop=0; tsEff*=0.16f; }
+      if(smoke)tscale=tsEff=1;    /* determinism for the harness */
+      wdt=dt*tsEff;
       wtime+=wdt;
 
       if(fireCD>0)fireCD-=dt;
@@ -3795,7 +3821,7 @@ int main(int argc,char**argv){
       if(swingT>0){
         float pt=swingT; swingT+=dt;
         if(pt<0.10f&&swingT>=0.10f)katana_strike();  /* one strike per swing */
-        if(swingT>0.26f)swingT=0;
+        if(swingT>SWING_TIME)swingT=0;
       }
       if(landT>0){ landT-=dt*3.6f; if(landT<0)landT=0; }
       if(dmgFlash>0)dmgFlash-=dt;
@@ -3826,7 +3852,7 @@ int main(int argc,char**argv){
     }
     if(gstate==ST_DEAD){ wdt=dt*MINTS; wtime+=wdt; update_bullets(wdt); }
     if(gstate==ST_WIN){ wdt=dt*0.25f; wtime+=wdt; update_bullets(wdt); }  /* victory slow-mo */
-    g_ats = gstate==ST_PLAY ? tscale : (gstate==ST_TITLE?1.0f:0.3f);
+    g_ats = gstate==ST_PLAY ? tsEff : (gstate==ST_TITLE?1.0f:0.3f);
     g_track = (gstate==ST_TITLE) ? 0 : curlevel+1;   /* MENU vs per-level track */
 
     for(int i=0;i<MAXPART;i++){
@@ -3884,7 +3910,7 @@ int main(int argc,char**argv){
     draw_world(camx,camy,camz);
     /* tonemap + bloom + grade. ts01 is the timescale remapped to 0..1 so the
      * composite can grade toward the frozen look without knowing about MINTS. */
-    post_end(clampf((tscale-MINTS)/(1.0f-MINTS),0,1), clampf(dmgFlash,0,1), gtime);
+    post_end(clampf((tsEff-MINTS)/(1.0f-MINTS),0,1), clampf(dmgFlash,0,1), gtime);
     draw_hud();
 
     SDL_GL_SwapWindow(win);
