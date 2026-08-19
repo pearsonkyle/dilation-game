@@ -259,16 +259,21 @@ static void gen_textures(void){
     float bevel=d/3.0f; if(bevel>1)bevel=1;
     bevel=bevel*bevel*(3-2*bevel);
     float grain=fbm(u,v,4,8,77u);
-    hh[y*TS+x]=bevel*0.9f+grain*0.1f;
+    /* per-panel identity: brightness jitter + the occasional recessed panel,
+     * so a long wall stops reading as the same panel wallpapered 40 times */
+    float pv=hash2(x>>7,y>>6,313u);
+    hh[y*TS+x]=bevel*0.9f*(pv>0.86f?0.55f:1.0f)+grain*0.1f;
     /* faint traced circuitry inside the panel */
     float tr = fbm(u*2.0f,v*0.3f,3,8,909u);
     float circuit = (tr>0.49f&&tr<0.515f)?0.5f:0.0f;
-    float base = 0.030f + grain*0.014f;
+    float base = (0.030f + grain*0.014f)*(0.75f+0.50f*pv);
     if(bevel<0.4f) base*=0.45f;                   /* seams nearly black  */
     putrgb(&alb[(y*TS+x)*4],
       base*0.85f + circuit*0.010f,
       base       + circuit*0.060f,
       base*0.95f + circuit*0.030f);
+    /* emissive mask: the circuit traces glow through the shader/bloom */
+    alb[(y*TS+x)*4+3]=(unsigned char)(circuit*220.0f);
   }
   h2n(hh,nrm,3.0f);
   texAlb[TX_WALL]=mktex(alb); texNrm[TX_WALL]=mktex(nrm);
@@ -282,12 +287,14 @@ static void gen_textures(void){
     float bevel=d/4.0f; if(bevel>1)bevel=1;
     float grain=fbm(u,v,5,16,901u);
     hh[y*TS+x]=bevel*0.8f+grain*0.2f;
-    float base=0.020f+grain*0.012f;
+    float pv=hash2(x>>7,y>>7,717u);               /* per-tile brightness  */
+    float base=(0.020f+grain*0.012f)*(0.80f+0.40f*pv);
     float seam=(d<2.0f)?1.0f:0.0f;                /* glowing grout line  */
     putrgb(&alb[(y*TS+x)*4],
       base + seam*0.015f,
       base + seam*0.110f,
       base + seam*0.050f);
+    alb[(y*TS+x)*4+3]=(unsigned char)(seam*45.0f); /* seams feed the bloom */
   }
   h2n(hh,nrm,2.0f);
   texAlb[TX_FLOOR]=mktex(alb); texNrm[TX_FLOOR]=mktex(nrm);
@@ -299,9 +306,12 @@ static void gen_textures(void){
     float slot = (sx_>28&&sx_<35)?1.0f:0.0f;      /* strip every half cell */
     float grain=fbm(u,v,4,8,71u);
     hh[y*TS+x]=(1.0f-slot)*0.8f+grain*0.2f;
-    float base=0.018f+grain*0.010f;
+    float pv=hash2(x>>6,y>>6,551u);
+    float base=(0.018f+grain*0.010f)*(0.85f+0.30f*pv);
     putrgb(&alb[(y*TS+x)*4],
       base+slot*0.022f, base+slot*0.13f, base+slot*0.06f);
+    /* the light slots are actual emitters now: masked emissive -> bloom */
+    alb[(y*TS+x)*4+3]=(unsigned char)(slot*200.0f);
   }
   h2n(hh,nrm,2.4f);
   texAlb[TX_CEIL]=mktex(alb); texNrm[TX_CEIL]=mktex(nrm);
@@ -1019,14 +1029,16 @@ static void audio_cb(void*ud,Uint8*stream,int len){
  * reflection pass. Fog folds everything into green-black murk. */
 static GLuint prog;
 static GLint uCam,uNL,uLpos,uLcol,uM3,uT,uTint,uBump,uEmis,uAlb,uNrm,
-             uTime,uRain,uGloss,uAlpha,uFog,uRim,uRimCol,uTonemap;
+             uTime,uRain,uGloss,uAlpha,uFog,uRim,uRimCol,uTonemap,uEmisM,uNSc;
 static const char*VS=
 "#version 120\n"
-"uniform mat3 uM3; uniform vec3 uT;\n"
+"uniform mat3 uM3; uniform vec3 uT; uniform vec3 uNS;\n"
 "varying vec3 vP; varying vec3 vN; varying vec2 vUV;\n"
 "void main(){\n"
 "  vec3 wp = uM3*gl_Vertex.xyz + uT;\n"
-"  vP=wp; vN=uM3*gl_Normal; vUV=gl_MultiTexCoord0.xy;\n"
+/* uNS = inverse squash of any non-uniform m3scl in uM3 (torso slabs, the
+ * boss's breathing thorax): R*S needs normals through R*S^-1, not R*S */
+"  vP=wp; vN=uM3*(gl_Normal*uNS); vUV=gl_MultiTexCoord0.xy;\n"
 "  gl_Position = gl_ModelViewProjectionMatrix * vec4(wp,1.0);\n"
 "}\n";
 static const char*FS=
@@ -1036,12 +1048,18 @@ static const char*FS=
 "uniform vec4 uLpos[8]; uniform vec3 uLcol[8];\n"
 "uniform vec3 uTint; uniform float uBump; uniform float uEmis;\n"
 "uniform float uTime; uniform float uRain; uniform float uGloss; uniform float uAlpha;\n"
+"uniform float uEmisMask;\n"
 "uniform vec3 uFog;\n"
 "uniform float uRim; uniform vec3 uRimCol; uniform float uTonemap;\n"
 "varying vec3 vP; varying vec3 vN; varying vec2 vUV;\n"
 "float h1(float x){ return fract(sin(x*127.1)*43758.5453); }\n"
 "void main(){\n"
-"  vec3 base = texture2D(uAlb,vUV).rgb * uTint;\n"
+"  vec4 albS = texture2D(uAlb,vUV);\n"
+"  vec3 base = albS.rgb * uTint;\n"
+/* per-tile brightness jitter (uv = worldpos*0.5, so floor(vUV) is the 2m cell
+ * id): breaks the wallpaper repeat that a single 256px texture tiled to the
+ * horizon otherwise shows. World surfaces only — figures run with uBump=0. */
+"  if(uBump>0.5) base *= 0.8231 + 0.36*h1(dot(floor(vUV),vec2(7.31,13.17)));\n"
 "  vec3 N = normalize(vN);\n"
 "  if(uBump>0.5){\n"
 "    vec3 T = (abs(N.y)>0.5)? vec3(1.0,0.0,0.0) : vec3(N.z,0.0,-N.x);\n"
@@ -1079,19 +1097,13 @@ static const char*FS=
  * black obsidian only reads as polished if something brightens at the horizon
  * — this is that reflection, faked from a fixed emerald-teal sky tint. */
 "  col += vec3(0.020,0.052,0.040)*pow(1.0-NdV,5.0)*uGloss;\n"
-"  if(uRim>0.0){\n"
-"    /* crystalline fresnel edge: glanced facets glow, fronts stay dark — the\n"
-"     * forward-only stand-in for bloom on the cut humanoids */\n"
-"    float fres = pow(1.0 - clamp(dot(N,V),0.0,1.0), 3.0);\n"
-"    col += uRimCol*fres*uRim;\n"
-"  }\n"
 "  if(uRain>0.5){\n"
 "    /* digital rain: world-aligned columns of flickering glyph cells */\n"
 "    float cx = floor(vUV.x*16.0);\n"
 "    float on = step(0.60, h1(cx*3.7+11.0));\n"
 "    float spd = 0.08 + 0.20*h1(cx*1.3);\n"
 "    float head = fract(uTime*spd + h1(cx*7.7));\n"
-"    float d2 = fract(head - vUV.y*0.45);\n"
+"    float d2 = fract(head + vUV.y*0.45);\n"
 "    float tail = pow(1.0-d2, 10.0);\n"
 "    float glyph = step(0.50, h1(cx*91.0 + floor(vUV.y*34.0)*17.0 + floor(uTime*9.0)*3.0));\n"
 "    col += vec3(0.10,1.00,0.42)*tail*glyph*on*(0.18+0.22*h1(cx*5.1));\n"
@@ -1101,6 +1113,16 @@ static const char*FS=
  * extrapolates PAST the albedo and subtracts the lit term, which the old
  * clipping tonemap hid as plain white. Clamp it to the 0..1 it was meant to be. */
 "  col = mix(col, base, clamp(uEmis,0.0,1.0));\n"
+/* the rim lives AFTER the emissive mix: it used to be scaled by (1-uEmis),
+ * erasing the lock-on red edge and the boss glow exactly when they mattered */
+"  if(uRim>0.0){\n"
+"    /* crystalline fresnel edge: glanced facets glow, fronts stay dark */\n"
+"    float fres = pow(1.0 - clamp(dot(N,V),0.0,1.0), 3.0);\n"
+"    col += uRimCol*fres*uRim;\n"
+"  }\n"
+/* masked emissive (albedo alpha): ceiling light slots, wall circuit traces
+ * and floor seams become real emitters that feed the bloom pass */
+"  col += base*(albS.a*uEmisMask);\n"
 /* Exponential-squared distance fog. The old linear ramp put a visible band
  * where it clamped; this one never fully saturates, so the far wall keeps a
  * trace of its own colour and the murk reads as depth rather than a curtain. */
@@ -1153,6 +1175,8 @@ static void init_shaders(void){
   uFog=glGetUniformLocation(prog,"uFog");
   uRim=glGetUniformLocation(prog,"uRim"); uRimCol=glGetUniformLocation(prog,"uRimCol");
   uTonemap=glGetUniformLocation(prog,"uTonemap");
+  uEmisM=glGetUniformLocation(prog,"uEmisMask");
+  uNSc=glGetUniformLocation(prog,"uNS");
 }
 
 /* ---------------------------------------------------------------- post stack
@@ -2561,10 +2585,12 @@ static void draw_boss(Enemy*e){
    * and down instead of rotating each part around its own fixed point. */
   float pvY=by+1.65f;
   float Tt[9]; memcpy(Tt,M,36); m3scl(Tt,breath,1.0f,breath*0.85f);
+  glUniform3f(uNSc,1.0f/breath,1,1.0f/(breath*0.85f));
   { float o[3]; m3v(M,0,0.40f,0,o);
     set_uM(Tt,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.55f,0.72f,1.15f,10);
   { float o[3]; m3v(M,0,1.40f,0,o);
     set_uM(Tt,e->x+o[0],pvY+o[1],e->z+o[2]); } sphere_sh(0.80f,0.72f,0.66f,10,7);
+  glUniform3f(uNSc,1,1,1);
   /* spine vents: a faint emissive ridge that brightens with phase */
   glUniform1f(uEmis,0.5f+0.5f*ph);
   tintf(0.6f+0.5f*ph,0.9f-0.3f*ph,0.4f);
@@ -2742,11 +2768,13 @@ static void draw_agent(Enemy*e,float dim){
    * (and the idle weight shift) translates the chest and head instead of
    * spinning each piece in place around its own fixed world point */
   float pvY=by+1.02f;
+  glUniform3f(uNSc,1,1,1.0f/0.60f);          /* correct normals under the slab squash */
   { float o[3]; m3v(M,0,0,0,o);
     set_uM(Mt,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.185f,0.165f,0.26f,9);
   float Mb[9]; memcpy(Mb,Mt,36); m3scl(Mb,br,1.0f,br);
   { float o[3]; m3v(M,0,0.38f,0,o);
     set_uM(Mb,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.175f,0.27f,0.54f,9);
+  glUniform3f(uNSc,1,1,1);
   /* shoulders: small caps on a wide frame */
   for(int si=-1;si<=1;si+=2){ put(M,e->x,pvY,e->z,si*0.29f,0.62f,0); sphere_sh(0.085f,0.085f,0.085f,8,5); }
   /* tie: a darker sliver down the chest */
@@ -2919,9 +2947,11 @@ static void draw_player(void){
   /* pelvis / jacket: same V-taper language as the agents */
   float Mt[9]; memcpy(Mt,M,36); m3scl(Mt,1.0f,1.0f,0.62f);
   tintf(0.03f,0.04f,0.035f);
+  glUniform3f(uNSc,1,1,1.0f/0.62f);
   { float o[3];
     m3v(M,0,0.49f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.175f,0.155f,0.24f,9);
     m3v(M,0,0.87f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.165f,0.25f,0.50f,9); }
+  glUniform3f(uNSc,1,1,1);
   tintf(0.05f,0.06f,0.055f);
   for(int si=-1;si<=1;si+=2){ put(M,px,pcy,pz,si*0.27f,1.05f*tk,0); sphere_sh(0.08f,0.08f,0.08f,8,5); }
 
@@ -3276,6 +3306,9 @@ static void draw_world(float camx,float camy,float camz){
   glUniform1f(uTime,wtime); glUniform1f(uRain,0); glUniform1f(uAlpha,1);
   glUniform3f(uFog,L->fog[0],L->fog[1],L->fog[2]);
   glUniform1f(uRim,0);   /* figures opt into the rim; world stays matte */
+  glUniform1f(uEmisM,0); /* only the world batches carry an emissive mask —
+                            figures bind TX_GLOW whose alpha is 255 at centre */
+  glUniform3f(uNSc,1,1,1);
   /* with the post stack up the scene stays linear HDR; without it, the world
    * program has to tonemap on its own or the frame reaches the window unlit */
   glUniform1f(uTonemap, postOK?0.0f:1.0f);
@@ -3353,6 +3386,7 @@ static void draw_world(float camx,float camy,float camz){
     glUniform1f(uAlpha,0.78f); glUniform1f(uGloss,1.0f);
     glUniform3f(uTint,L->floort[0],L->floort[1],L->floort[2]);
     glUniform1f(uBump,1); glUniform1f(uEmis,0);
+    glUniform1f(uEmisM,2.5f);          /* hairline seams feed the bloom */
     float I[9]; m3id(I); set_uM(I,0,0,0);
     glVertexPointer(3,GL_FLOAT,32,batch[1]);
     glNormalPointer(GL_FLOAT,32,batch[1]+3);
@@ -3362,10 +3396,12 @@ static void draw_world(float camx,float camy,float camz){
     glUniform1f(uAlpha,1);
     /* walls (with rain) and ceiling, opaque, in the sector's climate */
     int texof[2]={TX_WALL,TX_CEIL}; int bid[2]={0,2}; float gls[2]={0.55f,0.3f};
+    float emk[2]={5.0f,1.7f};   /* wall circuit traces / ceiling light slots */
     for(int b=0;b<2;b++){
       glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,texAlb[texof[b]]);
       glActiveTexture_(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,texNrm[texof[b]]);
       glUniform1f(uGloss,gls[b]); glUniform1f(uRain,b==0?1.0f:0.0f);
+      glUniform1f(uEmisM,emk[b]);
       float tk=b==0?1.0f:0.8f;
       glUniform3f(uTint,L->wallt[0]*tk,L->wallt[1]*tk,L->wallt[2]*tk);
       glVertexPointer(3,GL_FLOAT,32,batch[bid[b]]);
@@ -3374,6 +3410,7 @@ static void draw_world(float camx,float camy,float camz){
       glDrawArrays(GL_QUADS,0,bn[bid[b]]/8);
     }
     glUniform1f(uRain,0);
+    glUniform1f(uEmisM,0);
     /* emissive emerald lips along platform/step edges (white-centre glow texel
      * × emerald tint, near-full emissive) — crisp verticality, SUPERHOT-clean */
     if(bn[3]>0){
