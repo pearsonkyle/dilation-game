@@ -761,7 +761,7 @@ static volatile int g_track=0;   /* music: 0 MENU,1=LOBBY,2=SUBWAY,3=TERMINAL,4=
 static volatile int g_mute=0;    /* 'm' toggles: silences output, clocks keep running */
 static unsigned arng=0xBADC0DEu;
 static float arand(void){ arng^=arng<<13;arng^=arng>>17;arng^=arng<<5; return (arng&0xffffff)/(float)0x800000-1.0f; }
-static float px,pz,pyaw;   /* player pose; full definition with the game state below */
+static float px,pz,pyaw,pvx,pvz; /* player pose+velocity; described with the game state below */
 
 /* Fire a voice with its stereo gains already baked. `on` is written LAST: the
  * audio thread polls that flag, so every other field must be settled before the
@@ -772,10 +772,12 @@ static void emit_voice(int type,float pitch,float gl,float gr){
    * with the frozen world, because you always move in real time */
   int world = !(type==V_CLICK||type==V_WIN||type==V_PICK||type==V_STEP
               ||type==V_ROLL||type==V_JUMP||type==V_KICK||type==V_LAND);
+  SDL_LockAudioDevice(adev);   /* cheap: taken once per one-shot, not per sample */
   for(int i=0;i<MAXVOICE;i++) if(!voices[i].on){
     voices[i].type=type; voices[i].t=0; voices[i].p=pitch; voices[i].world=world;
     voices[i].lp=0; voices[i].gl=gl; voices[i].gr=gr;
-    voices[i].on=1; return; }
+    voices[i].on=1; break; }
+  SDL_UnlockAudioDevice(adev);
 }
 static void sfxp(int type,float pitch){ if(audioOK) emit_voice(type,pitch,1.0f,1.0f); }
 static void sfx(int type){ sfxp(type,1.0f); }
@@ -787,7 +789,16 @@ static void sfx3(int type,float pitch,float x,float y,float z){
   float dist=sqrtf(dx*dx+dz*dz);
   float pan = dist>0.001f ? (dx*cosf(yr)+dz*sinf(yr))/dist : 0; /* +1 = hard right */
   float g   = 1.0f/(1.0f+0.10f*dist);                          /* unity up close  */
-  emit_voice(type,pitch, g*(pan>0?1.0f-pan:1.0f), g*(pan<0?1.0f+pan:1.0f));
+  /* your own motion Doppler-shifts the world's sounds — the same physics the
+   * renderer paints. Closing on a source pitches it up a touch. */
+  if(dist>0.001f){
+    float vr=-(pvx*dx+pvz*dz)/dist;
+    pitch*=clampf(1.0f-vr*0.012f,0.8f,1.25f);
+  }
+  /* equal-power pan: the linear law dipped ~3dB dead-centre and snapped at
+   * the edges; cos/sin keeps perceived loudness constant across the arc */
+  float th=(pan+1.0f)*(PI*0.25f);
+  emit_voice(type,pitch, g*cosf(th), g*sinf(th));
 }
 
 /* ---------------------------------------------------------------- music
@@ -982,7 +993,7 @@ static void audio_cb(void*ud,Uint8*stream,int len){
      * with ats, so the groove stays steady while you move. Music is centered;
      * each voice pans into sL/sR by its baked gl/gr. */
     mt += 1.0/44100.0;
-    float m=music_sample(mt,g_track);
+    float m=music_sample(mt,g_track)*0.85f;  /* headroom: stop pumping the SFX */
     float sL=m, sR=m;
     for(int v=0;v<MAXVOICE;v++){
       if(!voices[v].on)continue;
@@ -1013,14 +1024,20 @@ static void audio_cb(void*ud,Uint8*stream,int len){
           float env=expf(-t*7.0f)*atk;
           vs+=(sinf(2*PI*f*t)*0.5f + sinf(2*PI*f*0.5f*t)*0.3f)*env;
           if(t>0.4f)voices[v].on=0; }break;
-        case V_PICK:{ float f=t<0.09f?660:990; vs+=sinf(2*PI*f*t)*expf(-t*9)*0.28f;
+        case V_PICK:{ /* phase-continuous: the raw f*t step clicked at 90ms */
+          float phc = t<0.09f ? 660*t : 660*0.09f+990*(t-0.09f);
+          vs+=sinf(2*PI*phc)*expf(-t*9)*0.28f;
           if(t>0.3f)voices[v].on=0; }break;
         case V_STEP: lp+=0.22f*(arand()-lp); vs+=lp*expf(-t*70)*0.8f;
           if(t>0.08f)voices[v].on=0; break;
         case V_CLICK: vs+=sinf(2*PI*1500*t)*expf(-t*170)*0.25f;
           if(t>0.05f)voices[v].on=0; break;
-        case V_WIN:{ float f= t<0.16f?262: t<0.32f?392: t<0.48f?523: 784;
-          vs+=sinf(2*PI*f*t)*expf(-(t>0.48f?(t-0.48f)*3:0))*0.26f;
+        case V_WIN:{ /* phase-continuous fanfare — each note used to click in */
+          float phc = t<0.16f? 262*t
+                    : t<0.32f? 262*0.16f+392*(t-0.16f)
+                    : t<0.48f? (262+392)*0.16f+523*(t-0.32f)
+                    :          (262+392+523)*0.16f+784*(t-0.48f);
+          vs+=sinf(2*PI*phc)*expf(-(t>0.48f?(t-0.48f)*3:0))*0.26f;
           if(t>1.4f)voices[v].on=0; }break;
         case V_WHOOSH:{ lp+=(0.5f-0.4f*t)*(arand()-lp);   /* passing bullet */
           vs+=lp*0.9f*expf(-t*6)*p;
@@ -1521,7 +1538,7 @@ static void spawn_shards(float x,float y,float z,float vr,float scale){
 enum { ST_TITLE, ST_PLAY, ST_DEAD, ST_WIN };
 static int gstate=ST_TITLE;
 static float py,ppitch,php;   /* px,pz,pyaw live with the audio block above */
-static float pvx,pvz,pvy;                   /* player velocity, for Doppler   */
+static float pvy;                           /* (pvx/pvz live with the audio block) */
 static int   pammo,jumps;                   /* finite pistol ammo; pickups keep you moving */
 static float tscale=1, actT, mouseAcc;
 static float tsEff=1;                       /* tscale with the hitstop dip folded
@@ -2910,7 +2927,7 @@ static void draw_player(void){
   PPose P; player_pose(&P);
   int rolling=P.rolling, blade=P.blade, aimStance=P.aimStance;
   float tuck=P.tuck, tk=P.tk, walk=P.walk, armw=P.armw, s=P.s, spd=P.spd,
-        run=P.run, fwdb=P.fwdb, latb=P.latb, absorb=P.absorb,
+        run=P.run, latb=P.latb, absorb=P.absorb,
         poseYaw=P.poseYaw, pcy=P.pcy;
   float M[9]; memcpy(M,P.M,36);
 
@@ -3170,7 +3187,8 @@ static void draw_items(void){
     if(refl){ /* pickups were the one thing on the glossy floor with no mirror
                  image; fade by height exactly like the figures do */
       float rf=clampf(1.0f-base/0.9f,0,1);
-      if(rf<=0.02f)continue; figDim=rf*0.6f;
+      if(rf<=0.02f)continue;
+      figDim=rf*0.6f;
     }
     float bob=base+0.45f+0.1f*sinf(wtime*2.5f+i);
     m3rotY(M,wtime*1.5f+i);
@@ -3938,7 +3956,8 @@ int main(int argc,char**argv){
             } break;
           case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4:
             if(once&&gstate==ST_TITLE){ curlevel=ev.key.keysym.sym-SDLK_1;
-              if(curlevel>=NLEVEL)curlevel=NLEVEL-1; preview_level(); sfx(V_CLICK); }
+              if(curlevel>=NLEVEL)curlevel=NLEVEL-1;
+              preview_level(); sfx(V_CLICK); }
             break;
           case SDLK_m: if(once){ g_mute=!g_mute; printf("[dilation] audio %s\n",g_mute?"muted":"unmuted"); } break;
           case SDLK_LEFT: if(once&&gstate==ST_TITLE){ curlevel=(curlevel+NLEVEL-1)%NLEVEL; preview_level(); sfx(V_CLICK); } break;
