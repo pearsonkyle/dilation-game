@@ -7,6 +7,14 @@ no assets on disk, no engine. Every texture, level, mesh, sound, and font is
 synthesized at startup or runtime. Stripped down to immediate-mode OpenGL 2 and
 SDL2, the whole game is one `.c` file and compiles to under ~150Kb.
 
+Rendering is deferred through an HDR post stack: the scene draws into a
+multisampled `RGBA16F` target and comes back out through a three-octave bloom
+pyramid, an ACES tonemap, chromatic aberration, vignette, scanlines and grain.
+Lighting is GGX with Schlick Fresnel and a hemisphere ambient. The whole chain
+degrades in steps — no float target falls back to `RGBA8`, no framebuffer
+objects at all falls back to tonemapping inline — so it still runs on a
+GL 2.1 driver from 2006.
+
 ![Title screen](screenshots/title.webp)
 
 | Features | Image |
@@ -48,9 +56,10 @@ clang -Os dilation.c -o dilation -I/opt/homebrew/include -L/opt/homebrew/lib \
 | Left mouse | Fire (range grows the more you move) |
 | Right mouse | Katana — kills up close, deflects bullets |
 | `1`–`4` / `←` `→` | Select sector (title screen) |
+| `M` | Mute / unmute |
 | `ESC` | Sector select / quit |
 
-Clear every agent in a sector to win.
+Clear every agent in a sector to win, then click to jack straight into the next one.
 
 ## Regression mode
 
@@ -58,6 +67,10 @@ Clear every agent in a sector to win.
 screenshots, then prints `SMOKE OK`. It forces `tscale=1` and fixed RNG seeds,
 so output is byte-stable run-to-run — a cheap visual/behavioral regression gate
 for refactors.
+
+Purely visual randomness (camera shake, the HUD damage glitch) draws from a
+second RNG stream, so what is on screen can never perturb the simulation the
+gate is measuring.
 
 ## License
 
