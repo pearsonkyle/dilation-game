@@ -445,27 +445,29 @@ static int bossIdx=-1;          /* index into en[] of the OVERLORD boss, or -1 *
 static int bossMaxHp=60;        /* shots required to kill the boss             */
 
 /* level mesh batches: 0 walls 1 floor 2 ceil 3 emissive edge trims;
- * interleaved p3 n3 uv2 */
+ * interleaved p3 n3 uv2 ao1 — ao is baked per-vertex OCCLUSION (0 open,
+ * ~0.5 boxed in), carried in the texcoord's third component so figures
+ * drawn with plain glTexCoord2f (z=0) are naturally unoccluded. */
 static float *batch[4]; static int bn[4], bcap[4];
-static void emit_v(int b,float px,float py,float pz,float nx,float ny,float nz){
-  if(bn[b]+8>bcap[b]){ bcap[b]=bcap[b]?bcap[b]*2:4096; batch[b]=realloc(batch[b],bcap[b]*sizeof(float)); }
+static void emit_v(int b,float px,float py,float pz,float nx,float ny,float nz,float ao){
+  if(bn[b]+9>bcap[b]){ bcap[b]=bcap[b]?bcap[b]*2:4096; batch[b]=realloc(batch[b],bcap[b]*sizeof(float)); }
   /* tangent/bitangent from axis-aligned normal — must match shader */
   float tx,ty,tz,bx,by,bz;
   if(fabsf(ny)>0.5f){ tx=1;ty=0;tz=0; } else { tx=nz;ty=0;tz=-nx; }
   bx=ny*tz-nz*ty; by=nz*tx-nx*tz; bz=nx*ty-ny*tx;
   float u=(px*tx+py*ty+pz*tz)*0.5f, v=(px*bx+py*by+pz*bz)*0.5f;
   float*o=&batch[b][bn[b]];
-  o[0]=px;o[1]=py;o[2]=pz; o[3]=nx;o[4]=ny;o[5]=nz; o[6]=u;o[7]=v;
-  bn[b]+=8;
+  o[0]=px;o[1]=py;o[2]=pz; o[3]=nx;o[4]=ny;o[5]=nz; o[6]=u;o[7]=v; o[8]=ao;
+  bn[b]+=9;
 }
 /* one trim vertex: batch 3, fixed UV at the glow sprite's white centre so the
  * strip reads as a solid emissive line regardless of the bound texture */
 static void emit_trim(float px,float py,float pz,float nx,float ny,float nz){
   int b=3;
-  if(bn[b]+8>bcap[b]){ bcap[b]=bcap[b]?bcap[b]*2:2048; batch[b]=realloc(batch[b],bcap[b]*sizeof(float)); }
+  if(bn[b]+9>bcap[b]){ bcap[b]=bcap[b]?bcap[b]*2:2048; batch[b]=realloc(batch[b],bcap[b]*sizeof(float)); }
   float*o=&batch[b][bn[b]];
-  o[0]=px;o[1]=py;o[2]=pz; o[3]=nx;o[4]=ny;o[5]=nz; o[6]=0.5f;o[7]=0.5f;
-  bn[b]+=8;
+  o[0]=px;o[1]=py;o[2]=pz; o[3]=nx;o[4]=ny;o[5]=nz; o[6]=0.5f;o[7]=0.5f; o[8]=0;
+  bn[b]+=9;
 }
 /* emissive lip across the top of one riser face, from bottom corner (x0,z0) to
  * (x1,z1) up to height nh. Only platform/step edges get it — full walls to the
@@ -487,6 +489,18 @@ static float cellh(int cx,int cz){
 static float floor_at(float x,float z){
   float h=cellh((int)floorf(x/CELL),(int)floorf(z/CELL));
   return h>100.0f?0:h;
+}
+/* baked corner occlusion: how boxed-in is the corner of cell (cx,cz) toward
+ * (sx,sz)? Counts the three corner-sharing neighbours that rise above ref. */
+static float corner_occ(int cx,int cz,int sx,int sz,float ref){
+  int occ=0;
+  if(cellh(cx+sx,cz )>ref+0.3f)occ++;
+  if(cellh(cx, cz+sz)>ref+0.3f)occ++;
+  if(cellh(cx+sx,cz+sz)>ref+0.3f)occ++;
+  return 0.16f*occ;
+}
+static float ceil_occ(int cx,int cz,int sx,int sz){
+  return 0.13f*(solid(cx+sx,cz)+solid(cx,cz+sz)+solid(cx+sx,cz+sz));
 }
 /* does a circle at (x,z) overlap cell (cx,cz)? */
 static int circ_cell(float x,float z,float r,int cx,int cz){
@@ -689,29 +703,42 @@ static void gen_level(int li,unsigned seedmix){
     if(grid[z][x])continue;
     float x0=x*CELL,x1=x0+CELL,z0=z*CELL,z1=z0+CELL;
     float fh=hgt[z][x];
-    emit_v(1,x0,fh,z0, 0,1,0); emit_v(1,x1,fh,z0, 0,1,0);
-    emit_v(1,x1,fh,z1, 0,1,0); emit_v(1,x0,fh,z1, 0,1,0);
-    emit_v(2,x0,wallh,z0, 0,-1,0); emit_v(2,x0,wallh,z1, 0,-1,0);
-    emit_v(2,x1,wallh,z1, 0,-1,0); emit_v(2,x1,wallh,z0, 0,-1,0);
+    /* floor corners darken where neighbouring cells rise; ceiling corners
+     * where solid columns meet it — baked AO that finally separates an open
+     * hall from a stairwell corner in a black-on-black construct */
+    emit_v(1,x0,fh,z0, 0,1,0, corner_occ(x,z,-1,-1,fh));
+    emit_v(1,x1,fh,z0, 0,1,0, corner_occ(x,z, 1,-1,fh));
+    emit_v(1,x1,fh,z1, 0,1,0, corner_occ(x,z, 1, 1,fh));
+    emit_v(1,x0,fh,z1, 0,1,0, corner_occ(x,z,-1, 1,fh));
+    emit_v(2,x0,wallh,z0, 0,-1,0, ceil_occ(x,z,-1,-1));
+    emit_v(2,x0,wallh,z1, 0,-1,0, ceil_occ(x,z,-1, 1));
+    emit_v(2,x1,wallh,z1, 0,-1,0, ceil_occ(x,z, 1, 1));
+    emit_v(2,x1,wallh,z0, 0,-1,0, ceil_occ(x,z, 1,-1));
     /* vertical faces, plus an emissive lip along each raised-floor riser top
-     * (platforms, stairs, train roofs) — crisp edges that read the verticality. */
+     * (platforms, stairs, train roofs) — crisp edges that read the verticality.
+     * Wall bases sink into contact shadow; tops shade only under the ceiling. */
     float nh,eps=0.016f;
+    { float aob=0.42f;
     nh=solid(x-1,z)?wallh:hgt[z][x-1];
-    if(nh>fh+0.001f){ emit_v(0,x0,fh,z0, 1,0,0); emit_v(0,x0,fh,z1, 1,0,0);
-                      emit_v(0,x0,nh,z1, 1,0,0); emit_v(0,x0,nh,z0, 1,0,0);
+    if(nh>fh+0.001f){ float aot=(nh>=wallh-0.05f)?0.30f:0.0f;
+                      emit_v(0,x0,fh,z0, 1,0,0,aob); emit_v(0,x0,fh,z1, 1,0,0,aob);
+                      emit_v(0,x0,nh,z1, 1,0,0,aot); emit_v(0,x0,nh,z0, 1,0,0,aot);
                       emit_riser(x0+eps,z0, x0+eps,z1, fh,nh, 1,0); }
     nh=solid(x+1,z)?wallh:hgt[z][x+1];
-    if(nh>fh+0.001f){ emit_v(0,x1,fh,z1, -1,0,0); emit_v(0,x1,fh,z0, -1,0,0);
-                      emit_v(0,x1,nh,z0, -1,0,0); emit_v(0,x1,nh,z1, -1,0,0);
+    if(nh>fh+0.001f){ float aot=(nh>=wallh-0.05f)?0.30f:0.0f;
+                      emit_v(0,x1,fh,z1, -1,0,0,aob); emit_v(0,x1,fh,z0, -1,0,0,aob);
+                      emit_v(0,x1,nh,z0, -1,0,0,aot); emit_v(0,x1,nh,z1, -1,0,0,aot);
                       emit_riser(x1-eps,z1, x1-eps,z0, fh,nh, -1,0); }
     nh=solid(x,z-1)?wallh:hgt[z-1][x];
-    if(nh>fh+0.001f){ emit_v(0,x1,fh,z0, 0,0,1); emit_v(0,x0,fh,z0, 0,0,1);
-                      emit_v(0,x0,nh,z0, 0,0,1); emit_v(0,x1,nh,z0, 0,0,1);
+    if(nh>fh+0.001f){ float aot=(nh>=wallh-0.05f)?0.30f:0.0f;
+                      emit_v(0,x1,fh,z0, 0,0,1,aob); emit_v(0,x0,fh,z0, 0,0,1,aob);
+                      emit_v(0,x0,nh,z0, 0,0,1,aot); emit_v(0,x1,nh,z0, 0,0,1,aot);
                       emit_riser(x1,z0+eps, x0,z0+eps, fh,nh, 0,1); }
     nh=solid(x,z+1)?wallh:hgt[z+1][x];
-    if(nh>fh+0.001f){ emit_v(0,x0,fh,z1, 0,0,-1); emit_v(0,x1,fh,z1, 0,0,-1);
-                      emit_v(0,x1,nh,z1, 0,0,-1); emit_v(0,x0,nh,z1, 0,0,-1);
-                      emit_riser(x0,z1-eps, x1,z1-eps, fh,nh, 0,-1); }
+    if(nh>fh+0.001f){ float aot=(nh>=wallh-0.05f)?0.30f:0.0f;
+                      emit_v(0,x0,fh,z1, 0,0,-1,aob); emit_v(0,x1,fh,z1, 0,0,-1,aob);
+                      emit_v(0,x1,nh,z1, 0,0,-1,aot); emit_v(0,x0,nh,z1, 0,0,-1,aot);
+                      emit_riser(x0,z1-eps, x1,z1-eps, fh,nh, 0,-1); } }
   }
 }
 
@@ -1033,9 +1060,10 @@ static GLint uCam,uNL,uLpos,uLcol,uM3,uT,uTint,uBump,uEmis,uAlb,uNrm,
 static const char*VS=
 "#version 120\n"
 "uniform mat3 uM3; uniform vec3 uT; uniform vec3 uNS;\n"
-"varying vec3 vP; varying vec3 vN; varying vec2 vUV;\n"
+"varying vec3 vP; varying vec3 vN; varying vec2 vUV; varying float vAO;\n"
 "void main(){\n"
 "  vec3 wp = uM3*gl_Vertex.xyz + uT;\n"
+"  vAO = gl_MultiTexCoord0.z;\n"
 /* uNS = inverse squash of any non-uniform m3scl in uM3 (torso slabs, the
  * boss's breathing thorax): R*S needs normals through R*S^-1, not R*S */
 "  vP=wp; vN=uM3*(gl_Normal*uNS); vUV=gl_MultiTexCoord0.xy;\n"
@@ -1051,7 +1079,7 @@ static const char*FS=
 "uniform float uEmisMask;\n"
 "uniform vec3 uFog;\n"
 "uniform float uRim; uniform vec3 uRimCol; uniform float uTonemap;\n"
-"varying vec3 vP; varying vec3 vN; varying vec2 vUV;\n"
+"varying vec3 vP; varying vec3 vN; varying vec2 vUV; varying float vAO;\n"
 "float h1(float x){ return fract(sin(x*127.1)*43758.5453); }\n"
 "void main(){\n"
 "  vec4 albS = texture2D(uAlb,vUV);\n"
@@ -1072,7 +1100,8 @@ static const char*FS=
 /* Hemisphere ambient instead of a flat 5% floor: up-facing planes catch a
  * little more than down-facing ones, so the facet planes of a standing figure
  * separate even in a corner no light reaches. */
-"  vec3 col = base*(0.032 + 0.048*(N.y*0.5+0.5));\n"
+"  float aoF = 1.0-vAO;\n"
+"  vec3 col = base*(0.032 + 0.048*(N.y*0.5+0.5))*aoF;\n"
 /* GGX specular. The old Blinn-Phong exponent gave every surface the same
  * plastic dot; a real microfacet lobe plus Schlick Fresnel is what makes the
  * obsidian floor and the cut crystal limbs look like different materials. */
@@ -1091,7 +1120,7 @@ static const char*FS=
 "    float Vs = 0.25/max((NdL*(1.0-kv)+kv)*(NdV*(1.0-kv)+kv),1e-3);\n"
 "    float F = 0.04+0.96*pow(1.0-max(dot(H,V),0.0),5.0);\n"
 "    float spec = min(D*Vs*F*NdL, 8.0)*(0.35+1.10*uGloss);\n"
-"    col += uLcol[i]*a*(base*NdL + vec3(spec)*a);\n"
+"    col += uLcol[i]*a*(base*NdL*aoF + vec3(spec)*a);\n"
 "  }\n"
 /* Grazing-angle environment sheen. There is no cubemap and never will be, but
  * black obsidian only reads as polished if something brightens at the horizon
@@ -3455,10 +3484,10 @@ static void draw_world(float camx,float camy,float camz){
     glUniform1f(uBump,1); glUniform1f(uEmis,0);
     glUniform1f(uEmisM,2.5f);          /* hairline seams feed the bloom */
     float I[9]; m3id(I); set_uM(I,0,0,0);
-    glVertexPointer(3,GL_FLOAT,32,batch[1]);
-    glNormalPointer(GL_FLOAT,32,batch[1]+3);
-    glTexCoordPointer(2,GL_FLOAT,32,batch[1]+6);
-    glDrawArrays(GL_QUADS,0,bn[1]/8);
+    glVertexPointer(3,GL_FLOAT,36,batch[1]);
+    glNormalPointer(GL_FLOAT,36,batch[1]+3);
+    glTexCoordPointer(3,GL_FLOAT,36,batch[1]+6);
+    glDrawArrays(GL_QUADS,0,bn[1]/9);
     glDisable(GL_BLEND);
     glUniform1f(uAlpha,1);
     /* walls (with rain) and ceiling, opaque, in the sector's climate */
@@ -3471,10 +3500,10 @@ static void draw_world(float camx,float camy,float camz){
       glUniform1f(uEmisM,emk[b]);
       float tk=b==0?1.0f:0.8f;
       glUniform3f(uTint,L->wallt[0]*tk,L->wallt[1]*tk,L->wallt[2]*tk);
-      glVertexPointer(3,GL_FLOAT,32,batch[bid[b]]);
-      glNormalPointer(GL_FLOAT,32,batch[bid[b]]+3);
-      glTexCoordPointer(2,GL_FLOAT,32,batch[bid[b]]+6);
-      glDrawArrays(GL_QUADS,0,bn[bid[b]]/8);
+      glVertexPointer(3,GL_FLOAT,36,batch[bid[b]]);
+      glNormalPointer(GL_FLOAT,36,batch[bid[b]]+3);
+      glTexCoordPointer(3,GL_FLOAT,36,batch[bid[b]]+6);
+      glDrawArrays(GL_QUADS,0,bn[bid[b]]/9);
     }
     glUniform1f(uRain,0);
     glUniform1f(uEmisM,0);
@@ -3484,10 +3513,10 @@ static void draw_world(float camx,float camy,float camz){
       glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
       glUniform1f(uGloss,0.0f); glUniform1f(uBump,0); glUniform1f(uEmis,0.92f);
       glUniform3f(uTint,0.20f,1.35f,0.55f);
-      glVertexPointer(3,GL_FLOAT,32,batch[3]);
-      glNormalPointer(GL_FLOAT,32,batch[3]+3);
-      glTexCoordPointer(2,GL_FLOAT,32,batch[3]+6);
-      glDrawArrays(GL_QUADS,0,bn[3]/8);
+      glVertexPointer(3,GL_FLOAT,36,batch[3]);
+      glNormalPointer(GL_FLOAT,36,batch[3]+3);
+      glTexCoordPointer(3,GL_FLOAT,36,batch[3]+6);
+      glDrawArrays(GL_QUADS,0,bn[3]/9);
       glUniform1f(uEmis,0);
     }
     goto draw_agentsetc;   /* fall through to the upright pass */
@@ -3831,14 +3860,14 @@ int main(int argc,char**argv){
     for(int l=0;l<NLEVEL;l++){
       gen_level(l,gseed);
       printf("[dilation] sector %d %-8s: %d agents, %d quads\n",
-        l+1,LEVELS[l].name,nen,(bn[0]+bn[1]+bn[2])/32);
+        l+1,LEVELS[l].name,nen,(bn[0]+bn[1]+bn[2])/36);
       float sy=cellh((int)(startx/CELL),(int)(startz/CELL));
       if(nen<1||sy>100.0f||!circ_free(startx,startz,0.34f,sy)){
         fprintf(stderr,"[dilation] SMOKE FAIL: bad sector %d\n",l); return 1; }
     }
   }
   t0=SDL_GetTicks(); reset_game();
-  printf("[dilation] world carved in %ums (%d quads)\n",SDL_GetTicks()-t0,(bn[0]+bn[1]+bn[2])/32);
+  printf("[dilation] world carved in %ums (%d quads)\n",SDL_GetTicks()-t0,(bn[0]+bn[1]+bn[2])/36);
   init_shaders();
   printf("[dilation] shaders up\n");
   init_post(msaa);
