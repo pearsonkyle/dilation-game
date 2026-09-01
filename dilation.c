@@ -444,6 +444,7 @@ static void draw_text(float x,float y,float sc,const char*s){
 
 /* ---------------------------------------------------------------- level */
 static unsigned char grid[G][G];           /* 1 = solid floor-to-ceiling   */
+static int navCx=-1,navCz=-1;              /* player cell the nav field was built for */
 static float hgt[G][G];                    /* open cells: raised floor height
                                               (platforms, stairs, train roofs) */
 static float startx,startz,startyaw;
@@ -474,6 +475,8 @@ typedef struct {
   int hp;                       /* 0 = one-shot (normal); >1 boss health     */
   /* boss-only (type==2): leap physics + spiral/attack/melee clocks + phase   */
   float vy,spiralA,atkCD,jumpCD,roar,melT; int bphase;
+  float melB,fireT;             /* boss: melee pose blend, volley vent pulse */
+  float blockT;                 /* seconds the walk has been wall-blocked     */
 } Enemy;
 static Enemy en[MAXENEMY]; static int nen, nalive;
 
@@ -739,7 +742,7 @@ static int gen_attempt(int li,unsigned seed){
   memset(grid,1,sizeof grid);
   memset(hgt,0,sizeof hgt);
   wallh=L->ceil;
-  nlights=0; nitems=0; nen=0; bossIdx=-1;
+  nlights=0; nitems=0; nen=0; bossIdx=-1; navCx=navCz=-1;
   for(int b=0;b<4;b++)bn[b]=0;
   int ax0=0,az0=0,ax1=G,az1=G;                 /* agent placement region */
 
@@ -1968,36 +1971,56 @@ static void spawn_parts(int n,float x,float y,float z,float spd,float cr,float c
     p->cr=cr;p->cg=cg;p->cb=cb;
   }
 }
-static void spawn_shards(float x,float y,float z,float vr,float scale){
-  /* Momentum carry is what reads as "it was moving when it died": a charging
-   * striker's debris should go where the striker was going, not puff out
-   * symmetrically like a standing shooter's. Set by shatter_enemy. */
-  extern float g_shardVX,g_shardVZ;
-  /* a figure comes apart: glowing facets, tinted by its final Doppler.
-   * scale grows count, spread, size and speed together — 1.0 for an agent
-   * (bit-identical to the unscaled path), ~2.6 for the 4.5u OVERLORD, whose
-   * death used to reuse the mook burst: 16 tiny chips in a 0.4u box. */
+/* doppler-tinted emissive for a shattering figure: vr<0 was closing on you */
+static void shard_rgb(float vr,float*r,float*g,float*b){
+  float k=clampf(vr/8.0f,-1,1);
+  if(k<0){ *r=0.15f-0.05f*k; *g=0.95f-0.30f*k; *b=0.40f-1.10f*k; }
+  else   { *r=0.15f+1.30f*k; *g=0.95f-0.62f*k; *b=0.40f-0.27f*k; }
+}
+static void spawn_shards(float x,float y,float z,float vx,float vz,float vr,float scale){
+  /* a figure comes apart into glowing facets, tinted by its final Doppler and
+   * carrying its momentum — debris goes where the figure was going. scale
+   * grows count, spread, size and speed together: ~2.6 for the 4.5u OVERLORD,
+   * whose death used to reuse the mook burst (16 tiny chips in a 0.4u box). */
   int n=(int)(16*scale); if(n>96)n=96;
+  float r,g,b; shard_rgb(vr,&r,&g,&b);
   for(int i=0;i<n;i++){
     Shard*s=&shards[shHead]; shHead=(shHead+1)%MAXSHARD;
-    float a=frand()*2*PI, b=(frand()-0.4f)*PI*0.5f;
+    float a=frand()*2*PI, bb=(frand()-0.4f)*PI*0.5f;
     float sp=(1.5f+frand()*3.5f)*(0.7f+0.3f*scale);
     s->x=x+(frand()-0.5f)*0.4f*scale; s->y=y+(0.3f+frand()*1.5f)*scale; s->z=z+(frand()-0.5f)*0.4f*scale;
-    s->vx=cosf(a)*cosf(b)*sp+g_shardVX*0.35f;
-    s->vy=sinf(b)*sp+2.0f;
-    s->vz=sinf(a)*cosf(b)*sp+g_shardVZ*0.35f;
+    s->vx=cosf(a)*cosf(bb)*sp+vx*0.7f; s->vy=sinf(bb)*sp+2.0f; s->vz=sinf(a)*cosf(bb)*sp+vz*0.7f;
     s->yaw=frand()*2*PI; s->pit=frand()*2*PI;
     s->wy=(frand()-0.5f)*14; s->wp=(frand()-0.5f)*14;
     s->sx=(0.06f+frand()*0.16f)*scale; s->sy=(0.06f+frand()*0.22f)*scale; s->sz=(0.02f+frand()*0.05f)*scale;
     s->life=s->max=1.1f+frand()*0.7f;
-    /* doppler-tinted emissive: vr<0 was closing on you when it died */
-    float k=clampf(vr/8.0f,-1,1);
-    if(k<0){ s->r=0.15f-0.05f*k; s->g=0.95f-0.30f*k; s->b=0.40f-1.10f*k; }
-    else   { s->r=0.15f+1.30f*k; s->g=0.95f-0.62f*k; s->b=0.40f-0.27f*k; }
+    s->r=r; s->g=g; s->b=b;
   }
 }
+/* one bone of a shattering agent: a facet the size of the limb segment a->b,
+ * thrown out from the figure's centre (cx,cy,cz) and carrying the body's own
+ * momentum (vx,vz), so the wreck flies the way the agent was running */
+static void shard_bone(const float*a,const float*b,float w,float th,
+                       float cx,float cy,float cz,float vx,float vz,
+                       float r,float g,float bl){
+  Shard*s=&shards[shHead]; shHead=(shHead+1)%MAXSHARD;
+  float ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2];
+  float l=sqrtf(ux*ux+uy*uy+uz*uz); if(l<1e-4f)l=1e-4f;
+  s->x=(a[0]+b[0])*0.5f; s->y=(a[1]+b[1])*0.5f; s->z=(a[2]+b[2])*0.5f;
+  /* draw_shards spins rotY(yaw)*rotX(pit): this puts the facet's long (Y)
+   * axis along the bone */
+  s->yaw=atan2f(ux,uz); s->pit=atan2f(sqrtf(ux*ux+uz*uz),uy);
+  s->sx=w; s->sy=l; s->sz=th;
+  float ox=s->x-cx, oy=s->y-cy, oz=s->z-cz, ol=sqrtf(ox*ox+oy*oy+oz*oz)+0.05f;
+  float sp=2.0f+frand()*3.0f;
+  s->vx=ox/ol*sp+(frand()-0.5f)*2.0f+vx*0.7f;
+  s->vy=oy/ol*sp+2.0f+frand()*1.5f;
+  s->vz=oz/ol*sp+(frand()-0.5f)*2.0f+vz*0.7f;
+  s->wy=(frand()-0.5f)*14; s->wp=(frand()-0.5f)*14;
+  s->life=s->max=1.1f+frand()*0.7f;
+  s->r=r; s->g=g; s->b=bl;
+}
 
-float g_shardVX=0,g_shardVZ=0;   /* victim velocity, read by spawn_shards */
 /* ---------------------------------------------------------------- game state */
 enum { ST_TITLE, ST_PLAY, ST_DEAD, ST_WIN };
 static int gstate=ST_TITLE;
@@ -2185,6 +2208,250 @@ static void dopp_rgb(float vr,float*r,float*g,float*b){
   }
 }
 
+/* orthonormal basis (col-major) whose local -Y axis points along (dx,dy,dz):
+ * aims a limb_seg from a joint straight at its child joint, for IK legs.
+ * limb_seg hangs down local -Y, so local +Y maps to the reverse of the dir. */
+static void aim_basis(float dx,float dy,float dz,float*M){
+  float l=sqrtf(dx*dx+dy*dy+dz*dz); if(l<1e-5f){ m3id(M); return; }
+  float yx=-dx/l, yy=-dy/l, yz=-dz/l;
+  float rx=0,ry=0,rz=1; if(fabsf(yz)>0.85f){ rx=1; rz=0; }   /* ref not ∥ Y */
+  float xx=ry*yz-rz*yy, xy=rz*yx-rx*yz, xz=rx*yy-ry*yx;       /* X = R×Y */
+  float xl=sqrtf(xx*xx+xy*xy+xz*xz); if(xl<1e-5f)xl=1; xx/=xl;xy/=xl;xz/=xl;
+  float zx=xy*yz-xz*yy, zy=xz*yx-xx*yz, zz=xx*yy-xy*yx;       /* Z = X×Y */
+  M[0]=xx;M[1]=xy;M[2]=xz; M[3]=yx;M[4]=yy;M[5]=yz; M[6]=zx;M[7]=zy;M[8]=zz;
+}
+/* basis with local -Y along (dx,dy,dz) and local X = the HINT projected off
+ * the axis: a figure that passes its own lateral axis keeps facets and light
+ * strips on the same side of every limb at any yaw or raise */
+static void aim_basis_h(float dx,float dy,float dz,float hx,float hy,float hz,float*M){
+  float l=sqrtf(dx*dx+dy*dy+dz*dz); if(l<1e-5f){ m3id(M); return; }
+  float yx=-dx/l, yy=-dy/l, yz=-dz/l;
+  float d=hx*yx+hy*yy+hz*yz;
+  float xx=hx-yx*d, xy=hy-yy*d, xz=hz-yz*d;
+  float xl=sqrtf(xx*xx+xy*xy+xz*xz);
+  if(xl<1e-3f){ /* hint parallel to the limb: any perpendicular will do */
+    xx=yy; xy=-yx; xz=0.0f;                                  /* Y x (0,0,1) */
+    if(fabsf(yz)>0.85f){ xx=0.0f; xy=yz; xz=-yy; }             /* Y x (1,0,0) */
+    xl=sqrtf(xx*xx+xy*xy+xz*xz); if(xl<1e-5f)xl=1; }
+  xx/=xl;xy/=xl;xz/=xl;
+  float zx=xy*yz-xz*yy, zy=xz*yx-xx*yz, zz=xx*yy-xy*yx;       /* Z = X×Y */
+  M[0]=xx;M[1]=xy;M[2]=xz; M[3]=yx;M[4]=yy;M[5]=yz; M[6]=zx;M[7]=zy;M[8]=zz;
+}
+/* 2-bone IK: middle joint for a limb from H to T, bones L1/L2, bending toward
+ * the 3D pole direction (knees forward, elbows out/down). */
+static void ik2(float hx,float hy,float hz,float tx,float ty,float tz,
+                float L1,float L2,float polex,float poley,float polez,
+                float*kx,float*ky,float*kz){
+  float dx=tx-hx,dy=ty-hy,dz=tz-hz;
+  float dist=sqrtf(dx*dx+dy*dy+dz*dz); if(dist<1e-4f)dist=1e-4f;
+  float ux=dx/dist,uy=dy/dist,uz=dz/dist;
+  float d1=(dist*dist+L1*L1-L2*L2)/(2.0f*dist);
+  float hh=L1*L1-d1*d1; hh=hh>0?sqrtf(hh):0;
+  float pdot=polex*ux+poley*uy+polez*uz;        /* project pole ⟂ to u */
+  float nx=polex-ux*pdot, ny=poley-uy*pdot, nz=polez-uz*pdot;
+  float nl=sqrtf(nx*nx+ny*ny+nz*nz);
+  if(nl<1e-3f){ nx=0;ny=0;nz=1; nl=1; }
+  nx/=nl;ny/=nl;nz/=nl;
+  *kx=hx+ux*d1+nx*hh; *ky=hy+uy*d1+ny*hh; *kz=hz+uz*d1+nz*hh;
+}
+
+
+/* ---------------------------------------------------------------- figure solvers
+ * The agents' stance, arm chain and joint set are evaluated by ONE set of
+ * functions shared by the renderer (draw_agent), the sim (where a round and
+ * its flash leave the pistol), the aim laser and the shatter (which bone flies
+ * where) — the avatar's PPose/ArmR pattern, so the drawn figure and the
+ * ballistics can never drift apart. Everything here reads sim state only (no
+ * vrand/gtime): the --smoke gate stays deterministic. */
+static void agent_basis(const Enemy*e,float*M,float*lwind,float*lhit){
+  /* the striker's lunge, split into anticipation and blow. The windup length
+   * tracks the AI's own difficulty-scaled lungeWind, and both halves ease
+   * rather than snapping between two fixed leans. lunRel is the follow-through
+   * clock set at the 3->2 hand-off: the blow's extension rides it down. */
+  float lunw=0.32f-0.045f*(float)LEVELS[curlevel].tier; if(lunw<0.08f)lunw=0.08f;
+  float lrel=sstep(e->lunRel);
+  float lw = e->state==3 ? sstep(clampf(e->state_t/lunw,0,1)) : 0.0f;
+  float lh = e->state==3 ? sstep(clampf((e->state_t-lunw)/0.18f,0,1)) : lrel;
+  /* the striker's hunch (0.18) is the baseline every phase blends out of and
+   * back into — the windup rocks back, the blow throws forward, the
+   * follow-through settles — so the lean never teleports at a state change */
+  float lean = e->state==3 ? 0.18f*(1.0f-lw) - 0.38f*lw*(1.0f-lh) + 0.62f*lh
+             : 0.62f*lrel + (e->type==1 ? 0.18f*(1.0f-lrel) : 0.0f);
+  lean -= e->recoil*e->recoil*0.10f;            /* fire recoil rocks the torso back */
+  /* idle weight shift: a standing agent used to be a perfect statue, which is
+   * exactly the pose you spend the most time staring at when the world is
+   * frozen. A slow per-agent-phase roll off the hips (killed the moment it
+   * starts walking) makes it a thing that is standing, not a mannequin. */
+  float idlew=0.045f*sinf(wtime*0.85f+e->phase)*(1.0f-e->moveb);
+  /* AI yaw uses the shot convention (sin yaw, -cos yaw); m3rotY maps local
+   * -Z forward with the opposite handedness, so the figure takes -yaw. */
+  float R[9],X[9],Zi[9],Si[9];
+  m3rotY(R,-e->yaw); m3rotZ(Zi,idlew); m3rotX(X,-lean);   /* +rotX tips the head BACK */
+  m3mul(Si,Zi,X); m3mul(M,R,Si);
+  /* the death collapse: squash down, bulge out (draw_agent drives the glow) */
+  if(e->state==4){ float die=1.0f-clampf(e->dieT/0.13f,0,1), sw=1.0f+0.55f*die;
+    m3scl(M,sw,1.0f-0.45f*die,sw); }
+  *lwind=lw; *lhit=lh;
+}
+/* how far arm ai is raised: anticipation dip -> eased raise with overshoot
+ * -> recoil kick, plus the pitch onto the target once the arm is up. The
+ * striker throws both arms through the lunge and recovers on lunRel. */
+static float agent_raise(const Enemy*e,int ai,float lwind,float lhit){
+  float t=e->armp, rc=e->recoil*e->recoil, lrel=sstep(e->lunRel), raise;
+  float lunge=-0.30f*lwind+1.85f*lhit;          /* cock back, throw, recover */
+  if(ai){
+    raise = t<0.22f ? -0.14f*sstep(t/0.22f)
+                    : 1.45f*easeOutBack((t-0.22f)/0.78f);
+    if(e->state==2) raise=1.45f*sstep(t);           /* eased lowering */
+    if(e->state==3) raise=lunge;
+    else if(lrel>0.001f) raise=1.85f*lrel+raise*(1.0f-lrel);
+    raise += rc*0.35f;
+    /* pitch onto your torso so the barrel (and the round) meet it — faded by
+     * armp so a lowering arm stops tracking */
+    if(e->type==0){ float dx=px-e->x, dz=pz-e->z, d=sqrtf(dx*dx+dz*dz); if(d<0.4f)d=0.4f;
+      raise += clampf(atan2f((py+1.28f)-(e->y+1.64f),d),-0.6f,0.6f)*sstep(t); }
+  } else raise = lunge;
+  /* idle arm drift, antiphase across the shoulders and offset per agent, so a
+   * crowd of waiting agents never breathes in unison. Faded out by moveb and
+   * by any raised arm, which owns its own eased motion. */
+  raise += 0.055f*sinf(wtime*1.5f+e->phase+ai*2.1f)
+           *(1.0f-e->moveb)*clampf(1.0f-raise*1.5f,0,1);
+  return raise;
+}
+typedef struct {
+  float A[9],F[9],GP[9];            /* upper arm / forearm / pistol grip bases */
+  float sx,sy,sz,ex,ey,ez,hx,hy,hz; /* shoulder, elbow, wrist (world)           */
+  float gx,gy,gz,tipx,tipy,tipz;    /* pistol origin, muzzle (world)            */
+  float bdx,bdy,bdz;                /* barrel direction (unit)                  */
+  float raise;
+} AgentArm;
+static void agent_arm(const Enemy*e,const float*M,int ai,float lwind,float lhit,AgentArm*o){
+  float pvY=e->y+1.02f;
+  float raise=agent_raise(e,ai,lwind,lhit);
+  float armw=cosf(e->anim);                       /* contralateral arm phase */
+  float swA=(ai?armw:-armw)*0.4f*e->moveb*clampf(1.0f-raise*2.0f,0,1);
+  /* elbow: slack at the hang, near-straight at full aim */
+  float eb=0.28f-0.14f*sstep(clampf(raise/1.45f,0,1));
+  float sh[3],v[3],RX[9],RZ[9],RE[9],S[9];
+  m3v(M,ai?0.29f:-0.29f,0.62f,0,sh);
+  o->sx=e->x+sh[0]; o->sy=pvY+sh[1]; o->sz=e->z+sh[2];
+  /* +rotX swings a hanging limb FORWARD (where the face is drawn and the
+   * rounds go): the raise and the elbow fold add up. The stride swing is
+   * negated as a whole to keep its tuned contralateral pairing. */
+  m3rotX(RX,raise-swA*e->fwdb); m3rotZ(RZ,-swA*e->latb*0.5f);
+  m3mul(S,RX,RZ); m3mul(o->A,M,S);
+  m3v(o->A,0,-0.37f,0,v); o->ex=o->sx+v[0]; o->ey=o->sy+v[1]; o->ez=o->sz+v[2];
+  m3rotX(RE,raise-swA*e->fwdb+eb); m3mul(S,RE,RZ); m3mul(o->F,M,S);
+  m3v(o->F,0,-0.36f,0,v); o->hx=o->ex+v[0]; o->hy=o->ey+v[1]; o->hz=o->ez+v[2];
+  /* grip: pistol_sh() barrels down local -Z; roll the forearm basis into the
+   * palm exactly as the avatar's player_arm_r does and seat it in the fist */
+  float GX[9]; m3rotX(GX,-PI*0.5f-0.06f); m3mul(o->GP,o->F,GX);
+  m3v(o->GP,0,0.085f,0.010f,v); o->gx=o->hx+v[0]; o->gy=o->hy+v[1]; o->gz=o->hz+v[2];
+  m3v(o->GP,0,-0.010f,-0.50f,v); o->tipx=o->gx+v[0]; o->tipy=o->gy+v[1]; o->tipz=o->gz+v[2];
+  m3v(o->GP,0,0,-1,v); o->bdx=v[0]; o->bdy=v[1]; o->bdz=v[2];
+  o->raise=raise;
+}
+/* the gun arm alone: what the sim fires from */
+static void agent_arm_r(const Enemy*e,AgentArm*o){
+  float M[9],lw,lh; agent_basis(e,M,&lw,&lh); agent_arm(e,M,1,lw,lh,o);
+}
+/* every joint draw_agent places, in world space */
+enum { AJ_PELVIS, AJ_CHEST, AJ_HEAD, AJ_SHL, AJ_ELL, AJ_HANDL, AJ_SHR, AJ_ELR, AJ_HANDR,
+       AJ_HIPL, AJ_KNEEL, AJ_ANKL, AJ_HIPR, AJ_KNEER, AJ_ANKR, AJ_EYEL, AJ_EYER, AJ_N };
+static void agent_joints(const Enemy*e,float J[][3],float*M,AgentArm ar[2],float sw[2]){
+  float lw,lh; agent_basis(e,M,&lw,&lh);
+  float by=e->y, pvY=by+1.02f;
+  /* legs: the same travel-locked stride the avatar walks on. Each foot gets a
+   * world-space target — a triangle sweep along the agent's ACTUAL velocity
+   * plus a lift on the swing half — and 2-bone IK finds the knee. The stance
+   * foot's backward sweep exactly cancels the agent's travel, so nothing
+   * skates, and strafing reads as side-steps for free because the stride runs
+   * along velocity rather than facing. Half-stride from the cadence law:
+   * half = pi*sp/(2*rate) cancels the travel EXACTLY at every walking speed.
+   * Direction from the live velocity, amplitude from the eased spdS (see
+   * update_enemies) so a dead stop settles instead of teleporting the feet. */
+  float asp=sqrtf(e->vx*e->vx+e->vz*e->vz), aspS=e->spdS;
+  float arun=clampf(aspS/3.2f,0,1)*e->moveb;
+  float ahalf=0.5f*PI*aspS/(0.9f+4.65f*aspS); if(ahalf>0.36f)ahalf=0.36f;
+  float fdx,fdz;
+  if(asp>0.2f){ fdx=e->vx/asp; fdz=e->vz/asp; }
+  else { fdx=sinf(e->yaw); fdz=-cosf(e->yaw); }
+  /* knee pole = the body's true forward (local -Z), never the travel
+   * direction — a backpedalling agent must not bend its knees the wrong way */
+  float polex=-M[6], polez=-M[8];
+  { float pl=sqrtf(polex*polex+polez*polez);
+    if(pl>1e-4f){ polex/=pl; polez/=pl; } else { polex=0; polez=-1; } }
+  for(int li=0;li<2;li++){
+    float*H=J[AJ_HIPL+3*li],*K=J[AJ_KNEEL+3*li],*A=J[AJ_ANKL+3*li];
+    float hip[3]; m3v(M,li?0.14f:-0.14f,-0.10f,0,hip);   /* through the pelvis pivot */
+    H[0]=e->x+hip[0]; H[1]=pvY+hip[1]; H[2]=e->z+hip[2];
+    float ph=fmodf(e->anim+(li?PI:0.0f), 2*PI); if(ph<0)ph+=2*PI;
+    float tri   = ph<PI ? 1.0f-2.0f*ph/PI : -1.0f+2.0f*(ph-PI)/PI;
+    float swing = ph<PI ? 0.0f : sinf(ph-PI);
+    float along=ahalf*tri, lift=swing*0.13f*arun;
+    float tx=H[0]+fdx*along, tz=H[2]+fdz*along, ty=by+0.03f+lift;
+    /* keep the target inside reach so the knee never snaps straight */
+    float L1=0.50f,L2=0.46f, maxr=(L1+L2)*0.985f, minr=0.10f;
+    float dxv=tx-H[0],dyv=ty-H[1],dzv=tz-H[2], dd=sqrtf(dxv*dxv+dyv*dyv+dzv*dzv);
+    if(dd>maxr){ float k=maxr/dd; tx=H[0]+dxv*k;ty=H[1]+dyv*k;tz=H[2]+dzv*k; }
+    else if(dd<minr&&dd>1e-4f){ float k=minr/dd; tx=H[0]+dxv*k;ty=H[1]+dyv*k;tz=H[2]+dzv*k; }
+    ik2(H[0],H[1],H[2],tx,ty,tz,L1,L2,polex,0,polez,&K[0],&K[1],&K[2]);
+    A[0]=tx; A[1]=ty; A[2]=tz;
+    sw[li]=swing*arun;
+  }
+  J[AJ_PELVIS][0]=e->x; J[AJ_PELVIS][1]=pvY; J[AJ_PELVIS][2]=e->z;
+  { float o[3]; m3v(M,0,0.62f,0,o);
+    J[AJ_CHEST][0]=e->x+o[0]; J[AJ_CHEST][1]=pvY+o[1]; J[AJ_CHEST][2]=e->z+o[2]; }
+  for(int ai=0;ai<2;ai++){
+    agent_arm(e,M,ai,lw,lh,&ar[ai]);
+    float*S=J[AJ_SHL+3*ai],*E=J[AJ_ELL+3*ai],*W=J[AJ_HANDL+3*ai];
+    S[0]=ar[ai].sx; S[1]=ar[ai].sy; S[2]=ar[ai].sz;
+    E[0]=ar[ai].ex; E[1]=ar[ai].ey; E[2]=ar[ai].ez;
+    W[0]=ar[ai].hx; W[1]=ar[ai].hy; W[2]=ar[ai].hz;
+  }
+  /* head centre, and the eyes in the head-look sub-basis */
+  float Mh[9],HY[9],HX[9],HL[9],hb[3];
+  m3rotY(HY,-e->headYaw); m3rotX(HX,e->headPitch); m3mul(HL,HY,HX); m3mul(Mh,M,HL);
+  m3v(M,0,0.83f,0,hb);
+  J[AJ_HEAD][0]=e->x+hb[0]; J[AJ_HEAD][1]=pvY+hb[1]; J[AJ_HEAD][2]=e->z+hb[2];
+  for(int s=0;s<2;s++){ float o[3]; m3v(Mh,s?0.058f:-0.058f,0.018f,-0.128f,o);
+    J[AJ_EYEL+s][0]=J[AJ_HEAD][0]+o[0]; J[AJ_EYEL+s][1]=J[AJ_HEAD][1]+o[1]; J[AJ_EYEL+s][2]=J[AJ_HEAD][2]+o[2]; }
+}
+/* per-agent pose cache on the avatar's phase stamp (pose_dirty below): the
+ * mirror pass, the upright pass and the aim laser all read ONE solve a frame */
+typedef struct { float M[9],J[AJ_N][3],sw[2]; AgentArm ar[2]; } AgentPose;
+static AgentPose apose[MAXENEMY]; static unsigned aposeStamp[MAXENEMY], poseStamp=1;
+static const AgentPose* agent_pose(const Enemy*e){
+  int i=(int)(e-en); AgentPose*p=&apose[i];
+  if(aposeStamp[i]!=poseStamp){ agent_joints(e,p->J,p->M,p->ar,p->sw); aposeStamp[i]=poseStamp; }
+  return p;
+}
+/* the OVERLORD's melee clock: windup (first 70% of the swat) then the strike,
+ * whose extreme lands exactly on the hit frame; after the blow the reach sags
+ * back over the recovery cooldown. Returns the sag, writes wind/strike. */
+static float boss_melee(const Enemy*e,float*wind,float*strike){
+  float span=e->bphase==2?0.32f:0.45f;
+  float mp = e->state==3 ? clampf(1.0f-e->melT/span,0,1) : 1.0f;
+  *wind=sstep(clampf(mp/0.7f,0,1)); *strike=sstep(clampf((mp-0.7f)/0.3f,0,1));
+  return e->state==3 ? 1.0f : clampf(e->melT/1.2f,0,1);
+}
+/* the OVERLORD's carriage: a low forward hunch at rest, stooping further as
+ * it strides; rears back as it leaps (armp), bows hard into the floor on
+ * impact (recoil), leans back through the swat's windup and lunges into the
+ * blow. Shared by draw_boss and the lance's firing point (the eye cluster). */
+static void boss_basis(const Enemy*e,float*M){
+  float crouch=e->recoil*e->recoil;                     /* eased landing absorb */
+  float lean = 0.10f + 0.16f*e->moveb + 0.04f*sinf(wtime*1.2f+e->bphase);
+  lean += -0.34f*e->armp + 0.45f*crouch;
+  float w,s,sag=boss_melee(e,&w,&s);
+  lean += e->melB*(-0.15f*w*(1.0f-s) + 0.34f*s*sag);
+  float R[9],X[9]; m3rotY(R,-e->yaw); m3rotX(X,-lean); m3mul(M,R,X);   /* +rotX tips the head BACK */
+  /* the collapse: 0.30s for a 4.5-unit body, so the OVERLORD comes apart over
+   * a beat rather than blinking into confetti */
+  if(e->state==4){ float die=1.0f-clampf(e->dieT/0.30f,0,1), sw=1.0f+0.55f*die;
+    m3scl(M,sw,1.0f-0.45f*die,sw); }
+}
+
 /* ---------------------------------------------------------------- combat */
 static void hurt_player(float dmg){
   if(gstate!=ST_PLAY||hurtCD>0)return;   /* mercy: one fan can't double-tap */
@@ -2208,6 +2475,46 @@ static void spawn_bullet(float x,float y,float z,float dx,float dy,float dz,
 }
 static void shatter_enemy(Enemy*e){
   if(e->state==4)return;
+  float vr=radial_v(e->x,e->z,e->vx,e->vz);
+  int boss=e->type==2;
+  float sc=boss?2.6f:1.0f;
+  if(boss) spawn_shards(e->x,e->y,e->z,e->vx,e->vz,vr,sc);
+  else {
+    /* the figure itself comes apart: one facet per bone segment, placed and
+     * pointed exactly where draw_agent has it — the LIVE pose, read before
+     * the state flips, since the collapse below plays out over debris that
+     * is already flying — the eyes as two bright slivers, then a top-up of
+     * small chips off the chest. */
+    float J[AJ_N][3],M[9],sw[2]; AgentArm ar[2];
+    agent_joints(e,J,M,ar,sw);
+    float cx=e->x, cy=e->y+1.0f, cz=e->z;
+    float r,g,b; shard_rgb(vr,&r,&g,&b);
+    r*=1.0f+e->hue*3.0f; g*=1.0f+e->hue*2.0f;        /* the agent's own facet hue */
+#define BONE(A,B,w,t) shard_bone(J[A],J[B],w,t,cx,cy,cz,e->vx,e->vz,r,g,b)
+    BONE(AJ_HIPL,AJ_KNEEL,0.19f,0.16f); BONE(AJ_KNEEL,AJ_ANKL,0.14f,0.12f);
+    BONE(AJ_HIPR,AJ_KNEER,0.19f,0.16f); BONE(AJ_KNEER,AJ_ANKR,0.14f,0.12f);
+    BONE(AJ_SHL,AJ_ELL,0.13f,0.11f);    BONE(AJ_ELL,AJ_HANDL,0.11f,0.10f);
+    BONE(AJ_SHR,AJ_ELR,0.13f,0.11f);    BONE(AJ_ELR,AJ_HANDR,0.11f,0.10f);
+#undef BONE
+    float p0[3],p1[3];
+    for(int k=0;k<3;k++){ p0[k]=J[AJ_PELVIS][k]-M[3+k]*0.13f; p1[k]=J[AJ_PELVIS][k]+M[3+k]*0.13f; }
+    shard_bone(p0,p1,0.34f,0.20f,cx,cy,cz,e->vx,e->vz,r,g,b);             /* waist */
+    for(int k=0;k<3;k++){ p0[k]=J[AJ_PELVIS][k]+M[3+k]*0.11f; }
+    shard_bone(p0,J[AJ_CHEST],0.40f,0.22f,cx,cy,cz,e->vx,e->vz,r,g,b);    /* chest */
+    for(int k=0;k<3;k++){ p0[k]=J[AJ_HEAD][k]-M[3+k]*0.16f; p1[k]=J[AJ_HEAD][k]+M[3+k]*0.16f; }
+    shard_bone(p0,p1,0.25f,0.27f,cx,cy,cz,e->vx,e->vz,r,g,b);             /* head  */
+    { float ev[3]; for(int k=0;k<3;k++) ev[k]=J[AJ_EYER][k]-J[AJ_EYEL][k];
+      float el=0.044f/(sqrtf(ev[0]*ev[0]+ev[1]*ev[1]+ev[2]*ev[2])+1e-6f);
+      for(int sl=0;sl<2;sl++){
+        for(int k=0;k<3;k++){ p0[k]=J[AJ_EYEL+sl][k]-ev[k]*el; p1[k]=J[AJ_EYEL+sl][k]+ev[k]*el; }
+        shard_bone(p0,p1,0.026f,0.022f,cx,cy,cz,e->vx,e->vz,0.35f,2.0f,0.85f); } }
+    for(int i=0;i<8;i++){
+      for(int k=0;k<3;k++){ p0[k]=(J[AJ_PELVIS][k]+J[AJ_CHEST][k])*0.5f+(frand()-0.5f)*0.5f;
+                            p1[k]=p0[k]+(frand()-0.5f)*0.24f; }
+      float w=0.05f+frand()*0.08f, t=0.02f+frand()*0.03f;   /* ordered draws */
+      shard_bone(p0,p1,w,t,cx,cy,cz,e->vx,e->vz,r,g,b);
+    }
+  }
   e->state=4; nalive--;
   /* Death kinematics. The figure used to cease to exist on the exact frame the
    * shards spawned — in a game whose entire punch is a hitstop that HOLDS the
@@ -2221,12 +2528,6 @@ static void shatter_enemy(Enemy*e){
    * to keep a full-brightness flash pinned at its last firing point for the rest
    * of the sector. Retire it with the body. */
   e->mzT=0;
-  float vr=radial_v(e->x,e->z,e->vx,e->vz);
-  int boss=e->type==2;
-  float sc=boss?2.6f:1.0f;
-  g_shardVX=e->vx; g_shardVZ=e->vz;
-  spawn_shards(e->x,e->y,e->z,vr,sc);
-  g_shardVX=g_shardVZ=0;
   spawn_parts(boss?48:14,e->x,e->y+1.1f*sc,e->z,2.5f*(boss?1.8f:1.0f), 0.2f,1.0f,0.5f);
   add_templ(e->x,e->y+1.2f*sc,e->z,6.0f*sc,boss?0.8f:0.35f, 0.3f,2.2f,1.0f);
   sfx3(V_SHATTER,boss?0.45f:1.0f,e->x,e->y,e->z);
@@ -2250,19 +2551,19 @@ static void shatter_enemy(Enemy*e){
     gstate=ST_WIN; sfx(V_WIN); SDL_SetRelativeMouseMode(SDL_FALSE);
   }
 }
-/* every round/melee hit funnels through here. normal agents carry hp 0, so the
- * hp>1 gate is false and they shatter on the first hit exactly as before — the
- * smoke regression stays byte-identical. the boss (hp bossMaxHp) bleeds and flashes
+/* every round/melee hit funnels through here, with the point it landed at.
+ * normal agents carry hp 0, so the hp>1 gate is false and they shatter on the
+ * first hit; the boss (hp bossMaxHp) bleeds and flashes AT THE IMPACT POINT
  * until the killing hit drops it through to shatter_enemy. */
-static void damage_enemy(Enemy*e,int dmg){
+static void damage_enemy(Enemy*e,int dmg,float hx,float hy,float hz){
   if(e->state==4)return;
   if(e->hp>1){
     e->hp-=dmg;
     if(e->hp>0){
       e->flash=0.10f;
-      spawn_parts(5,e->x,e->y+2.6f,e->z,2.2f, 0.7f,1.3f,1.0f);
-      add_templ(e->x,e->y+2.6f,e->z,3.0f,0.06f, 0.6f,1.9f,1.5f);
-      sfx3(V_DEFLECT,1.25f,e->x,e->y+2.0f,e->z);
+      spawn_parts(5,hx,hy,hz,2.2f, 0.7f,1.3f,1.0f);
+      add_templ(hx,hy,hz,3.0f,0.06f, 0.6f,1.9f,1.5f);
+      sfx3(V_DEFLECT,1.25f,hx,hy,hz);
       return;
     }
   }
@@ -2547,7 +2848,7 @@ static void update_feet(float dt){
 static int   poseCached=0;
 static PPose cPose;
 static ArmR  cArm;
-static void pose_dirty(void){ poseCached=0; }
+static void pose_dirty(void){ poseCached=0; poseStamp++; }
 static const PPose* pose_get(void){
   if(!poseCached){ player_pose(&cPose); player_arm_r(&cPose,&cArm); poseCached=1; }
   return &cPose;
@@ -2653,7 +2954,8 @@ static void katana_strike(void){
     if((dx*fx+dz*fz)/(d+1e-6f) < 0.45f)continue;
     if(hitMask&(1u<<i))continue;               /* one cut per agent per swing */
     hitMask|=1u<<i;
-    damage_enemy(e,1);
+    { float hr=e->type==2?1.5f:0.45f, id=1.0f/(d+1e-6f);   /* the blade lands on the near face */
+      damage_enemy(e,1,e->x-dx*id*hr,py+1.25f,e->z-dz*id*hr); }
   }
   for(int i=0;i<MAXBUL;i++){
     Bullet*b=&bul[i];
@@ -2750,7 +3052,7 @@ static void update_bullets(float wdt){
           /* boss is a much larger body: widen its hit capsule accordingly */
           float hr=e->type==2?1.5f:0.45f, htop=e->type==2?5.0f:2.0f;
           if(dx*dx+dz*dz<hr*hr && b->y>e->y && b->y<e->y+htop){
-            damage_enemy(e,1);
+            damage_enemy(e,1,b->x,b->y,b->z);
             b->on=0; break;
           }
         }
@@ -2811,18 +3113,26 @@ static void update_boss(Enemy*e,float wdt){
    * counter-swept for a quarter second chasing a body that had already arrived.
    * The boss turns slowly in the air so a leap commits to its direction. */
   { int inAir=(e->y>ground_h(e->x,e->z,e->y)+0.05f)||e->vy>0.01f;
-    e->yaw=angto(e->yaw, atan2f(dx,-dz), wdt*(inAir?1.5f:5.0f)); }
+    /* on the ground a finite 2.2+0.8*phase rad/s, so it can be circled and a
+     * swat you step round misses; quicker as it enrages */
+    e->yaw=angto(e->yaw, atan2f(dx,-dz), wdt*(inAir?1.5f:2.2f+0.8f*e->bphase)); }
   /* stride drivers: moveb is a smoothed 0..1 walk blend, anim the gait phase —
      its cadence rises with ground speed so the legs/arms read the movement */
   float spd2=sqrtf(e->vx*e->vx+e->vz*e->vz);
   e->moveb=toward(e->moveb, clampf(spd2/2.2f,0,1), wdt*6.0f);
-  e->anim+=wdt*(3.0f+spd2*2.2f);
+  /* attack-instant, release-eased speed (see the agents' spdS): feeds the
+   * cadence AND draw_boss's half-stride, so the stance foot never skates */
+  e->spdS = spd2>e->spdS ? spd2 : toward(e->spdS,spd2,wdt*7.0f);
+  e->anim+=wdt*(3.0f+e->spdS*2.2f);
   e->roar=toward(e->roar, e->state==1?1.0f:(e->state==3?0.7f:0.15f), wdt*6.0f);
   /* smoothed pose blends so leaps ease in and OUT instead of snapping: armp is
      the airborne-pose amount (arms up / knees tucked), recoil the landing crouch
      that decays after touchdown. Both advance on world-time, freezing with it. */
   e->armp=toward(e->armp, e->state==1?1.0f:0.0f, wdt*8.0f);
   if(e->recoil>0){ e->recoil-=wdt*2.2f; if(e->recoil<0)e->recoil=0; }
+  e->melB=toward(e->melB, e->state==3?1.0f:0.0f, wdt*10.0f);   /* swat pose fade */
+  if(e->fireT>0){ e->fireT-=wdt; if(e->fireT<0)e->fireT=0; }
+  if(e->mzT>0){ e->mzT-=wdt; if(e->mzT<0)e->mzT=0; }         /* update_enemies skips the boss */
 
   /* leap physics: gravity + a slam burst on touchdown */
   float gh=ground_h(e->x,e->z,e->y);
@@ -2834,16 +3144,23 @@ static void update_boss(Enemy*e,float wdt){
        the sector becomes unwinnable */
     move_circ(&e->x,&e->z, e->vx*wdt, e->vz*wdt, 0.9f, e->y);
     if(e->y<=gh){
-      e->y=gh; e->vy=0; e->vx=e->vz=0; e->state=0; e->recoil=1.0f; shake=0.55f;
-      sfx3(V_SHATTER,0.55f,e->x,e->y,e->z);
-      add_templ(e->x,e->y+0.5f,e->z,9.0f,0.30f, 1.0f,0.5f,1.4f);
-      for(int k=0;k<arms*2;k++){ float a=k*PI/arms;
-        spawn_bullet(e->x,e->y+0.7f,e->z, sinf(a),0.04f,-cosf(a), bspd*0.9f,0,-1); }
+      /* the slam only fires for a real leap (state 1 in flight) or a genuine
+       * fall — stepping off a kerb used to detonate the full landing burst */
+      int slam = e->state==1 || e->vy<-6.0f;
+      e->y=gh; e->vy=0; e->vx=e->vz=0;
+      if(slam){
+        e->state=0; e->recoil=1.0f; shake=0.55f;
+        sfx3(V_SHATTER,0.55f,e->x,e->y,e->z);
+        add_templ(e->x,e->y+0.5f,e->z,9.0f,0.30f, 1.0f,0.5f,1.4f);
+        for(int k=0;k<arms*2;k++){ float a=k*PI/arms;
+          spawn_bullet(e->x,e->y+0.7f,e->z, sinf(a),0.04f,-cosf(a), bspd*0.9f,0,-1); }
+      } else if(e->recoil<0.35f) e->recoil=0.35f;        /* just a small settle */
     }
   } else {
     e->y=toward(e->y, gh, wdt*10.0f);
   }
-  if(wdt>1e-4f){ e->vx=airborne?e->vx:(e->x-e->lx)/wdt; e->vz=airborne?e->vz:(e->z-e->lz)/wdt; }
+  /* 1e-3, not 1e-4: same finite-difference noise floor as the agents */
+  if(wdt>1e-3f){ e->vx=airborne?e->vx:(e->x-e->lx)/wdt; e->vz=airborne?e->vz:(e->z-e->lz)/wdt; }
   e->lx=e->x; e->lz=e->z;
 
   /* the spiral fountain — the dodgeable base pattern. its arms leave rotating
@@ -2855,11 +3172,13 @@ static void update_boss(Enemy*e,float wdt){
   if(!airborne && !resting && e->atkCD<=0){
     e->atkCD=cad;
     float sv = elevated ? clampf(vslope*0.6f,0.0f,1.4f) : 0.02f;
+    /* each round starts on the thorax surface along its own arm, not inside it */
     for(int k=0;k<arms;k++){ float a=e->spiralA + k*2*PI/arms;
-      spawn_bullet(e->x,my,e->z, sinf(a),sv,-cosf(a), bspd,0,-1); }
+      spawn_bullet(e->x+sinf(a)*0.85f,my,e->z-cosf(a)*0.85f, sinf(a),sv,-cosf(a), bspd,0,-1); }
     if(e->bphase==2)
       for(int k=0;k<arms;k++){ float a=-e->spiralA + k*2*PI/arms + 0.3f;
-        spawn_bullet(e->x,my,e->z, sinf(a),sv,-cosf(a), bspd*0.85f,0,-1); }
+        spawn_bullet(e->x+sinf(a)*0.85f,my,e->z-cosf(a)*0.85f, sinf(a),sv,-cosf(a), bspd*0.85f,0,-1); }
+    e->fireT=0.12f;                              /* the spine vents pulse per volley */
     sfx3(V_ESHOT,0.6f,e->x,my,e->z);
   }
 
@@ -2873,17 +3192,22 @@ static void update_boss(Enemy*e,float wdt){
   if(!airborne && e->phase<=0){
     e->phase = (e->bphase==0?1.9f:e->bphase==1?1.5f:1.1f) * (elevated?0.55f:1.0f);
     int   N      = e->bphase==0?3:5;
-    float base   = atan2f(dx,-dz);
+    float base   = atan2f(dx,-dz);          /* the lance itself aims exactly */
     float spread = elevated?0.10f:0.17f;
+    /* loosed from the eye cluster (skull centre, half a unit forward) through
+     * the shared carriage basis, not from inside the thorax */
+    float Mb[9],eo[3]; boss_basis(e,Mb); m3v(Mb,0,2.50f,-0.55f,eo);
+    float ox=e->x+eo[0], oy=e->y+1.65f+eo[1], oz=e->z+eo[2], ls=(aimY-oy)/d;
     for(int k=0;k<N;k++){ float a=base+(k-(N-1)*0.5f)*spread;
-      spawn_bullet(e->x,my+0.5f,e->z, sinf(a),vslope,-cosf(a), bspd*1.2f,0,-1); }
-    sfx3(V_ESHOT,0.72f,e->x,my,e->z);
+      spawn_bullet(ox,oy,oz, sinf(a),ls,-cosf(a), bspd*1.2f,0,-1); }
+    e->fireT=0.12f; e->mzT=0.07f; e->mzx=ox; e->mzy=oy; e->mzz=oz;   /* vents + eye flash */
+    sfx3(V_ESHOT,0.72f,ox,oy,oz);
   }
 
   /* periodic leap toward the player */
   e->jumpCD -= wdt;
   if(!airborne && e->jumpCD<=0 && d>3.0f){
-    e->vy=9.5f; e->state=1;
+    e->vy=9.5f; e->state=1; e->melT=0;       /* a leap cancels any swat bookkeeping */
     float hop=clampf(d*0.55f,3.0f,9.0f);
     e->vx=dx/d*hop; e->vz=dz/d*hop;
     e->jumpCD = (e->bphase==2?2.6f:4.6f)+frand()*1.6f;
@@ -2909,7 +3233,9 @@ static void update_boss(Enemy*e,float wdt){
     if(e->state==3){
       e->melT-=wdt;
       if(e->melT<=0){
-        if(d<2.6f && fabsf(py-e->y)<2.5f) hurt_player(e->bphase==2?34:26);
+        /* the claw only lands in front of it: no hits from a swat you circled behind */
+        if(d<2.6f && fabsf(py-e->y)<2.5f && (dx*sinf(e->yaw)-dz*cosf(e->yaw))/d > 0.2f)
+          hurt_player(e->bphase==2?34:26);
         e->state=0; e->melT=1.2f;
       }
     } else {
@@ -2922,7 +3248,46 @@ static void update_boss(Enemy*e,float wdt){
 
   /* keep the boss off the player: back it out when they overlap (same
      convention the agents use — the figure yields, not the player) */
-  if(d<2.0f){ float push=(2.0f-d)*0.5f; e->x-=dx/d*push; e->z-=dz/d*push; }
+  if(d<2.0f){ float push=(2.0f-d)*0.5f, ox=e->x,oz=e->z;
+    move_circ(&e->x,&e->z,-dx/d*push,-dz/d*push,0.9f,e->y);   /* never through a wall */
+    float rx=-dx/d*push-(e->x-ox), rz=-dz/d*push-(e->z-oz);
+    if(fabsf(rx)+fabsf(rz)>1e-4f) move_circ(&px,&pz,-rx,-rz,0.34f,py); }
+}
+
+/* ---------------------------------------------------------------- nav field
+ * A flow field toward the player: BFS distance over the walkable grid,
+ * rebuilt only when the player crosses a cell boundary. An agent that has
+ * lost sight of you follows it downhill instead of grinding into the wall
+ * between you. Deterministic: grid + player cell only. */
+static unsigned char nav[G][G];
+static void nav_build(int sx,int sz){
+  static const int D[4][2]={{1,0},{-1,0},{0,1},{0,-1}};
+  static short q[G*G]; int qh=0,qt=0;
+  memset(nav,255,sizeof nav);
+  if(solid(sx,sz))return;
+  nav[sz][sx]=0; q[qt++]=(short)(sz*G+sx);
+  while(qh<qt){
+    int c=q[qh++], cx=c%G, cz=c/G; unsigned v=nav[cz][cx];
+    for(int k=0;k<4;k++){ int nx=cx+D[k][0], nz=cz+D[k][1];
+      if(solid(nx,nz)||nav[nz][nx]!=255)continue;
+      if(fabsf(hgt[nz][nx]-hgt[cz][cx])>STEP)continue;
+      nav[nz][nx]=(unsigned char)(v+1<254?v+1:254); q[qt++]=(short)(nz*G+nx); }
+  }
+}
+/* steer (mx,mz) toward the lowest-valued neighbour cell centre; leaves the
+ * beeline alone when the field has nothing better to say */
+static void nav_dir(const Enemy*e,float*mx,float*mz){
+  static const int D[4][2]={{1,0},{-1,0},{0,1},{0,-1}};
+  int cx=(int)floorf(e->x/CELL), cz=(int)floorf(e->z/CELL);
+  if(cx<0||cz<0||cx>=G||cz>=G||nav[cz][cx]>=254)return;
+  int best=nav[cz][cx], bx=-1,bz=-1;
+  for(int k=0;k<4;k++){ int nx=cx+D[k][0], nz=cz+D[k][1];
+    if(nx<0||nz<0||nx>=G||nz>=G)continue;
+    if(nav[nz][nx]<best){ best=nav[nz][nx]; bx=nx; bz=nz; } }
+  if(bx<0)return;
+  float dx=(bx+0.5f)*CELL-e->x, dz=(bz+0.5f)*CELL-e->z, d=sqrtf(dx*dx+dz*dz);
+  if(d<0.05f)return;
+  *mx=dx/d; *mz=dz/d;
 }
 
 /* ---------------------------------------------------------------- agent AI
@@ -2942,6 +3307,8 @@ static void update_enemies(float wdt){
   int maxAim=4+(LEVELS[curlevel].tier>=2);
   int aimers=0;
   for(int i=0;i<nen;i++) if(en[i].state==1&&en[i].type!=2)aimers++; /* boss leaps reuse state 1 */
+  { int pcx=(int)floorf(px/CELL), pcz=(int)floorf(pz/CELL);
+    if(pcx!=navCx||pcz!=navCz){ navCx=pcx; navCz=pcz; nav_build(pcx,pcz); } }
   for(int i=0;i<nen;i++){
     Enemy*e=&en[i];
     if(e->type==2){ if(e->state!=4)update_boss(e,wdt); continue; }
@@ -3017,44 +3384,54 @@ static void update_enemies(float wdt){
       e->headYaw=toward(e->headYaw,want,wdt*6.0f);
       e->headPitch=toward(e->headPitch,wp,wdt*6.0f); }
     float spd = (e->type==1?4.4f:2.6f)*moveMul;
+    /* the body turns at a finite rate in EVERY living state — the cooldown
+     * used to freeze the yaw, so the figure popped round when it ended. The
+     * aim must be crisp; the lunge is slow on purpose (see case 3); the
+     * patrol turn is ~0.13s. */
+    e->yaw=angto(e->yaw, atan2f(dx,-dz),
+                 wdt*(e->state==1?13.0f : e->state==3?6.0f : e->state==2?5.0f : 8.0f));
     switch(e->state){
       case 0:{ /* advance / reposition */
-        e->yaw=angto(e->yaw, atan2f(dx,-dz), wdt*8.0f);   /* patrol turn ~0.13s */
         float mx=0,mz=0;
-        if(e->type==1||!see||d>13.0f){ mx=dx/d; mz=dz/d; }
+        if(e->type==1||!see||d>13.0f){ mx=dx/d; mz=dz/d;
+          /* no line of sight (or wedged for a while): follow the flow field
+           * round the wall instead of pushing into it */
+          if(!see||e->blockT>0.4f) nav_dir(e,&mx,&mz); }
         else if(d<4.0f){ mx=-dx/d; mz=-dz/d; }
         else { float sgn=sinf(wtime*0.7f+e->phase)>0?1:-1;   /* strafe */
                mx=-dz/d*sgn; mz=dx/d*sgn; spd*=0.7f; }
         float ox=e->x,oz=e->z;
         move_circ(&e->x,&e->z,mx*spd*wdt,mz*spd*wdt,0.32f,e->y);
         if(fabsf(e->x-ox)+fabsf(e->z-oz) < spd*wdt*0.25f){
+          e->blockT+=wdt;
           float a=e->yaw+(sinf(wtime*3+e->phase)>0?1.4f:-1.4f);
           move_circ(&e->x,&e->z,sinf(a)*spd*wdt,-cosf(a)*spd*wdt,0.32f,e->y);
-        }
+        } else { e->blockT-=wdt*0.5f; if(e->blockT<0)e->blockT=0; }
         /* never walk off a high edge (train roofs, the mezzanine) */
         if(e->y-ground_h(e->x,e->z,e->y) > AGENT_DROP){ e->x=ox; e->z=oz; }
         e->state_t+=wdt;
         if(e->type==0){ if(see&&d<15.0f&&d>3.0f&&e->state_t>0&&aimers<maxAim){
-                          e->state=1; e->state_t=0; aimers++; } }
+                          /* resume the raise from wherever the arm is (a
+                           * LOS-abort leaves it half up) instead of snapping */
+                          e->state=1; e->state_t=e->armp*0.25f; aimers++; } }
         else          { if(d<1.7f&&fabsf(py-e->y)<1.2f&&e->state_t>0){ e->state=3; e->state_t=0; } }
       } break;
       case 1: /* aim: eyes flare, arm rises */
-        e->yaw=angto(e->yaw, atan2f(dx,-dz), wdt*13.0f);  /* aim must be crisp  */
         e->state_t+=wdt;
         e->armp=clampf(e->state_t/0.25f,0,1);
         if(!see){ e->state=0; e->state_t=0; break; }
         if(e->state_t>aimTime){
           /* a three-round fan, aimed at your stance RIGHT NOW —
            * roll under it, jump over it, or stand still and study it */
-          /* fire from the drawn RIGHT hand (shoulder +0.29 lateral, arm
-           * raised forward), not the old chest-centreline point — the flash
-           * and rounds now leave the pistol the pose is holding */
-          float my=e->y+1.62f, aimY=py+1.28f;
-          float hx=e->x+sinf(e->yaw)*0.55f+cosf(e->yaw)*0.29f;
-          float hz=e->z-cosf(e->yaw)*0.55f+sinf(e->yaw)*0.29f;
+          /* fire from the drawn pistol's muzzle: the SAME arm solve draw_agent
+           * places, so the flash, the laser and the rounds all leave the barrel
+           * you see. The fan's bearing is muzzle -> torso, the laser's own line. */
+          AgentArm ar; agent_arm_r(e,&ar);
+          float hx=ar.tipx, my=ar.tipy, hz=ar.tipz, aimY=py+1.28f;
+          float tdx=px-hx, tdz=pz-hz;
           for(int k=-1;k<=1;k++){
             float sp=k*0.14f+(frand()-0.5f)*0.03f;
-            float bdx=dx+(-dz)*sp, bdz=dz+dx*sp;
+            float bdx=tdx+(-tdz)*sp, bdz=tdz+tdx*sp;
             spawn_bullet(hx,my,hz,bdx,aimY-my,bdz,(7.0f+frand()*2.5f)*shotMul,0,-1);
           }
           e->recoil=1.0f;
@@ -3080,7 +3457,6 @@ static void update_enemies(float wdt){
          * with no dodge window. The root motion below now follows e->yaw rather
          * than the live bearing, so the striker COMMITS and a sidestep beats it
          * — the counterplay the 0.18s follow-through was written for. */
-        e->yaw=angto(e->yaw, atan2f(dx,-dz), wdt*6.0f);
         e->state_t+=wdt;
         if(e->state_t>=lungeWind){
           /* root motion through the strike: the throw pose used to play out
@@ -3104,9 +3480,28 @@ static void update_enemies(float wdt){
         break;
     }
     if(e->state!=4 && d<0.7f && d>0.001f && fabsf(py-e->y)<1.5f){
-      e->x-=dx/d*(0.7f-d); e->z-=dz/d*(0.7f-d);
+      /* keep the figure off the player — through the collision test, so an
+       * agent pinned against a wall is never shoved into it. If it cannot
+       * yield, the player gives the remainder instead, so the overlap still
+       * resolves. */
+      float k=0.7f-d, ox=e->x,oz=e->z;
+      move_circ(&e->x,&e->z,-dx/d*k,-dz/d*k,0.32f,e->y);
+      float rx=-dx/d*k-(e->x-ox), rz=-dz/d*k-(e->z-oz);
+      if(fabsf(rx)+fabsf(rz)>1e-4f) move_circ(&px,&pz,-rx,-rz,0.34f,py);
     }
   }
+  /* agent-agent separation: a crowd used to stack into one column. Pairs
+   * closer than 0.75u (1.4u against the boss) push apart, half each,
+   * collision-checked. n<=32 so the O(n^2) pass is nothing. */
+  for(int i=0;i<nen;i++){ Enemy*a=&en[i]; if(a->state==4)continue;
+    for(int j=i+1;j<nen;j++){ Enemy*b=&en[j]; if(b->state==4)continue;
+      float sx=b->x-a->x, sz=b->z-a->z, d2=sx*sx+sz*sz;
+      float want=(a->type==2||b->type==2)?1.4f:0.75f;
+      if(d2>=want*want||d2<1e-6f||fabsf(a->y-b->y)>1.5f)continue;
+      float d=sqrtf(d2), k=(want-d)*0.5f; sx/=d; sz/=d;
+      move_circ(&a->x,&a->z,-sx*k,-sz*k,a->type==2?0.9f:0.32f,a->y);
+      move_circ(&b->x,&b->z, sx*k, sz*k,b->type==2?0.9f:0.32f,b->y);
+    } }
 }
 
 /* ---------------------------------------------------------------- drawing */
@@ -3361,55 +3756,6 @@ static void limb_seg(const float*L,float jx,float jy,float jz,float cdrop,
   put(L,jx,jy,jz,0,cdrop,0); cyl_shc(r0,r1,h,seg,0);
   float e[3]; m3v(L,0,edrop,0,e); *nx=jx+e[0]; *ny=jy+e[1]; *nz=jz+e[2];
 }
-/* orthonormal basis (col-major) whose local -Y axis points along (dx,dy,dz):
- * aims a limb_seg from a joint straight at its child joint, for IK legs.
- * limb_seg hangs down local -Y, so local +Y maps to the reverse of the dir. */
-static void aim_basis(float dx,float dy,float dz,float*M){
-  float l=sqrtf(dx*dx+dy*dy+dz*dz); if(l<1e-5f){ m3id(M); return; }
-  float yx=-dx/l, yy=-dy/l, yz=-dz/l;
-  float rx=0,ry=0,rz=1; if(fabsf(yz)>0.85f){ rx=1; rz=0; }   /* ref not ∥ Y */
-  float xx=ry*yz-rz*yy, xy=rz*yx-rx*yz, xz=rx*yy-ry*yx;       /* X = R×Y */
-  float xl=sqrtf(xx*xx+xy*xy+xz*xz); if(xl<1e-5f)xl=1; xx/=xl;xy/=xl;xz/=xl;
-  float zx=xy*yz-xz*yy, zy=xz*yx-xx*yz, zz=xx*yy-xy*yx;       /* Z = X×Y */
-  M[0]=xx;M[1]=xy;M[2]=xz; M[3]=yx;M[4]=yy;M[5]=yz; M[6]=zx;M[7]=zy;M[8]=zz;
-}
-/* 2-bone IK: knee for a leg from hip H to foot T, bones L1/L2, bending toward
- * the world pole (px,pz) (knees forward). Writes the knee world position. */
-/* basis with local -Y along (dx,dy,dz) and local X = the HINT projected off
- * the axis: a figure that passes its own lateral axis keeps facets and light
- * strips on the same side of every limb at any yaw or raise */
-static void aim_basis_h(float dx,float dy,float dz,float hx,float hy,float hz,float*M){
-  float l=sqrtf(dx*dx+dy*dy+dz*dz); if(l<1e-5f){ m3id(M); return; }
-  float yx=-dx/l, yy=-dy/l, yz=-dz/l;
-  float d=hx*yx+hy*yy+hz*yz;
-  float xx=hx-yx*d, xy=hy-yy*d, xz=hz-yz*d;
-  float xl=sqrtf(xx*xx+xy*xy+xz*xz);
-  if(xl<1e-3f){ /* hint parallel to the limb: any perpendicular will do */
-    xx=yy; xy=-yx; xz=0.0f;                                  /* Y x (0,0,1) */
-    if(fabsf(yz)>0.85f){ xx=0.0f; xy=yz; xz=-yy; }             /* Y x (1,0,0) */
-    xl=sqrtf(xx*xx+xy*xy+xz*xz); if(xl<1e-5f)xl=1; }
-  xx/=xl;xy/=xl;xz/=xl;
-  float zx=xy*yz-xz*yy, zy=xz*yx-xx*yz, zz=xx*yy-xy*yx;       /* Z = X×Y */
-  M[0]=xx;M[1]=xy;M[2]=xz; M[3]=yx;M[4]=yy;M[5]=yz; M[6]=zx;M[7]=zy;M[8]=zz;
-}
-/* 2-bone IK: middle joint for a limb from H to T, bones L1/L2, bending toward
- * the 3D pole direction (knees forward, elbows out/down). */
-static void ik2(float hx,float hy,float hz,float tx,float ty,float tz,
-                float L1,float L2,float polex,float poley,float polez,
-                float*kx,float*ky,float*kz){
-  float dx=tx-hx,dy=ty-hy,dz=tz-hz;
-  float dist=sqrtf(dx*dx+dy*dy+dz*dz); if(dist<1e-4f)dist=1e-4f;
-  float ux=dx/dist,uy=dy/dist,uz=dz/dist;
-  float d1=(dist*dist+L1*L1-L2*L2)/(2.0f*dist);
-  float hh=L1*L1-d1*d1; hh=hh>0?sqrtf(hh):0;
-  float pdot=polex*ux+poley*uy+polez*uz;        /* project pole ⟂ to u */
-  float nx=polex-ux*pdot, ny=poley-uy*pdot, nz=polez-uz*pdot;
-  float nl=sqrtf(nx*nx+ny*ny+nz*nz);
-  if(nl<1e-3f){ nx=0;ny=0;nz=1; nl=1; }
-  nx/=nl;ny/=nl;nz/=nl;
-  *kx=hx+ux*d1+nx*hh; *ky=hy+uy*d1+ny*hh; *kz=hz+uz*d1+nz*hh;
-}
-
 static void pistol_sh(const float*W,float gx,float gy,float gz,int ammo){
   float o[3],M2[9],RX[9];
   tintf(0.040f,0.048f,0.052f);
@@ -3470,23 +3816,14 @@ static void draw_boss(Enemy*e){
   if(e->state==4 && e->dieT<=0)return;
   primArm=1;
   float by=e->y;
-  float M[9],R[9],X[9];
-  /* a low forward hunch at rest, stooping further as it strides; rears back as
-     it leaps (armp), then bows hard into the floor on impact (recoil) before
-     recovering — never the upright T-stance */
+  float M[9]; boss_basis(e,M);      /* the carriage (and the collapse squash), shared with the lance */
   float crouch=e->recoil*e->recoil;                     /* eased landing absorb */
-  float lean = 0.10f + 0.16f*e->moveb + 0.04f*sinf(wtime*1.2f+e->bphase);
-  lean += -0.34f*e->armp + 0.45f*crouch;
-  if(e->state==3) lean=0.34f;                           /* melee lunge overrides */
-  m3rotY(R,-e->yaw); m3rotX(X,lean); m3mul(M,R,X);
-  /* the collapse: squash down, bulge out. 0.30s for a 4.5-unit body, so the
-     OVERLORD comes apart over a beat rather than blinking into confetti. */
-  if(die>0) m3scl(M,1.0f+0.55f*die,1.0f-0.45f*die,1.0f+0.55f*die);
+  float mw,ms,msag=boss_melee(e,&mw,&ms), mel=e->melB;  /* swat windup / strike / recovery */
 
   float vr=radial_v(e->x,e->z,e->vx,e->vz);
   float dr,dg,db; dopp_rgb(vr,&dr,&dg,&db);
   float ph=(float)e->bphase;
-  float fl=e->flash>0?0.7f:0.0f;
+  float fl=0.7f*clampf(e->flash/0.10f,0,1); fl*=fl;   /* eased hit pulse */
   /* bruised violet hide, reddening with each phase */
   float sr=0.18f+0.10f*ph + dr*0.10f;
   float sg=0.06f           + dg*0.08f;
@@ -3500,33 +3837,51 @@ static void draw_boss(Enemy*e){
    * shards look like they were shed by it rather than swapped in for it */
   float figDim0=figDim;              /* figDim belongs to the caller: restored below */
   if(die>0){ glUniform1f(uEmis,0.35f+0.90f*die); figDim*=1.0f+2.2f*die; }
-  if(die>0){ glUniform1f(uEmis,0.35f+0.90f*die); figDim*=1.0f+2.2f*die; }
   float breath=1.0f+0.03f*sinf(wtime*2.2f+e->bphase);
 
-  /* legs: two heavy two-bone limbs. A hip swing + knee bend drive a stride that
-     scales with moveb; mid-leap the knees tuck up instead of pedalling. */
-  for(int li=-1;li<=1;li+=2){
-    float lph=e->anim+(li>0?0:PI);
-    float ground=1.0f-e->armp;                                      /* 0 airborne..1 planted */
-    float sw =sinf(lph)*0.55f*e->moveb*ground;                      /* hip fwd/back */
-    float kb =(0.10f+0.55f*clampf(0.5f-0.5f*sinf(lph),0,1))*e->moveb*ground
-              +0.55f*crouch;                                        /* + impact absorb */
-    float tuck=0.75f*e->armp;
-    float hip[3]; m3v(M,li*0.45f,0,0.05f,hip);
-    float hx=e->x+hip[0], hy=by+1.65f-0.30f*crouch, hz=e->z+hip[2];
-    float UL[9],RX[9],RZ[9],S[9];
-    m3rotX(RX, sw+tuck); m3rotZ(RZ, li*0.14f); m3mul(S,RX,RZ); m3mul(UL,M,S);
-    float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.46f, 0.30f,0.25f,0.95f,7, -0.92f, &kx,&ky,&kz);
-    /* The bead bridges the two bones instead of sitting on them like a bead on a
-     * string: it is 20% wider than either bone end, elongated ALONG the limb, and
-     * bound in the LIMB basis so its facets share the bones' orientation. Bound
-     * in the body basis (as all of these were) you saw three unrelated facet
-     * patterns meeting at a point the moment the joint bent. */
-    set_uM(UL,kx,ky,kz); sphere_sh(0.30f,0.34f,0.30f,6,4);
-    float LL[9],RK[9]; m3rotX(RK, sw+kb+tuck*0.9f); m3mul(S,RK,RZ); m3mul(LL,M,S);
-    float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.42f, 0.25f,0.15f,0.86f,7, -0.84f, &ax,&ay,&az);
-    put(LL,ax,ay,az,0,-0.04f,-0.22f); wedge_sh(0.34f,0.18f,0.55f);
-  }
+  /* legs: the agents' travel-locked IK stride on a 4.5u frame. Each foot gets
+   * a world target swept along the boss's ACTUAL velocity (its facing when
+   * stopped) and 2-bone IK finds the joint — the old FK swing skated on every
+   * stride and sank through the floor on the landing crouch. Digitigrade: the
+   * pole points BACK, so the joint hooks rearward like the original build.
+   * In the air the targets lift toward a tuck point under the hips. Direction
+   * from the live velocity, amplitude from the eased spdS (update_boss), whose
+   * cadence law 3.0+2.2*sp pairs with this half-stride to cancel travel exactly. */
+  { float asp=sqrtf(e->vx*e->vx+e->vz*e->vz);
+    float aspS=e->spdS*(1.0f-e->armp);                /* leap velocity is no stride */
+    float arun=clampf(aspS/2.0f,0,1)*e->moveb;
+    float half=0.5f*PI*aspS/(3.0f+2.2f*aspS); if(half>0.9f)half=0.9f;
+    float fdx,fdz;
+    if(asp>0.2f){ fdx=e->vx/asp; fdz=e->vz/asp; }
+    else { fdx=sinf(e->yaw); fdz=-cosf(e->yaw); }
+    float L1=0.92f,L2=0.84f, maxr=(L1+L2)*0.985f;
+    for(int li=-1;li<=1;li+=2){
+      float hip[3]; m3v(M,li*0.45f,0,0.05f,hip);
+      float hx=e->x+hip[0], hy=by+1.65f-0.30f*crouch, hz=e->z+hip[2];
+      float lph=fmodf(e->anim+(li>0?0:PI),2*PI); if(lph<0)lph+=2*PI;
+      float tri   = lph<PI ? 1.0f-2.0f*lph/PI : -1.0f+2.0f*(lph-PI)/PI;
+      float swing = lph<PI ? 0.0f : sinf(lph-PI);
+      float sp[3],tk[3]; m3v(M,li*0.14f,0,0,sp); m3v(M,0,-0.85f,-0.35f,tk);   /* splay, tuck */
+      float tx=hx+sp[0]+fdx*half*tri, tz=hz+sp[2]+fdz*half*tri, ty=by+0.05f+swing*0.16f*arun;
+      tx+=(hx+tk[0]-tx)*e->armp; ty+=(hy+tk[1]-ty)*e->armp; tz+=(hz+tk[2]-tz)*e->armp;
+      float dxv=tx-hx,dyv=ty-hy,dzv=tz-hz, dd=sqrtf(dxv*dxv+dyv*dyv+dzv*dzv);
+      if(dd>maxr){ float k=maxr/dd; tx=hx+dxv*k;ty=hy+dyv*k;tz=hz+dzv*k; }
+      float kx,ky,kz; ik2(hx,hy,hz,tx,ty,tz,L1,L2,M[6],0,M[8],&kx,&ky,&kz);
+      float UL[9],LL[9],jx,jy,jz,ax,ay,az;
+      aim_basis_h(kx-hx,ky-hy,kz-hz,M[0],M[1],M[2],UL);
+      limb_seg(UL,hx,hy,hz,-0.46f, 0.30f,0.25f,0.95f,7, -0.92f, &jx,&jy,&jz);
+      /* The bead bridges the two bones instead of sitting on them like a bead on
+       * a string: 20% wider than either bone end, elongated ALONG the limb, and
+       * bound in the LIMB basis so its facets share the bones' orientation. */
+      set_uM(UL,jx,jy,jz); sphere_sh(0.30f,0.34f,0.30f,6,4);
+      aim_basis_h(tx-jx,ty-jy,tz-jz,M[0],M[1],M[2],LL);
+      limb_seg(LL,jx,jy,jz,-0.42f, 0.25f,0.15f,0.86f,7, -0.84f, &ax,&ay,&az);
+      /* the foot stays flat on the floor (facing basis), toes lifting through
+         the swing and curling under in the air */
+      float FF[9],FR[9],FX[9]; m3rotY(FR,-e->yaw);
+      m3rotX(FX,0.35f*swing*arun+0.6f*e->armp); m3mul(FF,FR,FX);
+      put(FF,ax,ay,az,0,0.05f,-0.20f); wedge_sh(0.34f,0.18f,0.55f);
+    } }
   /* thorax: barrel waist swelling into a bulbous chest. Everything above the
    * hips hangs off ONE pivot through the lean basis, so the hunting hunch,
    * the leap rear-back and the landing bow actually carry the mass forward
@@ -3540,8 +3895,9 @@ static void draw_boss(Enemy*e){
     set_uM(Tt,e->x+o[0],pvY+o[1],e->z+o[2]); } sphere_sh(0.80f,0.72f,0.66f,10,7);
   glUniform3f(uNSc,1,1,1);
   /* spine vents: a faint emissive ridge that brightens with phase */
-  glUniform1f(uEmis,0.5f+0.5f*ph);
-  tintf(0.6f+0.5f*ph,0.9f-0.3f*ph,0.4f);
+  { float vp=1.0f+0.6f*clampf(e->fireT/0.12f,0,1);     /* every volley pulses the vents */
+    glUniform1f(uEmis,(0.5f+0.5f*ph)*vp);
+    tintf((0.6f+0.5f*ph)*vp,(0.9f-0.3f*ph)*vp,0.4f*vp); }
   for(int sgi=0;sgi<3;sgi++){ put(M,e->x,pvY,e->z,0,0.85f+sgi*0.45f,0.45f); box_sh(0.05f,0.12f,0.08f); }
   glUniform1f(uEmis,0.10f+fl+0.05f*ph);
   tintf(sr+fl,sg+fl*0.6f,sb+fl*0.7f);
@@ -3553,7 +3909,11 @@ static void draw_boss(Enemy*e){
     float aph=e->anim+(ai>0?PI:0);
     float sw =sinf(aph)*0.40f*e->moveb*(1.0f-e->armp);
     float idle=0.06f*sinf(wtime*1.6f+ai);
-    float reach=e->state==3?(ai==1?1.25f:0.30f):0.0f;
+    /* the swat, driven by the melee clock: the lead claw sweeps UP and BACK
+       through the windup, then whips to full reach so the extreme lands on the
+       hit frame, and sags back over the recovery; melB fades it in and out */
+    float reach=mel*(ai==1 ? -0.90f*mw*(1.0f-ms)+1.25f*ms*msag
+                           : -0.30f*mw*(1.0f-ms)+0.30f*ms*msag);
     /* up: down-forward base, rears up while airborne (armp), then thrust down to
        brace on impact (crouch) so the arms visibly come out of the leap pose */
     /* forward-POSITIVE, like the agents and the avatar: m3rotX(+t) swings the
@@ -3561,7 +3921,7 @@ static void draw_boss(Enemy*e){
      * throughout, so "down-and-forward" hung backward and the melee claw hooked
      * away from the player it was swatting. Mirrored wholesale to keep the tuning. */
     float up=0.50f+reach+0.85f*e->armp-0.40f*crouch-sw-idle;
-    float eb=(e->state==3?0.35f:0.80f);            /* elbow bend                */
+    float eb=0.80f-0.45f*mel*ms*msag;              /* the elbow straightens through the strike */
     float A[9],F[9],RX[9],RE[9],RZ[9],S[9];
     m3rotZ(RZ,ai*0.26f);
     m3rotX(RX,up);    m3mul(S,RX,RZ); m3mul(A,M,S);
@@ -3608,36 +3968,15 @@ static void draw_boss(Enemy*e){
 static void draw_agent(Enemy*e,float dim){
   if(e->state==4 && e->dieT<=0)return;
   primArm=1;
-  /* 0 alive -> 1 fully come apart. Squash down and bulge out, and drive the
-   * whole body toward white: the geometry is disintegrating into the shards that
-   * are already flying. uNSc gets the same scale so the normals stay honest. */
+  /* ONE solve — stance, legs, arms, head — the very joints the sim fires from
+   * and the shatter breaks along, cached per frame across the mirror pass, the
+   * upright pass and the laser. agent_basis folds the death collapse (squash
+   * down, bulge out) into the basis; die below drives the glow-out to white. */
+  const AgentPose*ap=agent_pose(e);
+  const float*M=ap->M;
   float die = e->state==4 ? 1.0f-clampf(e->dieT/0.13f,0,1) : 0.0f;
-  float M[9],R[9],X[9];
-  float by=e->y;
-  float walk = sinf(e->anim), armw = cosf(e->anim); /* armw: contralateral arm phase */
-  /* the striker's lunge, split into anticipation and blow. The windup length
-   * tracks the AI's own difficulty-scaled lungeWind instead of the hardcoded
-   * 0.32 that used to sit exactly ON the state change, and both halves ease
-   * rather than snapping between two fixed leans. */
-  float lunw=0.32f-0.045f*(float)LEVELS[curlevel].tier; if(lunw<0.08f)lunw=0.08f;
-  float lrel  = sstep(e->lunRel);          /* 1 at the blow, eased to 0 after   */
-  float lwind = e->state==3 ? sstep(clampf(e->state_t/lunw,0,1)) : 0.0f;
-  float lhit  = e->state==3 ? sstep(clampf((e->state_t-lunw)/0.18f,0,1)) : lrel;
-  float lean = e->state==3 ? (-0.38f*lwind*(1.0f-lhit) + 0.62f*lhit)
-             : (0.62f*lrel + (e->type==1&&e->state==0 ? 0.18f*(1.0f-lrel) : 0.0f));
-  lean -= e->recoil*e->recoil*0.10f;            /* fire recoil rocks the torso */
-  /* Enemy AI yaw uses gameplay/shot direction (sin(+yaw), -cos(yaw)), while
-   * m3rotY() maps the model's local -Z forward using the opposite handedness.
-   * Negate only the visual yaw so raised arms/guns point toward their shots. */
-  /* idle weight shift: a standing agent used to be a perfect statue, which is
-   * exactly the pose you spend the most time staring at when the world is
-   * frozen. A slow per-agent-phase roll off the hips (killed the moment it
-   * starts walking) makes it a thing that is standing, not a mannequin. */
-  float idlew=0.045f*sinf(wtime*0.85f+e->phase)*(1.0f-e->moveb);
-  float Zi[9],Si[9];
-  m3rotY(R,-e->yaw); m3rotZ(Zi,idlew); m3rotX(X,lean);
-  m3mul(Si,Zi,X); m3mul(M,R,Si);
-  if(die>0){ float sq=1.0f-0.45f*die, sw=1.0f+0.55f*die; m3scl(M,sw,sq,sw); }
+  float by=e->y, pvY=by+1.02f;
+  float walk = sinf(e->anim);
 
   float vr=radial_v(e->x,e->z,e->vx,e->vz);
   float dr,dg,db; dopp_rgb(vr,&dr,&dg,&db);
@@ -3646,7 +3985,8 @@ static void draw_agent(Enemy*e,float dim){
   float sr=(0.080f+e->hue*0.4f)*(1-mixk)+dr*0.22f*mixk;
   float sg=(0.090f+e->hue*0.3f)*(1-mixk)+dg*0.22f*mixk;
   float sb= 0.085f            *(1-mixk)+db*0.22f*mixk;
-  float fl=e->flash>0?0.6f:0.0f;
+  /* hit flash: an eased pulse over its 0.10s, not a hard on/off step */
+  float fl=0.6f*clampf(e->flash/0.10f,0,1); fl*=fl;
   int locked = (gstate==ST_PLAY && laserTarget>=0 && laserTarget<nen && e==&en[laserTarget]);
   /* body tint, resolved once. The hit flash is warm-white, but a LOCKED agent
    * has to stay unmistakably RED: bleeding the flash into green and blue the
@@ -3661,62 +4001,29 @@ static void draw_agent(Enemy*e,float dim){
     float lk=0.28f+0.20f*p;
     fr_=fl+lk; fg_=(fl+lk)*0.13f; fb_=(fl+lk)*0.08f;
   }
-  float tr_=sr+fr_, tg_=sg+fg_, tb_=sb+fb_;
-  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f);
-  glUniform1f(uEmis,(locked?0.65f:0.12f)+fl+0.88f*die);
-  tintf(tr_+2.4f*die,tg_+2.4f*die,tb_+2.4f*die);
+  /* the collapse drives the whole body toward white: the geometry is
+   * disintegrating into the shards that are already flying */
+  float tr_=sr+fr_+2.4f*die, tg_=sg+fg_+2.4f*die, tb_=sb+fb_+2.4f*die;
+  float emis=(locked?0.65f:0.12f)+fl+0.88f*die;
+  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f); glUniform1f(uEmis,emis);
+  tintf(tr_,tg_,tb_);
   /* crystalline rim: edge glow shaded by the agent's own Doppler — closing
    * agents flare blue, receding red — so the silhouette carries the mechanic.
    * Lock paints a hot red rim instead. */
   glUniform1f(uRim, locked?1.20f:0.85f);
   rimf( locked?1.40f:dr*0.9f, locked?0.18f:dg*0.9f, locked?0.10f:db*0.9f);
 
-  /* legs: the same travel-locked stride the avatar walks on. Each foot gets a
-   * world-space target — a triangle sweep along the agent's ACTUAL velocity
-   * plus a lift on the swing half — and 2-bone IK finds the knee. The stance
-   * foot's backward sweep exactly cancels the agent's travel, so the old FK
-   * swing's skate is gone, and strafing reads as side-steps for free because
-   * the stride runs along velocity rather than facing. */
-  float asp=sqrtf(e->vx*e->vx+e->vz*e->vz);   /* live, for the stride DIRECTION */
-  float aspS=e->spdS;                         /* eased, for its AMPLITUDE       */
-  float arun=clampf(aspS/3.2f,0,1)*e->moveb;
-  /* Half-stride solved from the cadence law rather than tuned at one speed.
-   * The stance foot sweeps 2*half per half cycle in pi/rate seconds, so
-   * half = pi*sp/(2*rate) cancels the travel EXACTLY — and agents walk at
-   * four different speeds (advance, strafe, cooldown drift, striker charge),
-   * which is precisely where a single tuned constant skates. Tends to the
-   * avatar's authored 0.338 at speed, and to zero when stopped. */
-  float ahalf=0.5f*PI*aspS/(0.9f+4.65f*aspS); if(ahalf>0.36f)ahalf=0.36f;
-  float fdx,fdz;
-  if(asp>0.2f){ fdx=e->vx/asp; fdz=e->vz/asp; }
-  else { fdx=sinf(e->yaw); fdz=-cosf(e->yaw); }
-  /* knee pole = the body's true forward (local -Z), never the travel
-   * direction — a backpedalling agent must not bend its knees the wrong way */
-  float polex=-M[6], polez=-M[8];
-  { float pl=sqrtf(polex*polex+polez*polez);
-    if(pl>1e-4f){ polex/=pl; polez/=pl; } else { polex=0; polez=-1; } }
+  /* legs: hip/knee/ankle straight from the shared solve */
   for(int li=0;li<2;li++){
-    float side=li?0.14f:-0.14f;
-    float hip[3]; m3v(M,side,-0.10f,0,hip);           /* through the pelvis pivot */
-    float hx=e->x+hip[0], hy=by+1.02f+hip[1], hz=e->z+hip[2];
-    float ph=fmodf(e->anim+(li?PI:0.0f), 2*PI); if(ph<0)ph+=2*PI;
-    float tri   = ph<PI ? 1.0f-2.0f*ph/PI : -1.0f+2.0f*(ph-PI)/PI;
-    float swing = ph<PI ? 0.0f : sinf(ph-PI);
-    float along=ahalf*tri, lift=swing*0.13f*arun;
-    float tgx=hx+fdx*along, tgz=hz+fdz*along, tgy=by+0.03f+lift;
-    /* keep the target inside reach so the knee never snaps straight */
-    float L1=0.50f,L2=0.46f, maxr=(L1+L2)*0.985f, minr=0.10f;
-    float dxv=tgx-hx,dyv=tgy-hy,dzv=tgz-hz, dd=sqrtf(dxv*dxv+dyv*dyv+dzv*dzv);
-    if(dd>maxr){ float k=maxr/dd; tgx=hx+dxv*k;tgy=hy+dyv*k;tgz=hz+dzv*k; }
-    else if(dd<minr&&dd>1e-4f){ float k=minr/dd; tgx=hx+dxv*k;tgy=hy+dyv*k;tgz=hz+dzv*k; }
-    float kx,ky,kz; ik2(hx,hy,hz,tgx,tgy,tgz,L1,L2,polex,0,polez,&kx,&ky,&kz);
-    float UB[9]; aim_basis(kx-hx,ky-hy,kz-hz,UB);
-    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.105f,0.084f,L1*1.04f,7, -L1, &jx,&jy,&jz);
+    const float*H=ap->J[AJ_HIPL+3*li],*K=ap->J[AJ_KNEEL+3*li],*A=ap->J[AJ_ANKL+3*li];
+    float L1=0.50f,L2=0.46f, UB[9],LB[9],jx,jy,jz,ax,ay,az;
+    aim_basis(K[0]-H[0],K[1]-H[1],K[2]-H[2],UB);
+    limb_seg(UB,H[0],H[1],H[2],-L1*0.52f, 0.105f,0.084f,L1*1.04f,7, -L1, &jx,&jy,&jz);
     set_uM(UB,jx,jy,jz); sphere_sh(0.101f,0.121f,0.101f,6,4);   /* knee */
-    float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
-    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.084f,0.052f,L2*1.04f,7, -L2, &ax,&ay,&az);
+    aim_basis(A[0]-jx,A[1]-jy,A[2]-jz,LB);
+    limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.084f,0.052f,L2*1.04f,7, -L2, &ax,&ay,&az);
     float FF[9],FR[9],FX[9]; m3rotY(FR,-e->yaw);
-    m3rotX(FX,0.30f*swing*arun);     /* light dorsiflexion through the swing */
+    m3rotX(FX,0.30f*ap->sw[li]);     /* light dorsiflexion through the swing */
     m3mul(FF,FR,FX);
     set_uM(FF,ax,ay-0.003f,az); wedge_sh(0.12f,0.065f,0.27f);  /* solved ankle */
   }
@@ -3728,7 +4035,6 @@ static void draw_agent(Enemy*e,float dim){
    * an offset THROUGH the lean basis M, so a striker's 0.62-rad lunge lean
    * (and the idle weight shift) translates the chest and head instead of
    * spinning each piece in place around its own fixed world point */
-  float pvY=by+1.02f;
   glUniform3f(uNSc,1,1,0.60f);          /* correct normals under the slab squash */
   { float o[3]; m3v(M,0,0,0,o);
     set_uM(Mt,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.185f,0.165f,0.26f,9);
@@ -3762,55 +4068,40 @@ static void draw_agent(Enemy*e,float dim){
       set_uM(CT,e->x+o[0],by+1.02f+o[1],e->z+o[2]); bevbox_sh(0.175f,0.48f,0.042f,0.018f);
     } }
   tintf(tr_,tg_,tb_);
-  /* arms: anticipation dip -> eased raise with overshoot -> recoil kick */
+  /* arms: the shared chain — the very bases the sim fires from */
   for(int ai=0;ai<2;ai++){
-    float t=e->armp, raise;
-    if(ai){
-      raise = t<0.22f ? -0.14f*sstep(t/0.22f)
-                      : 1.45f*easeOutBack((t-0.22f)/0.78f);
-      if(e->state==2) raise=1.45f*sstep(t);           /* eased lowering */
-      if(e->state==3) raise=-0.30f*lwind+1.85f*lhit;   /* cock back, then throw */
-      else if(lrel>0.001f) raise = 1.85f*lrel + raise*(1.0f-lrel);  /* ...and recover */
-      raise += e->recoil*e->recoil*0.35f;
-    } else raise = e->state==3? -0.30f*lwind+1.85f*lhit : 1.85f*lrel;
-    /* idle arm drift, antiphase across the shoulders and offset per agent, so a
-     * crowd of waiting agents never breathes in unison. Faded out by moveb and
-     * by any raised arm, which owns its own eased motion. */
-    raise += 0.055f*sinf(wtime*1.5f+e->phase+ai*2.1f)
-             *(1.0f-e->moveb)*clampf(1.0f-raise*1.5f,0,1);
-    float swA=(ai?armw:-armw)*0.4f*e->moveb*clampf(1.0f-raise*2.0f,0,1);
-    float eb=0.30f+0.55f*sstep(clampf(raise/1.45f,0,1));
-    float sh[3]; m3v(M,ai?0.29f:-0.29f,0.62f,0,sh);
-    float shx=e->x+sh[0],shy=pvY+sh[1],shz=e->z+sh[2];
-    float A[9],RX[9],RZ[9],S[9];
-    /* SIGN. limb_seg hangs along local -Y, and m3rotX(+t) swings that toward
-     * local -Z — which is the direction the face is drawn and the direction
-     * gameplay fires (update_enemies spawns rounds 0.55 in FRONT). This whole
-     * expression used to be negated, so every raised gun arm reached 180 degrees
-     * BEHIND the agent while its bullets left the front: the aim telegraph, the
-     * drawn pistol and the striker's claw all pointed the wrong way. draw_player
-     * was fixed long ago (see its own note) and the fix never reached the agents.
-     * Negated as a whole, so the stride swing keeps its tuned contralateral pairing. */
-    m3rotX(RX,raise-swA*e->fwdb); m3rotZ(RZ,-swA*e->latb*0.5f);
-    m3mul(S,RX,RZ); m3mul(A,M,S);
-    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.072f,0.062f,0.38f,7, -0.37f, &ex,&ey,&ez);
-    set_uM(A,ex,ey,ez); sphere_sh(0.075f,0.090f,0.075f,6,4);   /* elbow */
-    float F[9],RE[9]; m3rotX(RE,raise-swA*e->fwdb+eb); m3mul(S,RE,RZ); m3mul(F,M,S);
-    float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.17f, 0.062f,0.050f,0.36f,7, -0.36f, &hx2,&hy2,&hz2);
-    set_uM(F,hx2,hy2,hz2); wedge_sh(0.072f,0.12f,0.060f);  /* cut mitt */
-    if(ai&&e->type==0&&raise>0.05f){ /* pistol in the raised hand */
-      tintf(0.03f,0.035f,0.04f);
-      put(F,hx2,hy2,hz2,0,-0.10f,-0.14f); box_sh(0.06f,0.09f,0.24f);
-      tintf(tr_,tg_,tb_);
-    }
+    const AgentArm*a=&ap->ar[ai];
+    put(a->A,a->sx,a->sy,a->sz,0,-0.18f,0); cyl_shc(0.072f,0.062f,0.38f,7,0);
+    set_uM(a->A,a->ex,a->ey,a->ez); sphere_sh(0.075f,0.090f,0.075f,6,4);   /* elbow */
+    put(a->F,a->ex,a->ey,a->ez,0,-0.17f,0); cyl_shc(0.062f,0.050f,0.36f,7,0);
+    set_uM(a->F,a->hx,a->hy,a->hz); wedge_sh(0.072f,0.12f,0.060f);  /* cut mitt */
+  }
+  if(e->type==0){
+    /* the sidearm is always on the body: holstered on the right hip (barrel
+     * down, grip back) and drawn into the fist as the arm rises — no pistol
+     * ever blinks into existence. The holster basis is the hanging arm's own
+     * grip roll, so aligning its barrel onto the hand's barrel lands exactly
+     * on the shared grip basis once the arm is up. */
+    const AgentArm*a=&ap->ar[1];
+    float k=sstep(clampf(a->raise/0.6f,0,1));
+    float Hb[9],HX[9],ho[3],bh[3];
+    m3rotX(HX,0.22f-PI*0.5f); m3mul(Hb,M,HX);
+    m3v(M,0.24f,-0.05f,0.06f,ho);
+    float hx0=e->x+ho[0], hy0=pvY+ho[1], hz0=e->z+ho[2];
+    float gx=hx0+(a->gx-hx0)*k, gy=hy0+(a->gy-hy0)*k, gz=hz0+(a->gz-hz0)*k;
+    m3v(Hb,0,0,-1,bh);
+    float bx=bh[0]+(a->bdx-bh[0])*k, byy=bh[1]+(a->bdy-bh[1])*k, bz=bh[2]+(a->bdz-bh[2])*k;
+    float il=1.0f/sqrtf(bx*bx+byy*byy+bz*bz+1e-9f);
+    m3align(Hb,bh[0],bh[1],bh[2],bx*il,byy*il,bz*il);
+    pistol_sh(Hb,gx,gy,gz,0);                 /* ammo 0: the pips stay dark */
+    glUniform1f(uEmis,emis); tintf(tr_,tg_,tb_);
   }
   /* defined neck + cut-gem head with hard brow and jaw lines. The head rides a
    * sub-basis (Mh) that adds the smoothed head-look so the skull tracks you. */
   put(M,e->x,pvY,e->z, 0,0.645f,0); cyl_sh(0.055f,0.070f,0.15f,8);
   float Mh[9],HY[9],HX[9],HL[9];
   m3rotY(HY,-e->headYaw); m3rotX(HX,e->headPitch); m3mul(HL,HY,HX); m3mul(Mh,M,HL);
-  float hb[3]; m3v(M,0,0.83f,0,hb);
-  float hcx=e->x+hb[0], hcy=pvY+hb[1], hcz=e->z+hb[2];   /* head centre */
+  float hcx=ap->J[AJ_HEAD][0], hcy=ap->J[AJ_HEAD][1], hcz=ap->J[AJ_HEAD][2];   /* head centre */
   set_uM(Mh,hcx,hcy,hcz); sphere_sh(0.125f,0.16f,0.135f,9,6);
   put(Mh,hcx,hcy,hcz,0,-0.12f,-0.045f); bevbox_sh(0.16f,0.09f,0.18f,0.022f);
   put(Mh,hcx,hcy,hcz,0,0.075f,-0.075f); bevbox_sh(0.20f,0.035f,0.10f,0.014f);
@@ -4309,11 +4600,10 @@ static void draw_lasers(void){
   for(int i=0;i<nen;i++){
     Enemy*e=&en[i];
     if(e->type==2||e->state!=1||e->armp<0.6f)continue;  /* boss leaps reuse state 1 */
-    float hx=e->x+sinf(e->yaw)*0.55f+cosf(e->yaw)*0.29f;
-    float hz=e->z-cosf(e->yaw)*0.55f+sinf(e->yaw)*0.29f;
+    const AgentArm*g=&agent_pose(e)->ar[1];    /* the beam leaves the drawn muzzle */
     float a=0.10f+0.10f*sinf(wtime*30+e->phase)+0.25f*e->armp*e->state_t;
     glColor4f(1.6f*a,0.6f*a,0.2f*a,a);
-    glVertex3f(hx,e->y+1.62f,hz);
+    glVertex3f(g->tipx,g->tipy,g->tipz);
     glVertex3f(px,py+1.28f,pz);
   }
   glEnd();
@@ -5460,6 +5750,7 @@ int main(int argc,char**argv){
         nen=nalive=1; memset(&en[0],0,sizeof en[0]);
         en[0].type=0; en[0].hue=0.30f;
         en[0].x=en[0].lx=ex; en[0].z=en[0].lz=ez; en[0].y=ground_h(ex,ez,py);
+        en[0].yaw=atan2f(px-ex,-(pz-ez));   /* the body turns at a finite rate: stage it facing us */
       }
       if(frame>=130&&frame<138){      /* hold the agent mid-aim and the lock steady */
         float dx=en[0].x-px, dz=en[0].z-pz, d=sqrtf(dx*dx+dz*dz);
