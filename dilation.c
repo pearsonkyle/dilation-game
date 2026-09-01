@@ -59,6 +59,8 @@
   GF(PFNGLUNIFORM2FPROC,         glUniform2f)         \
   GF(PFNGLGENFRAMEBUFFERSPROC,   glGenFramebuffers)   \
   GF(PFNGLBINDFRAMEBUFFERPROC,   glBindFramebuffer)   \
+  GF(PFNGLDELETEFRAMEBUFFERSPROC,  glDeleteFramebuffers)  \
+  GF(PFNGLDELETERENDERBUFFERSPROC, glDeleteRenderbuffers) \
   GF(PFNGLFRAMEBUFFERTEXTURE2DPROC,    glFramebufferTexture2D)    \
   GF(PFNGLFRAMEBUFFERRENDERBUFFERPROC, glFramebufferRenderbuffer) \
   GF(PFNGLGENRENDERBUFFERSPROC,  glGenRenderbuffers)  \
@@ -94,8 +96,26 @@ static void load_gl(void){
 #endif
 
 /* ---------------------------------------------------------------- constants */
-#define WINW 1280
-#define WINH 720
+/* Two resolutions, and keeping them apart is the whole trick.
+ *
+ * HUDW/HUDH is a VIRTUAL 1280x720 space that every HUD coordinate is authored
+ * in. draw_hud's ortho matrix maps it onto whatever the real framebuffer is, so
+ * the ~40 hand-placed text and bar positions never have to know the resolution.
+ *
+ * fbW/fbH is the real drawable size in PIXELS, from SDL_GL_GetDrawableSize —
+ * which on a Retina display is 2x the window size. Everything that allocates or
+ * reads pixels (the post chain, the viewport, glReadPixels, the projection
+ * aspect) uses these. They used to be the same fixed 1280x720 #define, so the
+ * game rendered a 720p image and let the OS upscale it. */
+#define HUDW 1280
+#define HUDH 720
+static int winW=HUDW, winH=HUDH;   /* window size, logical points  */
+static int fbW=HUDW,  fbH=HUDH;    /* drawable size, real pixels   */
+/* Above this many pixels we render the scene at a fraction and let the composite
+ * upscale — a 6K display is 4x the fragments of 1440p for no visible gain on
+ * geometry this clean, and the three-octave blur is the dominant cost. */
+#define PIXEL_BUDGET (2560*1440)
+static float renderScale=1.0f;
 #define G 44              /* grid cells per side  */
 #define CELL 2.0f         /* world units per cell */
 #define EYE 1.62f
@@ -112,7 +132,14 @@ static void load_gl(void){
 #define SHLIGHTS 8        /* lights fed to the shader per frame */
 #define MINTS 0.045f      /* simulation never fully stops (SUPERHOT creep) */
 #define NLEVEL 4
+#define SMOKE_SEEDS 48    /* layouts --smoke validates beyond the one it plays */
 #define STEP 0.55f        /* max auto step-up: anything taller is a wall */
+/* How far an agent will willingly step off. It used to be 0.65 with no falling
+ * physics at all, which meant anything placed on a 1.1 platform, a 1.6 mezzanine
+ * or a 2.35 train roof could never come down — strikers stranded up there could
+ * not be reached by their own AI and just camped. Agents fall properly now, so
+ * the limit only has to exclude drops that would look like a dive. */
+#define AGENT_DROP 2.6f
 #define GUN_MAX_RANGE 42.0f
 #define GUN_MIN_RANGE 3.5f     /* point-blank floor: a fired round always reaches */
 #define GUN_CHARGE_TIME 3.85f
@@ -263,23 +290,26 @@ static void gen_textures(void){
      * so a long wall stops reading as the same panel wallpapered 40 times */
     float pv=hash2(x>>7,y>>6,313u);
     hh[y*TS+x]=bevel*0.9f*(pv>0.86f?0.55f:1.0f)+grain*0.1f;
-    /* traced circuitry inside the panel: crisp rectilinear dashes on an 8px
-     * grid — hashed live rows/columns with hashed segment breaks, like PCB
-     * traces. The old fbm iso-band drew wandering organic contour lines,
-     * which read as glowing goo once the emissive mask lit them up. Kept off
-     * the panel seams by the bevel gate. */
-    int gx=x>>3, gy=y>>3;
-    int hline = hash2(gy,y>>6,417u)>0.80f && hash2(gx,gy,913u)>0.35f && (y&7)==3;
-    int vline = hash2(gx,x>>7,517u)>0.88f && hash2(gy,gx,113u)>0.40f && (x&7)==3;
-    float circuit = ((hline||vline) && bevel>0.45f) ? 0.5f : 0.0f;
+    /* NO CIRCUITRY. There used to be hashed "PCB traces" here — 8px dashes gated
+     * by three hashes — and lit through the emissive mask they read as scattered
+     * green confetti with no connectivity and no direction: mould stains, not
+     * circuits. Worse, they competed directly with the digital rain, which is the
+     * same colour, on the same surface, and is the thing actually worth looking
+     * at. The wall's job is to be dark, panelled and structural so the rain has
+     * something to fall down.
+     *
+     * What is left: a shallow vertical CHANNEL every half panel. It is cut into
+     * the heightfield only, so it shows up as a normal-map crease that catches a
+     * grazing highlight — structure you read as architecture rather than as
+     * decoration, and it gives the rain a groove to run in. */
+    int chx=x&31;
+    float ch=(chx>13&&chx<18)?1.0f:0.0f;
+    float chSoft=ch*(1.0f-fabsf((chx-15.5f)/2.5f))*0.35f;
+    hh[y*TS+x]-=chSoft*(bevel>0.5f?1.0f:0.0f);
     float base = (0.030f + grain*0.014f)*(0.75f+0.50f*pv);
     if(bevel<0.4f) base*=0.45f;                   /* seams nearly black  */
-    putrgb(&alb[(y*TS+x)*4],
-      base*0.85f + circuit*0.010f,
-      base       + circuit*0.060f,
-      base*0.95f + circuit*0.030f);
-    /* emissive mask: the circuit traces glow through the shader/bloom */
-    alb[(y*TS+x)*4+3]=(unsigned char)(circuit*220.0f);
+    putrgb(&alb[(y*TS+x)*4], base*0.85f, base, base*0.95f);
+    alb[(y*TS+x)*4+3]=0;                          /* walls emit nothing */
   }
   h2n(hh,nrm,3.0f);
   texAlb[TX_WALL]=mktex(alb); texNrm[TX_WALL]=mktex(nrm);
@@ -336,8 +366,8 @@ static void gen_textures(void){
 }
 
 /* ---------------------------------------------------------------- 5x7 bitfont
- * 0-9 A-Z and '-' ; 7 row bytes per glyph, bit4 = leftmost column. */
-static const unsigned char font[38][7]={
+ * 0-9 A-Z '-' '^' and '.' ; 7 row bytes per glyph, bit4 = leftmost column. */
+static const unsigned char font[39][7]={
  {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},{0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
  {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},{0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},
  {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},{0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
@@ -357,14 +387,16 @@ static const unsigned char font[38][7]={
  {0x11,0x11,0x11,0x15,0x15,0x1B,0x11},{0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
  {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},{0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
  {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
- {0x04,0x04,0x0A,0x0A,0x11,0x11,0x1F}};  /* 37 = delta wordmark glyph */
+ {0x04,0x04,0x0A,0x0A,0x11,0x11,0x1F},   /* 37 = delta wordmark glyph */
+ {0x00,0x00,0x00,0x00,0x00,0x00,0x04}};  /* 38 = full stop (decimal point) */
 
 static float textw(const char*s,float sc){ return (float)strlen(s)*6*sc; }
 static void draw_text(float x,float y,float sc,const char*s){
   glBegin(GL_QUADS);
   for(;*s;s++,x+=6*sc){
     int gi=-1; char c=*s;
-    if(c>='0'&&c<='9')gi=c-'0'; else if(c>='A'&&c<='Z')gi=10+c-'A'; else if(c=='-')gi=36; else if(c=='^')gi=37;
+    if(c>='0'&&c<='9')gi=c-'0'; else if(c>='A'&&c<='Z')gi=10+c-'A';
+    else if(c=='-')gi=36; else if(c=='^')gi=37; else if(c=='.')gi=38;
     if(gi<0)continue;
     for(int r=0;r<7;r++){ unsigned char row=font[gi][r];
       for(int col=0;col<5;col++) if(row&(0x10>>col)){
@@ -395,6 +427,9 @@ typedef struct {
   float y;                      /* floor height under the agent             */
   float moveb,fwdb,latb;        /* idle<->walk blend + local move direction */
   float flare,recoil;           /* smoothed eye flare, fire recoil 1->0     */
+  float spdS;                   /* speed, attack-instant / release-eased     */
+  float dieT;                   /* death collapse timer, world-time          */
+  float lunRel;                 /* lunge follow-through, 1 -> 0 after the blow*/
   float headYaw,headPitch;      /* smoothed head-look delta toward the player*/
   float mzT,mzx,mzy,mzz;        /* muzzle flash: timer + the muzzle it fired from */
   int type;                     /* 0 shooter 1 striker 2 boss               */
@@ -428,22 +463,25 @@ static Shard shards[MAXSHARD]; static int shHead=0;
 typedef struct {
   const char*name; int style; unsigned seed;
   int nshoot,nstrike;
+  int tier;                     /* difficulty rung, 0..3. Was derived from the
+                                   curlevel INDEX, so reordering the campaign or
+                                   adding a sector silently mis-tuned the AI. */
   float ceil;                   /* hall height */
   float fog[3];                 /* fog / horizon color  */
   float wallt[3];               /* wall tint            */
   float floort[3];              /* floor tint           */
 } LevelDef;
 static const LevelDef LEVELS[NLEVEL]={
-  {"LOBBY",   0,0x1A0BB7u,10,3, 5.4f,
+  {"LOBBY",   0,0x1A0BB7u,10,3, 0, 5.4f,
     {0.0018f,0.0050f,0.0034f},{1.10f,1.22f,1.12f},{1.05f,1.15f,1.08f}},
-  {"SUBWAY",  1,0x5ABBA7u,14,5, 4.8f,
+  {"SUBWAY",  1,0x5ABBA7u,14,5, 1, 4.8f,
     {0.0042f,0.0030f,0.0015f},{1.25f,1.02f,0.78f},{1.10f,0.98f,0.82f}},
-  {"TERMINAL",2,0x7E2211u,18,7, 5.8f,
+  {"TERMINAL",2,0x7E2211u,18,7, 2, 5.8f,
     {0.0015f,0.0034f,0.0050f},{0.82f,1.02f,1.22f},{0.85f,1.00f,1.18f}},
   /* OVERLORD: the final sector — a high black amphitheatre for the boss. no
      auto-spawned agents (nshoot/nstrike 0); the boss is placed by hand. tall
      ceiling for its leaps and the aerial ammo parkour. bruised violet climate. */
-  {"OVERLORD",3,0xB055EDu, 0,0, 8.0f,
+  {"OVERLORD",3,0xB055EDu, 0,0, 3, 8.0f,
     {0.0050f,0.0015f,0.0062f},{1.05f,0.72f,1.25f},{0.92f,0.78f,1.10f}},
 };
 static int curlevel=0;
@@ -484,6 +522,7 @@ static void emit_riser(float x0,float z0,float x1,float z1,float fh,float nh,flo
   emit_trim(x0,t,z0, nx,0,nz);  emit_trim(x1,t,z1, nx,0,nz);
   emit_trim(x1,nh,z1, nx,0,nz); emit_trim(x0,nh,z0, nx,0,nz);
 }
+static int circ_free(float x,float z,float r,float y);   /* defined with movement */
 static int solid(int cx,int cz){ if(cx<0||cz<0||cx>=G||cz>=G)return 1; return grid[cz][cx]; }
 /* floor-of-cell: solid cells are infinitely tall walls */
 static float cellh(int cx,int cz){
@@ -549,33 +588,117 @@ static void add_item_r(float x,float z,int type,int amt,float respawn){
 }
 static void add_item(float x,float z,int type,int amt){ add_item_r(x,z,type,amt,0); }
 
-/* drop an agent on a random free cell, away from spawn and other agents */
-static void place_agent(int type,int x0,int z0,int x1,int z1){
-  if(nen>=MAXENEMY)return;
-  for(int tries=0;tries<200;tries++){
-    int cx=x0+(int)(frand()*(x1-x0)), cz=z0+(int)(frand()*(z1-z0));
-    if(solid(cx,cz))continue;
-    float wx=(cx+0.5f)*CELL, wz=(cz+0.5f)*CELL;
+/* ------------------------------------------------- reachability flood fill
+ * Which open cells can the player actually GET to from the spawn? Nothing in
+ * this game ever asked that question, which is how TERMINAL ended up able to
+ * generate its reward terrace behind an unclimbable wall and place_agent ended
+ * up able to strand a striker on a train roof. Four-connected BFS under the
+ * same rules the mover enforces: rise at most JUMP_UP, fall any distance.
+ *
+ * JUMP_UP is the DOUBLE-jump apex, because the player has one: the ground jump
+ * sets pvy=7.5 against g=18 (7.5^2/36 = 1.56) and the air jump adds pvy=6.6 from
+ * there (6.6^2/36 = 1.21), so 2.77 total. 2.55 keeps a margin. That is generous
+ * on purpose — it is exactly what SUBWAY's 2.35 train roofs need, and a
+ * validator that rejects the shipped sectors is a validator nobody will run. */
+#define JUMP_UP 2.55f
+static unsigned char reach[G][G];
+static int reachable(void){
+  memset(reach,0,sizeof reach);
+  int sx=(int)floorf(startx/CELL), sz=(int)floorf(startz/CELL);
+  if(sx<0||sz<0||sx>=G||sz>=G||grid[sz][sx])return 0;
+  static short qx[G*G],qz[G*G];      /* fixed queue; no malloc in this file */
+  int head=0,tail=0,n=1;
+  reach[sz][sx]=1; qx[tail]=(short)sx; qz[tail]=(short)sz; tail++;
+  static const int D[4][2]={{1,0},{-1,0},{0,1},{0,-1}};
+  while(head<tail){
+    int cx=qx[head], cz=qz[head]; head++;
+    float h=hgt[cz][cx];
+    for(int k=0;k<4;k++){
+      int nx=cx+D[k][0], nz=cz+D[k][1];
+      if(nx<0||nz<0||nx>=G||nz>=G||grid[nz][nx]||reach[nz][nx])continue;
+      if(hgt[nz][nx]-h > JUMP_UP)continue;
+      reach[nz][nx]=1; qx[tail]=(short)nx; qz[tail]=(short)nz; tail++; n++;
+    }
+  }
+  return n;
+}
+/* is the cell under this world point one the player can stand on and get to? */
+static int reach_at(float x,float z){
+  int cx=(int)floorf(x/CELL), cz=(int)floorf(z/CELL);
+  if(cx<0||cz<0||cx>=G||cz>=G)return 0;
+  return reach[cz][cx];
+}
+
+/* small helper: a uniform integer in [0,n). frand() is strictly < 1, so the
+ * cast can never reach n. Used everywhere the layout wants a seeded choice. */
+static int irand(int n){ return n<=1?0:(int)(frand()*(float)n); }
+
+/* ---------------------------------------------------- placement candidates
+ * Every open, REACHABLE cell far enough from spawn to be a fight rather than an
+ * ambush. Built once per generation attempt; agents sample it by INDEX.
+ *
+ * This is what makes the RNG draw count fixed. place_agent used to be a
+ * rejection sampler that consumed anywhere from 2 to 400+ draws depending on
+ * how cluttered the geometry happened to be — so the NUMBER of draws, not just
+ * their values, depended on the layout. That, and not the call sites, was the
+ * real reason the byte gate was so brittle. */
+static short candX[G*G], candZ[G*G]; static int nCand;
+static void build_candidates(int x0,int z0,int x1,int z1,float minSpawnD){
+  nCand=0;
+  if(x0<0)x0=0; if(z0<0)z0=0; if(x1>G)x1=G; if(z1>G)z1=G;
+  for(int z=z0;z<z1;z++)for(int x=x0;x<x1;x++){
+    if(grid[z][x]||!reach[z][x])continue;
+    float wx=(x+0.5f)*CELL, wz=(z+0.5f)*CELL;
     float dx=wx-startx,dz=wz-startz;
-    if(dx*dx+dz*dz<8*8)continue;
+    if(dx*dx+dz*dz<minSpawnD*minSpawnD)continue;
+    candX[nCand]=(short)x; candZ[nCand]=(short)z; nCand++;
+  }
+}
+/* Exactly five frand() draws, always: the index, then yaw/phase/stagger/hue.
+ * If the sampled cell is too close to an already-placed agent we walk FORWARD
+ * through the candidate list deterministically rather than re-rolling. */
+static int place_agent(int type){
+  if(nen>=MAXENEMY||nCand<=0)return 0;
+  int start=irand(nCand);
+  int placed=-1;
+  for(int k=0;k<nCand;k++){
+    int c=(start+k)%nCand;
+    float wx=(candX[c]+0.5f)*CELL, wz=(candZ[c]+0.5f)*CELL;
     int ok=1;
     for(int i=0;i<nen;i++){ float ax=en[i].x-wx,az=en[i].z-wz;
       if(ax*ax+az*az<3*3){ok=0;break;} }
-    if(!ok)continue;
-    Enemy*e=&en[nen++];
-    memset(e,0,sizeof*e);
-    e->x=e->lx=wx; e->z=e->lz=wz; e->type=type;
-    e->y=hgt[cz][cx];
-    e->yaw=frand()*2*PI; e->phase=frand()*6.28f;
-    e->state=0; e->state_t=-frand()*2.0f;   /* stagger the first volley */
-    e->hue=(frand()-0.5f)*0.08f;
-    return;
+    if(ok){ placed=c; break; }
   }
+  if(placed<0)return 0;
+  int cx=candX[placed], cz=candZ[placed];
+  Enemy*e=&en[nen++];
+  memset(e,0,sizeof*e);
+  e->x=e->lx=(cx+0.5f)*CELL; e->z=e->lz=(cz+0.5f)*CELL; e->type=type;
+  e->y=hgt[cz][cx];
+  e->yaw=frand()*2*PI; e->phase=frand()*6.28f;
+  e->state=0; e->state_t=-frand()*2.0f;   /* stagger the first volley */
+  e->hue=(frand()-0.5f)*0.08f;
+  return 1;
+}
+/* an item on a reachable cell chosen from the candidate list */
+static void add_item_cand(int type,int amt,float respawn){
+  if(nCand<=0)return;
+  int c=irand(nCand);
+  add_item_r((candX[c]+0.5f)*CELL,(candZ[c]+0.5f)*CELL,type,amt,respawn);
 }
 
-static void gen_level(int li,unsigned seedmix){
+/* ------------------------------------------------------------- generation
+ * One ATTEMPT at a sector: carve the seeded layout, work out what is reachable,
+ * populate it, and report whether the result is sound. gen_level below retries
+ * until it gets a sound one, so nothing downstream ever sees a broken sector.
+ *
+ * Every sector keeps its own architectural grammar — that is what makes the
+ * four places feel like places — but every PARAMETER of that grammar is now
+ * drawn from the seed. Before this, three of the four sectors contained no
+ * frand() at all and `--seed` was very nearly a no-op. */
+static int gen_attempt(int li,unsigned seed){
   const LevelDef*L=&LEVELS[li];
-  rngs=L->seed^seedmix; if(!rngs)rngs=0xC0FFEEu;
+  rngs=seed; if(!rngs)rngs=0xC0FFEEu;
   memset(grid,1,sizeof grid);
   memset(hgt,0,sizeof hgt);
   wallh=L->ceil;
@@ -584,124 +707,229 @@ static void gen_level(int li,unsigned seedmix){
   int ax0=0,az0=0,ax1=G,az1=G;                 /* agent placement region */
 
   switch(L->style){
-    case 0:{ /* LOBBY: a corporate atrium — open central corridor between twin
-                colonnades, a mezzanine gallery with two staircases, low
-                reception desks you vault or duck behind. ivory-emerald light. */
-      carve(4,4,36,36);
-      raise(4,4,36,4,1.6f);                       /* mezzanine, north edge   */
-      for(int s=0;s<3;s++){                       /* twin stairs, 0.4 risers */
-        raise(8,8+s,3,1,1.2f-0.4f*s);
-        raise(33,8+s,3,1,1.2f-0.4f*s);
+    case 0:{ /* LOBBY: a corporate atrium — twin colonnades down a long hall, a
+                mezzanine gallery over the north end reached by stair runs, low
+                reception desks to vault or duck behind. ivory-emerald light. */
+      int mg=3+irand(3);                         /* wall margin 3..5        */
+      int x0=mg,x1=G-mg, z0=mg,z1=G-mg;
+      carve(x0,z0,x1-x0,z1-z0);
+      int mezD=3+irand(3);                       /* mezzanine depth 3..5    */
+      raise(x0,z0,x1-x0,mezD,1.6f);
+      /* stair runs down off the mezzanine's south edge: 1.2/0.8/0.4 puts every
+         step inside STEP, so the gallery is walkable, not a jump puzzle */
+      int nst=2+irand(2);
+      for(int st=0;st<nst;st++){
+        int sx=x0+1+irand(x1-x0-4);
+        for(int r=0;r<3;r++) raise(sx,z0+mezD+r,3,1,1.2f-0.4f*r);
       }
-      for(int j=12;j<38;j+=4){ fill(14,j,1,1); fill(29,j,1,1); } /* colonnades */
-      raise(19,18,6,1,1.0f); raise(19,26,6,1,1.0f);              /* desks      */
-      for(int j=13;j<38;j+=7){
-        int lj=j+(j%4==0?1:0);   /* colonnade pillars sit on rows j%4==0 */
-        add_light(14.5f*CELL,3.6f,(lj+0.5f)*CELL,8.5f, 0.85f,0.95f,0.80f);
-        add_light(29.5f*CELL,3.6f,(lj+0.5f)*CELL,8.5f, 0.85f,0.95f,0.80f);
+      /* colonnades: two pillar rows flanking the central corridor */
+      int inset=3+irand(3), pitch=3+irand(3);
+      int cxA=x0+inset, cxB=x1-1-inset;
+      for(int j=z0+mezD+4;j<z1-3;j+=pitch){ fill(cxA,j,1,1); fill(cxB,j,1,1); }
+      /* desks, always between the colonnades so they read as furniture */
+      int nd=2+irand(2);
+      for(int d=0;d<nd;d++){
+        int dw=4+irand(3);
+        int dx=cxA+2+irand(cxB-cxA-dw-2);
+        int dz=z0+mezD+6+irand(z1-z0-mezD-10);
+        raise(dx,dz,dw,1,1.0f);
       }
-      add_light(22*CELL,4.6f,20*CELL,16.0f, 0.30f,1.30f,0.65f);  /* atrium core */
-      add_light(22*CELL,3.2f, 6*CELL,11.0f, 0.60f,1.00f,0.78f);  /* mezzanine   */
-      startx=22*CELL; startz=38.0f*CELL; startyaw=0;
-      add_item(22.5f*CELL, 6.5f*CELL,1,6);              /* ammo cache up top */
-      add_item( 7.5f*CELL,30.5f*CELL,0,35);
-      add_item(37.5f*CELL,20.5f*CELL,1,4);
-      ax0=5; az0=10; ax1=39; az1=34;
+      startx=(x0+x1)*0.5f*CELL; startz=(z1-1.5f)*CELL; startyaw=0;
+      for(int j=z0+mezD+4;j<z1-3;j+=pitch*2){
+        add_light((cxA+0.5f)*CELL,3.6f,(j+0.5f)*CELL,8.5f, 0.85f,0.95f,0.80f);
+        add_light((cxB+0.5f)*CELL,3.6f,(j+0.5f)*CELL,8.5f, 0.85f,0.95f,0.80f);
+      }
+      add_light((x0+x1)*0.5f*CELL,4.6f,(z0+z1)*0.5f*CELL,16.0f, 0.30f,1.30f,0.65f);
+      add_light((x0+x1)*0.5f*CELL,3.2f,(z0+mezD*0.5f)*CELL,11.0f, 0.60f,1.00f,0.78f);
+      ax0=x0+1; az0=z0+1; ax1=x1-1; az1=z1-1;
+      reachable();
+      build_candidates(ax0,az0,ax1,az1,8.0f);
+      /* the mezzanine ammo cache is the reward for taking the high ground, so
+         it is placed ON the gallery rather than anywhere reachable */
+      add_item((x0+x1)*0.5f*CELL,(z0+0.5f)*CELL,1,6);
+      add_item_cand(0,35,0);
+      add_item_cand(1,4,0);
     } break;
+
     case 1:{ /* SUBWAY: raised platforms over a track trench, a parked train
                 whose roofs are a fighting surface, steps at both ends.
                 sodium amber over the platforms, cold cyan over the rails. */
-      carve(4,12,36,20);
-      raise(4,12,36,4,1.1f);                      /* north platform */
-      raise(4,28,36,4,1.1f);                      /* south platform */
-      for(int c=0;c<4;c++) raise(6+c*9,20,7,4,2.35f); /* train cars + gaps */
-      raise(4,16,2,2,0.55f); raise(38,26,2,2,0.55f);  /* track steps       */
-      for(int i=6;i<39;i+=5){ fill(i,15,1,1); fill(i,28,1,1); } /* pillars  */
-      for(int i=6;i<39;i+=6){
-        add_light((i+0.5f)*CELL,3.7f,13.5f*CELL,7.5f, 1.05f,0.72f,0.35f);
-        add_light((i+0.5f)*CELL,3.7f,29.5f*CELL,7.5f, 1.05f,0.72f,0.35f);
+      int mg=3+irand(2);
+      int hallZ=18+irand(5);
+      int z0=(G-hallZ)/2, z1=z0+hallZ;
+      int x0=mg, x1=G-mg;
+      carve(x0,z0,x1-x0,hallZ);
+      int platD=3+irand(2);
+      raise(x0,z0,x1-x0,platD,1.1f);             /* north platform */
+      raise(x0,z1-platD,x1-x0,platD,1.1f);       /* south platform */
+      int tz0=z0+platD, tz1=z1-platD;            /* the trench      */
+      /* the train: a seeded number of cars with gaps to thread between */
+      int ncar=3+irand(3);
+      int span=x1-x0-2, carLen=span/ncar-1; if(carLen<4)carLen=4;
+      int carZ=tz0+1, carD=(tz1-tz0)-2; if(carD<3)carD=3;
+      for(int c=0;c<ncar;c++){
+        int cx=x0+1+c*(carLen+1);
+        if(cx+carLen>x1-1)break;
+        raise(cx,carZ,carLen,carD,2.35f);
       }
-      for(int i=9;i<39;i+=9)
-        add_light((i+0.5f)*CELL,3.3f,22.0f*CELL,9.5f, 0.25f,0.95f,1.05f);
-      startx=5.5f*CELL; startz=13.5f*CELL; startyaw=90;
-      add_item(18.5f*CELL,22.5f*CELL,1,6);              /* ammo on a train roof */
-      add_item(37.5f*CELL,30.5f*CELL,0,35);
-      add_item(22.5f*CELL,18.5f*CELL,0,35);
-      add_item(28.5f*CELL,22.5f*CELL,1,4);
-      ax0=8; az0=12; ax1=39; az1=31;
+      /* track steps so the trench floor is never a pit you cannot leave */
+      raise(x0,tz0,2,2,0.55f); raise(x1-2,tz1-2,2,2,0.55f);
+      int ppitch=4+irand(3);
+      for(int i=x0+2;i<x1-1;i+=ppitch){ fill(i,z0+platD-1,1,1); fill(i,z1-platD,1,1); }
+      startx=(x0+1.5f)*CELL; startz=(z0+platD*0.5f)*CELL; startyaw=90;
+      for(int i=x0+2;i<x1-1;i+=ppitch+2){
+        add_light((i+0.5f)*CELL,3.7f,(z0+1.5f)*CELL,7.5f, 1.05f,0.72f,0.35f);
+        add_light((i+0.5f)*CELL,3.7f,(z1-1.5f)*CELL,7.5f, 1.05f,0.72f,0.35f);
+      }
+      for(int i=x0+3;i<x1-1;i+=ppitch+4)
+        add_light((i+0.5f)*CELL,3.3f,(tz0+tz1)*0.5f*CELL,9.5f, 0.25f,0.95f,1.05f);
+      ax0=x0+2; az0=z0; ax1=x1-1; az1=z1;
+      reachable();
+      build_candidates(ax0,az0,ax1,az1,8.0f);
+      /* ammo on a train roof: pick the middle car so the climb is the price */
+      { int mc=ncar/2, cx=x0+1+mc*(carLen+1);
+        add_item((cx+carLen*0.5f)*CELL,(carZ+carD*0.5f)*CELL,1,6); }
+      add_item_cand(0,35,0);
+      add_item_cand(0,35,0);
+      add_item_cand(1,4,0);
     } break;
+
     case 3:{ /* OVERLORD: a black amphitheatre. wide open floor so the spiral
-                reads, four corner step-pyramids carrying respawning ammo you
-                must platform up to, a ring of full-height cover pillars, and
-                the boss enthroned dead centre. */
-      carve(4,4,36,36);
-      /* four concentric step-pyramids in the corners: 0.9 -> 1.9 -> 2.9, each
-         tier a single jump above the last, ammo on the top perch */
-      int cb[4][2]={{5,5},{34,5},{5,34},{34,34}};
-      for(int q=0;q<4;q++){
-        int bx=cb[q][0], bz=cb[q][1];
+                reads, corner step-pyramids carrying respawning ammo you must
+                platform up to, a ring of full-height cover pillars, and the
+                boss enthroned dead centre. */
+      int mg=3+irand(3);
+      int x0=mg,x1=G-mg,z0=mg,z1=G-mg;
+      carve(x0,z0,x1-x0,z1-z0);
+      int mid=G/2;
+      /* 2..4 step-pyramids, each tier a single jump above the last */
+      int npy=2+irand(3);
+      int corner[4][2]={{x0+1,z0+1},{x1-6,z0+1},{x0+1,z1-6},{x1-6,z1-6}};
+      int order[4]={0,1,2,3};
+      for(int k=3;k>0;k--){ int j=irand(k+1); int t=order[k];order[k]=order[j];order[j]=t; }
+      for(int q=0;q<npy;q++){
+        int bx=corner[order[q]][0], bz=corner[order[q]][1];
         raise(bx,  bz,  5,5,0.9f);
         raise(bx+1,bz+1,3,3,1.9f);
         raise(bx+2,bz+2,1,1,2.9f);
         float tx=(bx+2.5f)*CELL, tz=(bz+2.5f)*CELL;
-        /* alternate ammo / health on the perches; all respawn on world-time */
-        if(q==0||q==3) add_item_r(tx,tz,1,10,7.0f);   /* ammo cache */
-        else           add_item_r(tx,tz,0,35,12.0f);  /* med cache */
+        if(q&1) add_item_r(tx,tz,0,35,12.0f);
+        else    add_item_r(tx,tz,1,10,7.0f);
         add_light(tx,3.4f,tz,7.0f, 0.55f,0.85f,1.05f);
       }
-      /* a second ammo cache at ground level near spawn so the fight can open */
-      add_item_r(22*CELL,34*CELL,1,8,9.0f);
-      /* ring of cover pillars at radius ~6 cells around the throne */
-      for(int k=0;k<8;k++){
-        float a=k*PI/4.0f;
-        int qx=22+(int)(cosf(a)*6.0f), qz=22+(int)(sinf(a)*6.0f);
-        fill(qx,qz,1,1);
+      /* ring of cover pillars at a seeded count and radius */
+      int nring=6+irand(5);
+      float rr=5.0f+(float)irand(3);
+      for(int k=0;k<nring;k++){
+        float a=k*2*PI/nring;
+        fill(mid+(int)(cosf(a)*rr), mid+(int)(sinf(a)*rr),1,1);
       }
-      add_light(22*CELL,6.5f,22*CELL,22.0f, 1.15f,0.30f,1.35f); /* throne, violet */
-      add_light(22*CELL,3.0f,36*CELL, 9.0f, 0.70f,0.45f,1.10f); /* spawn approach */
-      startx=22*CELL; startz=38.0f*CELL; startyaw=0;
+      add_light(mid*CELL,6.5f,mid*CELL,22.0f, 1.15f,0.30f,1.35f);  /* throne  */
+      startx=mid*CELL; startz=(z1-1.5f)*CELL; startyaw=0;
+      add_light(startx,3.0f,startz,9.0f, 0.70f,0.45f,1.10f);
+      reachable();
+      build_candidates(x0+1,z0+1,x1-1,z1-1,8.0f);
+      add_item_cand(1,8,9.0f);              /* a ground cache near the fight  */
       /* enthrone the boss at centre */
       { Enemy*e=&en[nen++]; memset(e,0,sizeof*e);
-        float bx=22.5f*CELL, bz=22.5f*CELL;
+        float bx=(mid+0.5f)*CELL, bz=(mid+0.5f)*CELL;
         e->x=e->lx=bx; e->z=e->lz=bz; e->type=2; e->hp=bossMaxHp=60;
-        e->y=hgt[22][22]; e->yaw=PI; e->bphase=0;
+        e->y=hgt[mid][mid]; e->yaw=PI; e->bphase=0;
         e->state=0; e->atkCD=2.2f; e->jumpCD=4.5f;
         bossIdx=nen-1;
       }
-      /* no auto-spawned agents here (nshoot/nstrike 0), so the placement
-         region the other sectors set is intentionally left at its default */
     } break;
+
     default:{ /* TERMINAL: vast ice-teal departure hall; monoliths at mixed
-                 heights chain into parkour up to a high corner terrace. */
-      carve(5,5,34,34);
-      raise(32,5,7,6,2.8f);                       /* the terrace            */
-      raise(28,12,3,2,2.0f); raise(24,16,3,2,1.2f); /* the way up           */
-      for(int k=0;k<16;k++){
+                 heights, and a SOLVED parkour chain up to a high corner
+                 terrace. The chain used to be three blocks with clear air
+                 between them, so the terrace was unreachable at every seed. */
+      int mg=4+irand(2);
+      int x0=mg,x1=G-mg,z0=mg,z1=G-mg;
+      carve(x0,z0,x1-x0,z1-z0);
+      int corner=irand(4);
+      int tw=6+irand(2), td=5+irand(2);
+      int tx = (corner&1)? x1-tw : x0;
+      int tz = (corner&2)? z1-td : z0;
+      raise(tx,tz,tw,td,2.8f);
+      /* upper landing, FLUSH against the terrace in x; lower landing flush
+         against the upper in z. 0 -> 1.2 -> 2.0 -> 2.8, every step one jump. */
+      int ux = (corner&1)? tx-3 : tx+tw;
+      int uz = tz + (td-3)/2;
+      raise(ux,uz,3,3,2.0f);
+      int lz = (corner&2)? uz-2 : uz+3;
+      raise(ux,lz,3,2,1.2f);
+      /* the climb corridor must stay clear of the monolith field, or a random
+         block lands on a landing and the chain is broken again */
+      int cx0=(ux<tx?ux:tx)-1, cx1=(ux+3>tx+tw?ux+3:tx+tw)+1;
+      int cz0=(lz<tz?lz:tz)-1, cz1=(lz+2>tz+td?lz+2:tz+td)+1;
+      startx=(x0+x1)*0.5f*CELL; startz=(z1-1.5f)*CELL; startyaw=0;
+      int nmono=12+irand(8);
+      for(int k=0;k<nmono;k++){
         int w=(xs()&1)?2:1, h=3-w;
-        int x=7+(int)(frand()*28), z=9+(int)(frand()*26);
-        if(x>18&&x<26&&z>30)continue;             /* keep spawn clear       */
-        if(x>26&&z<15)continue;                   /* keep the climb honest  */
-        if(k%5==0) fill(x,z,w,h);
-        else       raise(x,z,w,h,(k%3==0)?2.0f:1.2f);
+        int mx2=x0+1+irand(x1-x0-3), mz2=z0+1+irand(z1-z0-3);
+        if(mx2>=cx0&&mx2<=cx1&&mz2>=cz0&&mz2<=cz1)continue;   /* keep the climb honest */
+        float sdx=(mx2+0.5f)*CELL-startx, sdz=(mz2+0.5f)*CELL-startz;
+        if(sdx*sdx+sdz*sdz<7*7)continue;                      /* keep spawn clear      */
+        if(k%5==0) fill(mx2,mz2,w,h);
+        else       raise(mx2,mz2,w,h,(k%3==0)?2.0f:1.2f);
       }
+      add_light((x0+x1)*0.5f*CELL,4.8f,(z0+z1)*0.5f*CELL,15.0f, 0.25f,1.10f,1.20f);
+      add_light((tx+tw*0.5f)*CELL,4.4f,(tz+td*0.5f)*CELL,9.0f, 0.45f,1.05f,0.95f);
+      reachable();
+      build_candidates(x0+1,z0+1,x1-1,z1-1,8.0f);
+      /* the terrace reward, then scattered caches on reachable ground */
+      add_item((tx+tw*0.5f)*CELL,(tz+td*0.5f)*CELL,1,8);
+      add_item_cand(0,35,0);
+      add_item_cand(1,4,0);
+      add_item_cand(0,35,0);
+      /* seeded ambient lights on reachable floor */
       for(int k=0;k<8;k++){
-        float lx=(8+frand()*27)*CELL, lz=(8+frand()*27)*CELL;
-        add_light(lx,3.6f,lz,8.5f, 0.40f,0.85f,1.00f);
+        if(nCand<=0)break;
+        int c=irand(nCand);
+        add_light((candX[c]+0.5f)*CELL,3.6f,(candZ[c]+0.5f)*CELL,8.5f, 0.40f,0.85f,1.00f);
       }
-      add_light(22*CELL,4.8f,22*CELL,15.0f, 0.25f,1.10f,1.20f);
-      add_light(35*CELL,4.4f, 8*CELL, 9.0f, 0.45f,1.05f,0.95f); /* terrace */
-      startx=22*CELL; startz=37.0f*CELL; startyaw=0;
-      add_item(35.5f*CELL, 7.5f*CELL,1,8);              /* the terrace reward */
-      add_item(10.5f*CELL,10.5f*CELL,0,35);
-      add_item( 8.5f*CELL,30.5f*CELL,1,4);
-      add_item(30.5f*CELL,34.5f*CELL,0,35);
-      ax0=7; az0=7; ax1=38; az1=33;
     } break;
   }
 
-  for(int k=0;k<L->nshoot;k++)  place_agent(0,ax0,az0,ax1,az1);
-  for(int k=0;k<L->nstrike;k++) place_agent(1,ax0,az0,ax1,az1);
+  /* candidates are built per-style above (they need the layout AND the spawn).
+   * If a style forgot, do it now so agent placement is never unseeded. */
+  if(nCand<=0){ reachable(); build_candidates(ax0,az0,ax1,az1,8.0f); }
+
+  int want=L->nshoot+L->nstrike+(L->style==3?1:0);
+  for(int k=0;k<L->nshoot;k++)  place_agent(0);
+  for(int k=0;k<L->nstrike;k++) place_agent(1);
   nalive=nen;
+
+  /* ---- soundness. gen_level retries on a 0, so a bad roll never ships. ---- */
+  float sy=cellh((int)floorf(startx/CELL),(int)floorf(startz/CELL));
+  if(sy>100.0f||!circ_free(startx,startz,0.34f,sy))return 0;
+  if(nen!=want)return 0;
+  if(nCand<G*G/16)return 0;                 /* too cramped to be a sector */
+  for(int i=0;i<nen;i++) if(!reach_at(en[i].x,en[i].z))return 0;
+  for(int i=0;i<nitems;i++) if(!reach_at(items[i].x,items[i].z))return 0;
+  if(nlights>=MAXLIGHT||nitems>=MAXITEM)return 0;
+  return 1;
+}
+
+/* Generate sector `li`, retrying until the layout is sound. Every attempt is a
+ * different seed, so a bad roll costs a few microseconds rather than shipping a
+ * sector with an unreachable reward or a stranded striker. The last attempt is
+ * accepted unconditionally: a playable-but-imperfect sector beats no sector, and
+ * --seed-sweep exists to prove that branch is never actually needed. */
+#define GEN_TRIES 24
+static int genAttempts=0;          /* reported by the smoke gate */
+static unsigned genSeedUsed=0;     /* shown on the title screen  */
+static void gen_level(int li,unsigned seedmix){
+  unsigned base=LEVELS[li].seed^seedmix;
+  int a;
+  for(a=0;a<GEN_TRIES;a++){
+    genSeedUsed = base ^ ((unsigned)a*2654435761u);
+    if(gen_attempt(li,genSeedUsed))break;
+  }
+  genAttempts=a+1;
+  if(a>=GEN_TRIES) printf("[dilation] warning: %s fell back after %d attempts\n",
+                          LEVELS[li].name,GEN_TRIES);
 
   /* mesh: floor at each cell's height, ceiling, and vertical faces — full
    * walls against solid cells, skirts where a neighbour's floor is higher */
@@ -1087,9 +1315,13 @@ static const char*VS=
 "void main(){\n"
 "  vec3 wp = uM3*gl_Vertex.xyz + uT;\n"
 "  vAO = gl_MultiTexCoord0.z;\n"
-/* uNS = inverse squash of any non-uniform m3scl in uM3 (torso slabs, the
- * boss's breathing thorax): R*S needs normals through R*S^-1, not R*S */
-"  vP=wp; vN=uM3*(gl_Normal*uNS); vUV=gl_MultiTexCoord0.xy;\n"
+/* uNS = the non-uniform m3scl actually folded into uM3 (torso slabs, the boss's
+ * breathing thorax). For uM3 = R*S the normal matrix is R*S^-1, so we need
+ * uM3 * (n/S^2) = R*S*S^-2*n = R*S^-1*n — hence the SQUARE. Callers used to pass
+ * 1/s and the shader multiplied, giving R*S*(1/s) = R: that cancelled the squash
+ * instead of inverting it, so every slab was lit as an unsquashed cylinder.
+ * Passing the plain scale here is the version that cannot be got wrong. */
+"  vP=wp; vN=uM3*(gl_Normal/(uNS*uNS)); vUV=gl_MultiTexCoord0.xy;\n"
 "  gl_Position = gl_ModelViewProjectionMatrix * vec4(wp,1.0);\n"
 "}\n";
 static const char*FS=
@@ -1143,22 +1375,55 @@ static const char*FS=
 "    float Vs = 0.25/max((NdL*(1.0-kv)+kv)*(NdV*(1.0-kv)+kv),1e-3);\n"
 "    float F = 0.04+0.96*pow(1.0-max(dot(H,V),0.0),5.0);\n"
 "    float spec = min(D*Vs*F*NdL, 8.0)*(0.35+1.10*uGloss);\n"
-"    col += uLcol[i]*a*(base*NdL*aoF + vec3(spec)*a);\n"
+/* One `a`, not two. The specular term used to sit INSIDE a second attenuation
+ * multiply, so the highlight fell off as the square of the diffuse rate — which
+ * is why the "glossy obsidian" floor and the cut-crystal limbs read as flat matte
+ * black at any distance from an emitter. Diffuse and specular are lit by the same
+ * light and take the same falloff. */
+"    col += uLcol[i]*a*(base*NdL*aoF + vec3(spec));\n"
 "  }\n"
 /* Grazing-angle environment sheen. There is no cubemap and never will be, but
  * black obsidian only reads as polished if something brightens at the horizon
  * — this is that reflection, faked from a fixed emerald-teal sky tint. */
 "  col += vec3(0.020,0.052,0.040)*pow(1.0-NdV,5.0)*uGloss;\n"
 "  if(uRain>0.5){\n"
-"    /* digital rain: world-aligned columns of flickering glyph cells */\n"
-"    float cx = floor(vUV.x*16.0);\n"
-"    float on = step(0.60, h1(cx*3.7+11.0));\n"
-"    float spd = 0.08 + 0.20*h1(cx*1.3);\n"
+/* Digital rain. This is the wall's whole identity now that the circuitry is
+ * gone, so it earns some real structure:
+ *   - a 3x5 sub-cell bit pattern, so each cell is a blocky GLYPH rather than a
+ *     solid lit square. This is the single change that makes it read as falling
+ *     characters instead of falling confetti.
+ *   - a white-hot leading cell with an emerald tail behind it, which is the one
+ *     detail everybody actually remembers about the effect.
+ *   - a softer tail exponent (6 rather than 10) so columns are long enough to
+ *     overlap and the wall reads as a sheet rather than as dots.
+ *   - more live columns, and per-column glyph churn rates, so neighbouring
+ *     columns never scramble in lockstep. */
+/* Cell size is chosen in WORLD units, not UV units. vUV is worldpos*0.5, so
+ * vUV.x*9 is one column every ~22cm and vUV.y*12 one glyph every ~17cm — about
+ * head-sized, which is what makes them read as characters. The previous 16x34
+ * put cells at 6cm, and subdividing those 3x5 for the block font landed the
+ * actual features at ~1cm, where they just alias into green noise. */
+"    float cx  = floor(vUV.x*9.0);\n"
+/* Density. Pulled a long way back: at 0.46 well over half the columns were live
+ * and every surface in the room was raining, which stopped reading as a wall
+ * with data on it and started reading as a screensaver. 0.80 leaves roughly one
+ * column in five, so most of the wall is just wall and the rain is an accent you
+ * notice rather than a texture you look through. */
+"    float on  = step(0.80, h1(cx*3.7+11.0));\n"
+"    float spd = 0.05 + 0.16*h1(cx*1.3);\n"
 "    float head = fract(uTime*spd + h1(cx*7.7));\n"
-"    float d2 = fract(head + vUV.y*0.45);\n"
-"    float tail = pow(1.0-d2, 10.0);\n"
-"    float glyph = step(0.50, h1(cx*91.0 + floor(vUV.y*34.0)*17.0 + floor(uTime*9.0)*3.0));\n"
-"    col += vec3(0.10,1.00,0.42)*tail*glyph*on*(0.18+0.22*h1(cx*5.1));\n"
+"    float d2  = fract(head + vUV.y*0.34);\n"
+"    float tail = pow(1.0-d2, 11.0);\n"      /* shorter streaks, not sheets */
+"    float row = floor(vUV.y*12.0);\n"
+/* the glyph: a 3x5 block font hashed per (column,row,tick). churn is per-column
+ * so the sheet shimmers unevenly, the way the real thing does. */
+"    float churn = floor(uTime*(7.0+9.0*h1(cx*2.3))) * 3.0;\n"
+"    vec2  sub = floor(fract(vec2(vUV.x*9.0, vUV.y*12.0))*vec2(3.0,5.0));\n"
+"    float bit = step(0.44, h1(cx*91.0 + row*17.0 + (sub.x+sub.y*3.0)*7.31 + churn));\n"
+/* leading cell burns white; everything behind it is emerald */
+"    float lead = smoothstep(0.90,1.0,1.0-d2);\n"
+"    vec3  rc = mix(vec3(0.10,1.00,0.42), vec3(0.85,1.00,0.92), lead);\n"
+"    col += rc*tail*bit*on*(0.13+0.17*h1(cx*5.1))*(1.0+1.5*lead);\n"
 "  }\n"
 /* uEmis is a lerp toward unlit albedo, and several callers stack a flash on top
  * of an already-high base (a locked-on agent reaches ~1.6). Left unclamped that
@@ -1245,15 +1510,42 @@ static void init_shaders(void){
  * Every stage degrades: no float target -> RGBA8, no multisample -> plain,
  * no FBOs at all -> postOK=0 and the game draws straight to the window. */
 #define NBLOOM 3
+/* ------------------------------------------------------------ quality tiers
+ * On the machine this was written on the whole frame costs well under a
+ * millisecond of CPU and the GPU never breaks a sweat. On an integrated part
+ * the picture inverts completely: the multisampled RGBA16F scene target and the
+ * three-octave separable blur are almost the entire frame, and they scale with
+ * PIXELS, not with anything the game is doing.
+ *
+ * So the post chain is now tiered. Ordered so the cheapest thing to lose goes
+ * first and the silhouette — which is the whole art direction — goes last:
+ *   bloom octaves   the widest octave is a 1/8-res haze almost nobody can name
+ *   HDR             RGBA8 halves scene bandwidth; emitters clip, bloom dulls
+ *   scene scale     softens everything, but keeps the HUD and the edges crisp
+ *   MSAA            dropped LAST: hard bright edges on black is the look
+ * `lights` also clamps the fragment shader's light loop, which is the one
+ * genuinely expensive thing in the world shader. */
+typedef struct { int msaa,hdr,bloom,lights; float scale; const char*name; } Quality;
+static const Quality QUAL[3]={
+  { 0, 0, 1, 4, 0.70f, "LOW"    },
+  { 2, 1, 2, 6, 1.00f, "MEDIUM" },
+  { 4, 1, 3, 8, 1.00f, "HIGH"   },
+};
+static int qual=2;          /* index into QUAL; --quality overrides            */
+static int qualAuto=1;      /* auto tier: step down when we cannot hold 60fps  */
 static int postOK=0, postMS=0;
 static GLuint fboMS, rbColMS, rbDepMS;      /* multisampled scene target */
 static GLuint fboScene, texScene, rbDepth;  /* resolved (or direct) scene   */
 static GLuint bloomFbo[NBLOOM][2], bloomTex[NBLOOM][2];
 static int bloomW[NBLOOM], bloomH[NBLOOM];
+/* SCENE resolution, which is fbW/fbH scaled by renderScale. The world renders
+ * here; the composite upscales to the real framebuffer on its way to the window.
+ * On anything up to 1440p these are just fbW/fbH. */
+static int scW=HUDW, scH=HUDH;
 static GLuint progBright, progBlur, progComp;
 static GLint  bSrc,bTexel,bThresh,bKnee;
 static GLint  lSrc,lDir;
-static GLint  cScene,cB0,cB1,cB2,cTime,cTs,cDmg,cExp,cBloom;
+static GLint  cScene,cB0,cB1,cB2,cTime,cTs,cDmg,cExp,cBloom,cBW;
 
 static const char*PVS=
 "#version 120\n"
@@ -1298,6 +1590,7 @@ static const char*COMPFS=
 "#version 120\n"
 "uniform sampler2D uScene,uB0,uB1,uB2;\n"
 "uniform float uTime,uTs,uDmg,uExp,uBloom;\n"
+"uniform vec3 uBW;\n"
 "varying vec2 vUV;\n"
 "float h1(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }\n"
 /* Narkowicz ACES fit: keeps saturation in the shoulder, which matters when the
@@ -1315,11 +1608,11 @@ static const char*COMPFS=
 "  col.r = texture2D(uScene,vUV+d*ab).r;\n"
 "  col.g = texture2D(uScene,vUV).g;\n"
 "  col.b = texture2D(uScene,vUV-d*ab).b;\n"
-"  vec3 bl = texture2D(uB0,vUV).rgb\n"
-"          + texture2D(uB1,vUV).rgb*0.85\n"
+"  vec3 bl = texture2D(uB0,vUV).rgb*uBW.x\n"
+"          + texture2D(uB1,vUV).rgb*uBW.y\n"
 /* anamorphic hint: the widest octave sampled through an x-compressed UV
  * stretches ~1.8x horizontally — emitters grow subtle lens streaks */
-"          + texture2D(uB2, vec2((vUV.x-0.5)*0.55+0.5, vUV.y)).rgb*0.50;\n"
+"          + texture2D(uB2, vec2((vUV.x-0.5)*0.55+0.5, vUV.y)).rgb*uBW.z;\n"
 "  col += bl*uBloom;\n"
 "  col *= uExp;\n"
 /* The time-dilation grade: frozen time drains the colour toward a cold blue
@@ -1356,25 +1649,59 @@ static int attach(GLuint fbo,GLuint tex){
   return glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE;
 }
 
+/* Release every render target. Split out of init_post so a window resize can
+ * rebuild the whole chain at the new size — the targets used to be allocated
+ * once at a compile-time constant and there was no way to change them. The
+ * shader PROGRAMS are deliberately not touched: they are resolution-independent
+ * and recompiling them on every drag-resize would stutter badly. */
+static void free_post(void){
+  if(fboScene){ glDeleteFramebuffers(1,&fboScene); fboScene=0; }
+  if(texScene){ glDeleteTextures(1,&texScene); texScene=0; }
+  if(rbDepth){ glDeleteRenderbuffers(1,&rbDepth); rbDepth=0; }
+  if(fboMS){ glDeleteFramebuffers(1,&fboMS); fboMS=0; }
+  if(rbColMS){ glDeleteRenderbuffers(1,&rbColMS); rbColMS=0; }
+  if(rbDepMS){ glDeleteRenderbuffers(1,&rbDepMS); rbDepMS=0; }
+  for(int i=0;i<NBLOOM;i++)for(int k=0;k<2;k++){
+    if(bloomFbo[i][k]){ glDeleteFramebuffers(1,&bloomFbo[i][k]); bloomFbo[i][k]=0; }
+    if(bloomTex[i][k]){ glDeleteTextures(1,&bloomTex[i][k]); bloomTex[i][k]=0; }
+  }
+  postOK=0; postMS=0;
+}
+
 static void init_post(int msaa){
   if(!glGenFramebuffers||!glBindFramebuffer||!glFramebufferTexture2D
      ||!glCheckFramebufferStatus||!glGenRenderbuffers){
     printf("[dilation] no FBO support, post-processing off\n"); return; }
-  int hdr = SDL_GL_ExtensionSupported("GL_ARB_texture_float")
-         || SDL_GL_ExtensionSupported("GL_APPLE_float_pixels");
+  const Quality*Q=&QUAL[qual];
+  if(msaa>Q->msaa)msaa=Q->msaa;          /* the tier caps the scene target */
+  int hdr = Q->hdr && (SDL_GL_ExtensionSupported("GL_ARB_texture_float")
+                    || SDL_GL_ExtensionSupported("GL_APPLE_float_pixels"));
+
+  /* pick the scene resolution: native up to the pixel budget, then scale down by
+   * area so a 6K panel costs about what 1440p does. */
+  renderScale = Q->scale;
+  if((float)fbW*(float)fbH*renderScale*renderScale > (float)PIXEL_BUDGET)
+    renderScale = sqrtf((float)PIXEL_BUDGET/((float)fbW*(float)fbH));
+  scW=(int)(fbW*renderScale); scH=(int)(fbH*renderScale);
+  if(scW<64)scW=64; if(scH<64)scH=64;
 
   /* resolved scene target */
   glGenFramebuffers(1,&fboScene);
-  texScene=mkrt(WINW,WINH,hdr);
+  texScene=mkrt(scW,scH,hdr);
   if(!attach(fboScene,texScene) && hdr){       /* float unsupported after all */
-    hdr=0; glDeleteTextures(1,&texScene); texScene=mkrt(WINW,WINH,0);
-    if(!attach(fboScene,texScene)){ printf("[dilation] scene FBO incomplete\n"); return; }
+    hdr=0; glDeleteTextures(1,&texScene); texScene=mkrt(scW,scH,0);
+    if(!attach(fboScene,texScene)){ printf("[dilation] scene FBO incomplete\n");
+      /* attach() leaves the (incomplete) fbo bound and nothing downstream ever
+       * rebinds 0 once postOK stays 0 — so bailing out here without unbinding
+       * turned the no-post fallback into a black window. Match the sibling
+       * bail-outs below. */
+      glBindFramebuffer(GL_FRAMEBUFFER,0); return; }
   }
   /* the resolved target needs its own depth only when we render straight into
    * it (no multisample path); attach it unconditionally, it is cheap */
   glGenRenderbuffers(1,&rbDepth);
   glBindRenderbuffer(GL_RENDERBUFFER,rbDepth);
-  glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT24,WINW,WINH);
+  glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT24,scW,scH);
   glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,rbDepth);
   if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){
     printf("[dilation] scene FBO incomplete\n"); glBindFramebuffer(GL_FRAMEBUFFER,0); return; }
@@ -1385,16 +1712,17 @@ static void init_post(int msaa){
     glGenFramebuffers(1,&fboMS);
     glBindFramebuffer(GL_FRAMEBUFFER,fboMS);
     glGenRenderbuffers(1,&rbColMS); glBindRenderbuffer(GL_RENDERBUFFER,rbColMS);
-    glRenderbufferStorageMultisample(GL_RENDERBUFFER,msaa,hdr?GL_RGBA16F:GL_RGBA8,WINW,WINH);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER,msaa,hdr?GL_RGBA16F:GL_RGBA8,scW,scH);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_RENDERBUFFER,rbColMS);
     glGenRenderbuffers(1,&rbDepMS); glBindRenderbuffer(GL_RENDERBUFFER,rbDepMS);
-    glRenderbufferStorageMultisample(GL_RENDERBUFFER,msaa,GL_DEPTH_COMPONENT24,WINW,WINH);
+    glRenderbufferStorageMultisample(GL_RENDERBUFFER,msaa,GL_DEPTH_COMPONENT24,scW,scH);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,rbDepMS);
     postMS = glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE;
   }
-  /* bloom chain: half, quarter, eighth */
+  /* bloom chain: half, quarter, eighth (the tier may use fewer octaves, but we
+   * allocate all three so a tier change never has to reallocate) */
   for(int i=0;i<NBLOOM;i++){
-    bloomW[i]=WINW>>(i+1); bloomH[i]=WINH>>(i+1);
+    bloomW[i]=scW>>(i+1); bloomH[i]=scH>>(i+1);
     if(bloomW[i]<2)bloomW[i]=2; if(bloomH[i]<2)bloomH[i]=2;
     for(int k=0;k<2;k++){
       glGenFramebuffers(1,&bloomFbo[i][k]);
@@ -1406,6 +1734,7 @@ static void init_post(int msaa){
   }
   glBindFramebuffer(GL_FRAMEBUFFER,0);
 
+  if(!progBright){
   progBright=mkprog(PVS,BRIGHTFS);
   bSrc=glGetUniformLocation(progBright,"uSrc");
   bTexel=glGetUniformLocation(progBright,"uTexel");
@@ -1423,9 +1752,12 @@ static void init_post(int msaa){
   cDmg=glGetUniformLocation(progComp,"uDmg");
   cExp=glGetUniformLocation(progComp,"uExp");
   cBloom=glGetUniformLocation(progComp,"uBloom");
+  cBW=glGetUniformLocation(progComp,"uBW");
+  }
   postOK=1;
-  printf("[dilation] post: %s, %s, %dx MSAA\n",
-    hdr?"RGBA16F HDR":"RGBA8 LDR", "bloom x3", postMS?msaa:0);
+  printf("[dilation] post: %s quality, %s, bloom x%d, %dx MSAA, %d lights, scene %dx%d -> window %dx%d\n",
+    Q->name, hdr?"RGBA16F HDR":"RGBA8 LDR", Q->bloom, postMS?msaa:0, Q->lights,
+    scW,scH, fbW,fbH);
 }
 
 /* a screen-filling quad in clip space — no matrices involved */
@@ -1445,7 +1777,7 @@ static void bind_tex(int unit,GLuint t){
 static void post_begin(void){
   if(!postOK)return;
   glBindFramebuffer(GL_FRAMEBUFFER, postMS?fboMS:fboScene);
-  glViewport(0,0,WINW,WINH);
+  glViewport(0,0,scW,scH);
 }
 /* resolve, build the bloom pyramid, and composite to the window */
 static void post_end(float ts01,float dmg,float time){
@@ -1453,7 +1785,7 @@ static void post_end(float ts01,float dmg,float time){
   if(postMS){   /* resolve multisample -> the sampleable float texture */
     glBindFramebuffer(GL_READ_FRAMEBUFFER,fboMS);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER,fboScene);
-    glBlitFramebuffer(0,0,WINW,WINH, 0,0,WINW,WINH, GL_COLOR_BUFFER_BIT,GL_NEAREST);
+    glBlitFramebuffer(0,0,scW,scH, 0,0,scW,scH, GL_COLOR_BUFFER_BIT,GL_NEAREST);
   }
   glDisable(GL_DEPTH_TEST); glDisable(GL_BLEND); glDepthMask(GL_FALSE);
 
@@ -1461,16 +1793,22 @@ static void post_end(float ts01,float dmg,float time){
    * downsamples the BLURRED octave above it and blurs again. The old two-loop
    * order box-halved UNBLURRED sources, so single-pixel emitters (bullet
    * heads, eye slits) aliased into sparkling, crawling halos. */
-  for(int i=0;i<NBLOOM;i++){
+  int nb=QUAL[qual].bloom; if(nb<1)nb=1; if(nb>NBLOOM)nb=NBLOOM;
+  for(int i=0;i<nb;i++){
     GLuint src = i? bloomTex[i-1][0] : texScene;
-    int sw = i? bloomW[i-1] : WINW, sh = i? bloomH[i-1] : WINH;
+    int sw = i? bloomW[i-1] : scW, sh = i? bloomH[i-1] : scH;
     glUseProgram(progBright);
     glUniform1i(bSrc,0);
     glBindFramebuffer(GL_FRAMEBUFFER,bloomFbo[i][0]);
     glViewport(0,0,bloomW[i],bloomH[i]);
     glUniform2f(bTexel,1.0f/sw,1.0f/sh);
-    /* only the first octave thresholds; the rest just carry the energy down */
-    glUniform1f(bThresh,i?0.0f:1.30f); glUniform1f(bKnee,i?0.0f:0.55f);
+    /* only the first octave thresholds; the rest just carry the energy down.
+     * The knee used to start at 1.30, which sat ABOVE most of the authored
+     * emissive palette: the shin/forearm strips and the TRON belt peak at 1.15,
+     * the player's eye slits at 1.25, so the things most obviously meant to glow
+     * contributed nothing to the bloom and only the agent eyes and edge trims
+     * (1.35-1.8) cleared it at all. 0.85 puts the whole palette inside the ramp. */
+    glUniform1f(bThresh,i?0.0f:0.85f); glUniform1f(bKnee,i?0.0f:0.45f);
     bind_tex(0,src);
     fsquad();
     glUseProgram(progBlur);
@@ -1484,14 +1822,18 @@ static void post_end(float ts01,float dmg,float time){
   }
 
   glBindFramebuffer(GL_FRAMEBUFFER,0);
-  glViewport(0,0,WINW,WINH);
+  glViewport(0,0,fbW,fbH);
   glUseProgram(progComp);
   bind_tex(0,texScene);     glUniform1i(cScene,0);
-  bind_tex(1,bloomTex[0][0]); glUniform1i(cB0,1);
-  bind_tex(2,bloomTex[1][0]); glUniform1i(cB1,2);
-  bind_tex(3,bloomTex[2][0]); glUniform1i(cB2,3);
+  /* octaves the tier skipped are never rendered, so point their samplers at the
+   * last one we DID render and scale the composite weights to match — sampling a
+   * stale or undefined target would smear last-second garbage across the frame */
+  bind_tex(1,bloomTex[0][0]);          glUniform1i(cB0,1);
+  bind_tex(2,bloomTex[nb>1?1:0][0]);   glUniform1i(cB1,2);
+  bind_tex(3,bloomTex[nb>2?2:nb-1][0]);glUniform1i(cB2,3);
   glUniform1f(cTime,time); glUniform1f(cTs,ts01); glUniform1f(cDmg,dmg);
   glUniform1f(cExp,1.15f); glUniform1f(cBloom,0.48f);
+  glUniform3f(cBW, 1.0f, nb>1?0.85f:0.0f, nb>2?0.50f:0.0f);
   fsquad();
 
   /* leave the bloom textures bound and only restore the active unit: unbinding
@@ -1518,6 +1860,10 @@ static void spawn_parts(int n,float x,float y,float z,float spd,float cr,float c
   }
 }
 static void spawn_shards(float x,float y,float z,float vr,float scale){
+  /* Momentum carry is what reads as "it was moving when it died": a charging
+   * striker's debris should go where the striker was going, not puff out
+   * symmetrically like a standing shooter's. Set by shatter_enemy. */
+  extern float g_shardVX,g_shardVZ;
   /* a figure comes apart: glowing facets, tinted by its final Doppler.
    * scale grows count, spread, size and speed together — 1.0 for an agent
    * (bit-identical to the unscaled path), ~2.6 for the 4.5u OVERLORD, whose
@@ -1528,7 +1874,9 @@ static void spawn_shards(float x,float y,float z,float vr,float scale){
     float a=frand()*2*PI, b=(frand()-0.4f)*PI*0.5f;
     float sp=(1.5f+frand()*3.5f)*(0.7f+0.3f*scale);
     s->x=x+(frand()-0.5f)*0.4f*scale; s->y=y+(0.3f+frand()*1.5f)*scale; s->z=z+(frand()-0.5f)*0.4f*scale;
-    s->vx=cosf(a)*cosf(b)*sp; s->vy=sinf(b)*sp+2.0f; s->vz=sinf(a)*cosf(b)*sp;
+    s->vx=cosf(a)*cosf(b)*sp+g_shardVX*0.35f;
+    s->vy=sinf(b)*sp+2.0f;
+    s->vz=sinf(a)*cosf(b)*sp+g_shardVZ*0.35f;
     s->yaw=frand()*2*PI; s->pit=frand()*2*PI;
     s->wy=(frand()-0.5f)*14; s->wp=(frand()-0.5f)*14;
     s->sx=(0.06f+frand()*0.16f)*scale; s->sy=(0.06f+frand()*0.22f)*scale; s->sz=(0.02f+frand()*0.05f)*scale;
@@ -1540,6 +1888,7 @@ static void spawn_shards(float x,float y,float z,float vr,float scale){
   }
 }
 
+float g_shardVX=0,g_shardVZ=0;   /* victim velocity, read by spawn_shards */
 /* ---------------------------------------------------------------- game state */
 enum { ST_TITLE, ST_PLAY, ST_DEAD, ST_WIN };
 static int gstate=ST_TITLE;
@@ -1552,18 +1901,33 @@ static float tsEff=1;                       /* tscale with the hitstop dip folde
 static float rollT,rollCD,rollDX,rollDZ;    /* dodge roll: timer + direction  */
 static float kvx,kvz;                       /* wall-kick horizontal impulse   */
 static float pmoveb;                        /* idle<->run blend for the avatar*/
+static float pspdS;                         /* speed follower; see update_enemies */
 static float avYaw;                         /* smoothed avatar facing (rad)   */
 static float camDist=3.05f,camYs=-1.0f;     /* smoothed camera boom + height  */
 static float coyT;                          /* coyote time: late edge jumps   */
 static float hurtCD;                        /* post-hit mercy window          */
 static float mzT,mzX,mzY,mzZ;               /* avatar muzzle flash            */
-static float landT;                         /* landing absorb 1->0, knee dip  */
+static float landT,landTgt;                 /* landing absorb: eased / target */
 static float airB;                          /* smoothed airborne blend 0..1   */
 static float hitstop;                       /* impact freeze: pins the world  */
+/* ADS: hold RMB to pull the camera out of the over-shoulder boom and into the
+ * avatar's own head. Eased on RAW dt — this is the player's hands, not the
+ * world, so it must not slow down when time does. `adsHold` is the button,
+ * `ads` the 0..1 blend everything else reads through ads_amt(). */
+static int   adsHold=0;
+static float ads=0;
+static float ads_amt(void){ return sstep(clampf(ads,0,1)); }
+/* FOV half-angles, in degrees, that the transition interpolates between. Lerped
+ * in TAN space (see the projection setup) — lerping the angle itself makes the
+ * zoom visibly accelerate through the middle. */
+#define FOV_HIP 35.0f
+#define FOV_ADS 26.0f
 
 static float player_height(void){ return rollT>0 ? 0.85f : 1.72f; }
 static float player_camh(void){ return py + (rollT>0 ? 1.45f : 1.92f); }
 static float fireCD,swingT,swingCD,dmgFlash,stepT,shake,bobT,winT,gtime,wtime,msgT;
+static float winRealT,winSimT;   /* both clocks, frozen at the moment of victory */
+static float rollPT;             /* roll dust accumulator: spawn on time, not per frame */
 static float swRel,swStow;   /* katana exit blends: end-of-cut->carry, carry->pistol */
 static float gunCharge;                       /* 0..1, controls laser/shot range */
 static float aimSet=1,stableT;      /* physical aim: 0 = gun rides the running
@@ -1578,20 +1942,23 @@ static int titlecap=0;   /* --titlecap: dump a numbered title-screen frame seque
  * curlevel, so the title kept rendering the OLD geometry tinted in the NEW
  * sector's climate under the new name. Regenerating on selection turns the
  * title into a real preview of the chosen sector (agents, lights and all). */
-static void preview_level(void){ gen_level(curlevel,gseed); laserTarget=-1; }
+static unsigned reroll=0;   /* bumped by R on the title, mixed into the seed */
+static void preview_level(void){ gen_level(curlevel,gseed^reroll); laserTarget=-1; }
 
 static void reset_game(void){
-  gen_level(curlevel,gseed);
+  gen_level(curlevel,gseed^reroll);
   px=startx; pz=startz; pyaw=startyaw; ppitch=0; pvx=pvz=pvy=0;
   avYaw=startyaw*PI/180.0f;
   py=hgt[(int)(startz/CELL)][(int)(startx/CELL)];
   php=100; pammo=6; jumps=1;
   tscale=tsEff=1; actT=0; mouseAcc=0;
   aimSet=1; stableT=GUN_SETTLE_TIME;   /* you jack in standing still: settled */
-  rollT=rollCD=rollDX=rollDZ=kvx=kvz=pmoveb=0;
-  coyT=hurtCD=mzT=landT=hitstop=airB=0;
+  rollT=rollCD=rollDX=rollDZ=kvx=kvz=pmoveb=pspdS=0;
+  coyT=hurtCD=mzT=landT=landTgt=hitstop=airB=0;
+  ads=0; adsHold=0;   /* respawning mid-zoom used to drop you in already aimed */
   camDist=3.05f; camYs=-1.0f;
   fireCD=swingT=swingCD=dmgFlash=stepT=shake=bobT=winT=wtime=0;
+  winRealT=winSimT=rollPT=0;
   swRel=swStow=0;
   gunCharge=0;
   msgT=3.0f;
@@ -1710,10 +2077,24 @@ static void spawn_bullet(float x,float y,float z,float dx,float dy,float dz,
 static void shatter_enemy(Enemy*e){
   if(e->state==4)return;
   e->state=4; nalive--;
+  /* Death kinematics. The figure used to cease to exist on the exact frame the
+   * shards spawned — in a game whose entire punch is a hitstop that HOLDS the
+   * moment, the moment itself was a one-frame pop. dieT keeps the body drawable
+   * for a beat while it squashes, bulges and blows out to white, so the shards
+   * emerge FROM a body instead of replacing one. Decayed on world time next to
+   * the shard integrator, so a kill at MINTS hangs exactly like the debris does. */
+  e->dieT = e->type==2 ? 0.30f : 0.13f;
+  /* the muzzle-flash timer stops ticking the moment an agent dies (update_enemies
+   * decays it BELOW its state==4 early-out), so a corpse killed mid-volley used
+   * to keep a full-brightness flash pinned at its last firing point for the rest
+   * of the sector. Retire it with the body. */
+  e->mzT=0;
   float vr=radial_v(e->x,e->z,e->vx,e->vz);
   int boss=e->type==2;
   float sc=boss?2.6f:1.0f;
+  g_shardVX=e->vx; g_shardVZ=e->vz;
   spawn_shards(e->x,e->y,e->z,vr,sc);
+  g_shardVX=g_shardVZ=0;
   spawn_parts(boss?48:14,e->x,e->y+1.1f*sc,e->z,2.5f*(boss?1.8f:1.0f), 0.2f,1.0f,0.5f);
   add_templ(e->x,e->y+1.2f*sc,e->z,6.0f*sc,boss?0.8f:0.35f, 0.3f,2.2f,1.0f);
   sfx3(V_SHATTER,boss?0.45f:1.0f,e->x,e->y,e->z);
@@ -1727,7 +2108,14 @@ static void shatter_enemy(Enemy*e){
     if(php<50) add_item(e->x,e->z,0,35); else add_item(e->x,e->z,1,amt);
   }
   if(nalive<=0 && gstate==ST_PLAY){
-    gstate=ST_WIN; winT=0; sfx(V_WIN); SDL_SetRelativeMouseMode(SDL_FALSE);
+    /* Snapshot both clocks HERE. winT is only advanced inside the ST_PLAY
+     * branch, so zeroing it on this edge (as we used to) meant the victory card
+     * read "0 SECONDS REAL" every single time. wtime, meanwhile, keeps climbing
+     * on the win screen — deliberately, since the victory slow-mo drives every
+     * sinf(wtime*..) animation — so reading it live made the card's second
+     * number drift upward while you looked at it. */
+    winRealT=winT; winSimT=wtime;
+    gstate=ST_WIN; sfx(V_WIN); SDL_SetRelativeMouseMode(SDL_FALSE);
   }
 }
 /* every round/melee hit funnels through here. normal agents carry hp 0, so the
@@ -1756,7 +2144,7 @@ static void player_aim(float*dx,float*dy,float*dz){
  * draw_player and the sim-side aiming chain below, so the drawn figure and
  * the ballistics can never drift apart. */
 typedef struct {
-  int rolling,blade,aimStance;
+  int rolling,blade;
   float tuck,tk,walk,armw,s,spd,run,fwdb,latb,absorb,poseYaw,pcy;
   float M[9];
 } PPose;
@@ -1772,7 +2160,6 @@ static void player_pose(PPose*P){
   P->armw = cosf(bobT*7.5f);
   P->s = swingT>0? clampf(swingT/SWING_TIME,0,1) : 0;  /* katana swing phase */
   P->blade = P->s>0 || swingCD>0;                      /* + follow-through   */
-  P->aimStance = !P->rolling && !P->blade;
   /* ONE yaw for every stance. avYaw lives in the aim convention (forward =
    * (sin a, -cos a), like pyaw/player_aim) and eases toward the look yaw —
    * or toward the roll direction mid-roll — in the main loop. m3rotY() maps
@@ -1840,9 +2227,33 @@ static void player_arm_r(const PPose*P,ArmR*o){
      * below keeps the barrel exact regardless of the blended raise. */
     raise += (0.52f-raise)*swStow;
     swYaw += (0.42f-swYaw)*swStow;
+    /* ADS: bring the gun UP to eye level and IN across the centreline, so from
+     * inside the head it reads as a sight picture instead of a hand dangling in
+     * the corner of the frame. This changes the gun's POSITION only — the
+     * m3align below re-seats the barrel onto mix(pose, look ray, aimSet)
+     * regardless, so the ballistics are untouched and the sights still cannot
+     * disagree with where the round goes. Bringing it inboard also shrinks the
+     * muzzle-to-eye parallax, which is what makes the reticle honest up close. */
+    /* Raise target solved, not guessed: the eye sits 0.24 above the shoulder and
+     * the arm is 0.68 long, so the hand reaches eye level at acos(-0.24/0.68) =
+     * 1.93 rad. Below that the sights sit under the sight line and there is
+     * nothing to align — which is the entire point of the mode. */
+    { float ae=ads_amt();
+      raise += (1.66f-raise)*ae;
+      swYaw += (-0.42f-swYaw)*ae; }
   }
-  float sh[3]; m3v(P->M,0.27f,1.05f*P->tk,0,sh);
-  o->sx=px+sh[0]; o->sy=P->pcy+sh[1]; o->sz=pz+sh[2];
+  /* Shouldering the weapon rolls the shoulder inboard AND presents it forward.
+   * Inboard because the real motion is a cheek weld, and without it the gun
+   * stays a hand's width to the right of where you are looking. Forward because
+   * the arm is only 0.68 long: with the shoulder at the eye, the whole weapon
+   * sits well inside half a metre and fills a zoomed frame. Pushing the shoulder
+   * out along the look direction buys apparent distance, which is the only lever
+   * available without giving the viewmodel its own projection. */
+  { float ae=P->rolling?0.0f:ads_amt();
+    /* all the way onto the centreline, not merely inboard: the sights have to be
+     * under the eye or they are decoration */
+    float sh[3]; m3v(P->M,0.27f-0.20f*ae,1.05f*P->tk,-0.22f*ae,sh);
+    o->sx=px+sh[0]; o->sy=P->pcy+sh[1]; o->sz=pz+sh[2]; }
   float RX[9],RY[9],S[9],e[3],h[3];
   m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(o->A,P->M,S);
   m3v(o->A,0,-0.35f,0,e);
@@ -1862,6 +2273,30 @@ static void player_arm_r(const PPose*P,ArmR*o){
     float mx=b[0]+(ax-b[0])*aimSet, my_=b[1]+(ay-b[1])*aimSet, mz_=b[2]+(az-b[2])*aimSet;
     float il=1.0f/sqrtf(mx*mx+my_*my_+mz_*mz_+1e-9f);
     m3align(o->GP, b[0],b[1],b[2], mx*il,my_*il,mz_*il); }
+  /* ROLL LEVELLING. m3align above pins the barrel DIRECTION but says nothing
+   * about the gun's rotation around it — that comes from wherever the wrist
+   * happens to be, which is fine for a carried weapon and useless for a sighted
+   * one: raise the arm and the iron sights rotate off to the side. Roll the grip
+   * about its own barrel until the gun's local up meets world up, blended in by
+   * ads_amt() so the hip-fire pose keeps the wrist's character and the shouldered
+   * pose gets a true sight picture. Rolling ABOUT the barrel cannot disturb it,
+   * so the ballistics guarantee is untouched. */
+  { float ae=P->rolling?0.0f:ads_amt();
+    if(ae>0.001f){
+      float f[3]; m3v(o->GP,0,0,-1,f);
+      float u[3]; m3v(o->GP,0,1,0,u);
+      /* world up with the barrel component removed = the up we want, unless we
+       * are aiming straight up or down, where it degenerates and we leave it */
+      float d=f[1];
+      float vx=-f[0]*d, vy=1.0f-f[1]*d, vz=-f[2]*d;
+      float vl=sqrtf(vx*vx+vy*vy+vz*vz);
+      if(vl>0.15f){
+        vx/=vl; vy/=vl; vz/=vl;
+        float wx=u[0]+(vx-u[0])*ae, wy=u[1]+(vy-u[1])*ae, wz=u[2]+(vz-u[2])*ae;
+        float wl=sqrtf(wx*wx+wy*wy+wz*wz);
+        if(wl>1e-5f) m3align(o->GP, u[0],u[1],u[2], wx/wl,wy/wl,wz/wl);
+      }
+    } }
   /* anchor the grip into the palm (inverse of pistol_sh's grip offset), with
    * a small forearm-up lift that seats it visibly in the hand */
   float go[3],lift[3]; m3v(o->GP,0,0.145f,0.020f,go); m3v(o->F,0,0.125f,0,lift);
@@ -1872,10 +2307,28 @@ static void player_arm_r(const PPose*P,ArmR*o){
   o->bdx=b2[0]; o->bdy=b2[1]; o->bdz=b2[2];
 }
 
+/* ---------------------------------------------------------------- pose cache
+ * player_pose + player_arm_r were solved FIVE times a frame from identical
+ * inputs: twice by draw_player (mirror pass, then upright), once by
+ * player_laser via draw_player_laser, once by laser_target, and once more by
+ * the ADS eye. The solve is pure, so it can be shared — but only within a
+ * PHASE. Between laser_target (simulation) and draw time, swingT/swingCD/swRel/
+ * swStow/landT all still move, so a cache spanning the two would quietly change
+ * behaviour rather than just speed. pose_dirty() is therefore called at exactly
+ * two places: the top of the sim section and the top of the render section. */
+static int   poseCached=0;
+static PPose cPose;
+static ArmR  cArm;
+static void pose_dirty(void){ poseCached=0; }
+static const PPose* pose_get(void){
+  if(!poseCached){ player_pose(&cPose); player_arm_r(&cPose,&cArm); poseCached=1; }
+  return &cPose;
+}
+static const ArmR* arm_get(void){ pose_get(); return &cArm; }
+
 static void player_laser(float*mx,float*my,float*mz,float*dx,float*dy,float*dz,
                          float*hx,float*hy,float*hz,float*dist){
-  PPose P; player_pose(&P);
-  ArmR a; player_arm_r(&P,&a);
+  const ArmR a=*arm_get();
   *mx=a.tipx; *my=a.tipy; *mz=a.tipz;
   *dx=a.bdx;  *dy=a.bdy;  *dz=a.bdz;
   /* The laser is the capacitor gauge: it grows outward by charge, but never
@@ -1913,16 +2366,31 @@ static int laser_target(void){
   return best;
 }
 static void fire(void){
-  if(fireCD>0||rollT>0||swingT>0)return;   /* that hand is holding a katana */
+  /* swingCD, not just swingT: the blade stays IN THE HAND through the whole
+   * cooldown (player_pose's `blade` is `s>0 || swingCD>0`), and both the laser
+   * and the lock-on already gate on it. Without it there was a ~0.24s window
+   * where a round left a gun that is not drawn — flash, report and ammo spent
+   * from a phantom pistol beside the katana. */
+  if(fireCD>0||rollT>0||swingT>0||swingCD>0)return;
   if(pammo<=0){ sfx(V_CLICK); fireCD=0.3f; gunCharge=0; return; }
   /* sample the barrel FIRST: the round leaves the gun as it was at trigger
    * pull — where the gun physically points, not where the camera looks —
-   * before the recoil state (fireCD raise, settle knock) kicks the pose */
+   * before the recoil state (fireCD raise, settle knock) kicks the pose.
+   * pose_dirty() is mandatory here and not an optimisation detail: fire() runs
+   * during event polling, BEFORE the simulation phase invalidates the cache, so
+   * without this it would aim with last frame's pitch. The regression gate
+   * caught exactly that — every shot around a trigger pull moved. */
+  pose_dirty();
   float mx,my,mz,dx,dy,dz,hx,hy,hz,ld;
   player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&ld);
   fireCD=FIRE_TIME; actT=0.22f;
   pammo--;
-  aimSet*=0.75f;        /* recoil unsettles the aim: follow-ups want a beat */
+  /* Recoil unsettles the aim so follow-ups want a beat. Knock the SETTLE CLOCK
+   * back rather than the settled value: aimSet is re-derived from stableT every
+   * frame, so multiplying it directly was a one-frame yank on the gun basis (and
+   * therefore on the laser) that the eased path immediately undid. Taking 0.09s
+   * off the clock produces the same recovery through the existing ease. */
+  stableT-=0.09f; if(stableT<0)stableT=0;
   sfx(V_SHOT);
   /* a round is never wasted: even an uncharged pistol carries point-blank
    * reach, so spending the ammo always buys you something */
@@ -1934,6 +2402,12 @@ static void fire(void){
 }
 static void katana(void){
   if(swingCD>0||swingT>0)return;
+  /* Drawing the blade lowers the gun. ADS and the katana are the same hand, and
+   * without this you could hold RMB to full zoom — camera inside the skull, near
+   * plane pulled to 0.035 — and then swing a 1.05-unit blade whose centre passes
+   * 6cm in front of the lens. The ads target below also gates on the blade, so
+   * the two cannot re-enter each other during the follow-through. */
+  adsHold=0;
   swingT=0.0001f; swingCD=0.5f; actT=0.26f;
   sfx(V_SWING);
 }
@@ -2081,7 +2555,16 @@ static void update_boss(Enemy*e,float wdt){
   float beatT  = e->bphase==2?2.6f:3.0f;
   int   resting= fmodf(e->state_t,beatT) > beatT-(e->bphase==2?0.45f:0.65f);
 
-  e->yaw=atan2f(dx,-dz);
+  /* Eased, not assigned. Every other pose channel on Enemy is a follower —
+   * moveb 8/s, fwdb/latb 6/s, headYaw 6/s, flare 7/s, armp 8/s — and yaw, the
+   * one the entire silhouette hangs off, was a hard atan2. Sprint past an agent
+   * and its body rotated 150 degrees in a frame while its arms, coat and head
+   * look all lagged their own rates: the figure visibly sheared. Worse, headYaw's
+   * target is a DELTA from yaw, so a snap flipped its sign and the skull then
+   * counter-swept for a quarter second chasing a body that had already arrived.
+   * The boss turns slowly in the air so a leap commits to its direction. */
+  { int inAir=(e->y>ground_h(e->x,e->z,e->y)+0.05f)||e->vy>0.01f;
+    e->yaw=angto(e->yaw, atan2f(dx,-dz), wdt*(inAir?1.5f:5.0f)); }
   /* stride drivers: moveb is a smoothed 0..1 walk blend, anim the gait phase —
      its cadence rises with ground speed so the legs/arms read the movement */
   float spd2=sqrtf(e->vx*e->vx+e->vz*e->vz);
@@ -2203,13 +2686,13 @@ static void update_boss(Enemy*e,float wdt){
 static void update_enemies(float wdt){
   /* aim tokens: only a few agents may draw on you at once, so dense
    * sectors stay a readable bullet hell instead of a firing squad */
-  float diff=(float)curlevel;
+  float diff=(float)LEVELS[curlevel].tier;
   float moveMul=1.0f+0.10f*diff;
   float aimTime=0.50f-0.07f*diff;
   float coolBase=0.70f-0.08f*diff;
   float shotMul=1.0f+0.10f*diff;
   float lungeWind=0.32f-0.045f*diff;
-  int maxAim=4+(curlevel>=2);
+  int maxAim=4+(LEVELS[curlevel].tier>=2);
   int aimers=0;
   for(int i=0;i<nen;i++) if(en[i].state==1&&en[i].type!=2)aimers++; /* boss leaps reuse state 1 */
   for(int i=0;i<nen;i++){
@@ -2217,15 +2700,36 @@ static void update_enemies(float wdt){
     if(e->type==2){ if(e->state!=4)update_boss(e,wdt); continue; }
     if(e->flash>0)e->flash-=wdt;
     /* velocity estimate for the Doppler tint */
-    if(wdt>1e-4f){ e->vx=(e->x-e->lx)/wdt; e->vz=(e->z-e->lz)/wdt; }
+    /* 1e-3, not 1e-4: this is a finite difference divided by wdt, and wdt goes
+     * to ~3e-4 at MINTS. Float noise in a coordinate of magnitude 40 then becomes
+     * ~1% velocity noise, which lands straight in the stride amplitude — foot
+     * jitter in exactly the frozen pose the player stares at longest. */
+    if(wdt>1e-3f){ e->vx=(e->x-e->lx)/wdt; e->vz=(e->z-e->lz)/wdt; }
     e->lx=e->x; e->lz=e->z;
     if(e->state==4)continue;
-    /* settle onto whatever floor is underfoot (stairs, platforms) */
-    e->y=toward(e->y, ground_h(e->x,e->z,e->y), wdt*10.0f);
+    /* settle onto whatever floor is underfoot (stairs, platforms). Stepping UP
+     * is an eased glide — that is what makes stairs read smoothly — but stepping
+     * OFF is a real fall on the boss's gravity, so leaving a train roof arcs
+     * instead of gliding down like an elevator. */
+    { float gh=ground_h(e->x,e->z,e->y);
+      if(e->y > gh+0.03f){ e->vy-=20.0f*wdt; e->y+=e->vy*wdt;
+                           if(e->y<=gh){ e->y=gh; e->vy=0; } }
+      else { e->y=toward(e->y,gh,wdt*10.0f); e->vy=0; } }
     /* animation blends, fed from real velocity so they're honest in every
      * state: walk amount + local move direction (forward vs lateral) */
     float sp2=sqrtf(e->vx*e->vx+e->vz*e->vz);
     e->moveb=toward(e->moveb, clampf(sp2/2.2f,0,1), wdt*8.0f);
+    /* Attack-instant, release-eased speed. The stride's HALF-WIDTH is driven by
+     * speed, and speed is a one-frame finite difference — so the frame an agent
+     * stopped (entering the aim state stops it dead) both feet teleported to
+     * directly under its hips and the knees kicked as the IK re-converged.
+     * moveb was already smoothed but only multiplies the swing-foot LIFT, never
+     * the horizontal sweep that owns the pose. Rising edge passes through
+     * untouched, so the cadence law still cancels travel exactly and the planted
+     * foot does not skate; falling edge trails ~0.14s and reads as weight
+     * settling. Must feed the phase RATE and the half-stride both, or the
+     * cancellation breaks. */
+    e->spdS = sp2>e->spdS ? sp2 : toward(e->spdS,sp2,wdt*7.0f);
     if(sp2>0.1f){
       float ivx=e->vx/sp2, ivz=e->vz/sp2;
       e->fwdb=toward(e->fwdb, ivx*sinf(e->yaw)-ivz*cosf(e->yaw), wdt*6.0f);
@@ -2236,10 +2740,15 @@ static void update_enemies(float wdt){
      * now stops walking on the spot, and the planted foot in draw_agent's IK
      * tracks the floor. Same rate law as the avatar's bobT (see draw_player):
      * phase rate 4.65/unit pairs with a 0.33 half-stride to cancel skate. */
-    e->anim += wdt*(0.9f + 4.65f*sp2);
+    e->anim += wdt*(0.9f + 4.65f*e->spdS);
     e->flare=toward(e->flare, e->state==1? sstep(e->armp):0.0f,
                     wdt*(e->state==1?7.0f:3.5f));
     if(e->recoil>0){ e->recoil-=wdt*3.5f; if(e->recoil<0)e->recoil=0; }
+    /* Lunge follow-through. On the frame the striker left state 3 its arm went
+     * from 1.85 rad to 0 and its torso from 0.62 to 0 — both in one frame, every
+     * single lunge. 3.2/s recovers in 0.31s, inside the cooldown, so the arm is
+     * always home before the next advance. */
+    if(e->lunRel>0){ e->lunRel-=wdt*3.2f; if(e->lunRel<0)e->lunRel=0; }
     if(e->mzT>0){ e->mzT-=wdt; if(e->mzT<0)e->mzT=0; }
     /* the gun arm eases down in every state that isn't actively aiming —
      * state 1 overwrites this absolutely each frame. The LOS-abort path
@@ -2263,7 +2772,7 @@ static void update_enemies(float wdt){
     float spd = (e->type==1?4.4f:2.6f)*moveMul;
     switch(e->state){
       case 0:{ /* advance / reposition */
-        e->yaw=atan2f(dx,-dz);
+        e->yaw=angto(e->yaw, atan2f(dx,-dz), wdt*8.0f);   /* patrol turn ~0.13s */
         float mx=0,mz=0;
         if(e->type==1||!see||d>13.0f){ mx=dx/d; mz=dz/d; }
         else if(d<4.0f){ mx=-dx/d; mz=-dz/d; }
@@ -2276,14 +2785,14 @@ static void update_enemies(float wdt){
           move_circ(&e->x,&e->z,sinf(a)*spd*wdt,-cosf(a)*spd*wdt,0.32f,e->y);
         }
         /* never walk off a high edge (train roofs, the mezzanine) */
-        if(e->y-ground_h(e->x,e->z,e->y) > 0.65f){ e->x=ox; e->z=oz; }
+        if(e->y-ground_h(e->x,e->z,e->y) > AGENT_DROP){ e->x=ox; e->z=oz; }
         e->state_t+=wdt;
         if(e->type==0){ if(see&&d<15.0f&&d>3.0f&&e->state_t>0&&aimers<maxAim){
                           e->state=1; e->state_t=0; aimers++; } }
         else          { if(d<1.7f&&fabsf(py-e->y)<1.2f&&e->state_t>0){ e->state=3; e->state_t=0; } }
       } break;
       case 1: /* aim: eyes flare, arm rises */
-        e->yaw=atan2f(dx,-dz);
+        e->yaw=angto(e->yaw, atan2f(dx,-dz), wdt*13.0f);  /* aim must be crisp  */
         e->state_t+=wdt;
         e->armp=clampf(e->state_t/0.25f,0,1);
         if(!see){ e->state=0; e->state_t=0; break; }
@@ -2320,15 +2829,19 @@ static void update_enemies(float wdt){
         if(e->state_t>0){ e->state=0; e->state_t=0; }
         break;
       case 3: /* striker lunge: wind up, then hurl the body through the blow */
-        e->yaw=atan2f(dx,-dz);
+        /* Slow on purpose: an infinite turn rate made the lunge a homing missile
+         * with no dodge window. The root motion below now follows e->yaw rather
+         * than the live bearing, so the striker COMMITS and a sidestep beats it
+         * — the counterplay the 0.18s follow-through was written for. */
+        e->yaw=angto(e->yaw, atan2f(dx,-dz), wdt*6.0f);
         e->state_t+=wdt;
         if(e->state_t>=lungeWind){
           /* root motion through the strike: the throw pose used to play out
            * at a standstill — now the body carries the blow. Same edge guard
            * as the walk, so a dash never strands an agent off a roof. */
           float ox=e->x,oz=e->z;
-          move_circ(&e->x,&e->z, dx/d*7.0f*wdt, dz/d*7.0f*wdt, 0.32f, e->y);
-          if(e->y-ground_h(e->x,e->z,e->y) > 0.65f){ e->x=ox; e->z=oz; }
+          move_circ(&e->x,&e->z, sinf(e->yaw)*7.0f*wdt, -cosf(e->yaw)*7.0f*wdt, 0.32f, e->y);
+          if(e->y-ground_h(e->x,e->z,e->y) > AGENT_DROP){ e->x=ox; e->z=oz; }
           if(!e->struck){
             float ndx=px-e->x, ndz=pz-e->z, nd=sqrtf(ndx*ndx+ndz*ndz);
             if(nd<2.0f && fabsf(py-e->y)<1.3f)hurt_player(26);
@@ -2339,7 +2852,7 @@ static void update_enemies(float wdt){
          * which made draw_agent's forward-thrust pose unreachable — every lunge
          * you ever saw was pure wind-up. Hold the state through a short
          * follow-through so the blow itself reads. */
-        if(e->state_t>lungeWind+0.18f){ e->state=2;
+        if(e->state_t>lungeWind+0.18f){ e->lunRel=1.0f; e->state=2;
           e->state_t=0.4f-(coolBase+frand()*0.5f); e->struck=0; }
         break;
     }
@@ -2350,6 +2863,57 @@ static void update_enemies(float wdt){
 }
 
 /* ---------------------------------------------------------------- drawing */
+/* ------------------------------------------------------------ frustum culling
+ * The only visibility test in this file used to be radial XZ distance, so at a
+ * 102-degree horizontal FOV roughly two thirds of the agents inside the 38-unit
+ * draw disc were BEHIND the camera and drawn in full — 34 shapes and ~125 GL
+ * calls each, plus a set_lights selection, twice (mirror pass and upright).
+ *
+ * Gribb-Hartmann: the six clip planes fall straight out of the rows of
+ * projection*modelview, which fixed-function GL will just hand us. Built once
+ * per frame, right after the view matrix is set. */
+static float frP[6][4];
+static int cullTested=0, cullSkipped=0;   /* smoke reports the cull's actual yield */
+static void frustum_build(void){
+  float p[16],m[16],c[16];
+  glGetFloatv(GL_PROJECTION_MATRIX,p);
+  glGetFloatv(GL_MODELVIEW_MATRIX,m);
+  /* GL matrices are column-major: element (row r, col k) is at [k*4+r]. */
+  for(int col=0;col<4;col++)for(int r=0;r<4;r++){
+    float s=0; for(int k=0;k<4;k++) s+=p[k*4+r]*m[col*4+k];
+    c[col*4+r]=s;
+  }
+  #define ROW(r) c[0*4+(r)],c[1*4+(r)],c[2*4+(r)],c[3*4+(r)]
+  float rw[4]={ROW(3)}, rx[4]={ROW(0)}, ry[4]={ROW(1)}, rz[4]={ROW(2)};
+  #undef ROW
+  for(int i=0;i<4;i++){
+    frP[0][i]=rw[i]+rx[i];  frP[1][i]=rw[i]-rx[i];   /* left  / right */
+    frP[2][i]=rw[i]+ry[i];  frP[3][i]=rw[i]-ry[i];   /* bottom/ top   */
+    frP[4][i]=rw[i]+rz[i];  frP[5][i]=rw[i]-rz[i];   /* near  / far   */
+  }
+  for(int j=0;j<6;j++){
+    float l=sqrtf(frP[j][0]*frP[j][0]+frP[j][1]*frP[j][1]+frP[j][2]*frP[j][2]);
+    if(l>1e-9f){ frP[j][0]/=l; frP[j][1]/=l; frP[j][2]/=l; frP[j][3]/=l; }
+  }
+}
+/* conservative: a sphere is kept if it is inside or straddling every plane */
+static int frustum_sphere(float x,float y,float z,float r){
+  cullTested++;
+  for(int j=0;j<6;j++)
+    if(frP[j][0]*x+frP[j][1]*y+frP[j][2]*z+frP[j][3] < -r){ cullSkipped++; return 0; }
+  return 1;
+}
+/* The mirror pass draws figures y-flipped about the floor, so a figure whose
+ * upright sphere is off screen may still have a visible reflection (and vice
+ * versa). Test the reflected sphere for that pass. */
+static int frustum_sphere_m(float x,float y,float z,float r,int mirrored){
+  return frustum_sphere(x, mirrored? -y : y, z, r);
+}
+
+/* figure bounding sphere: centre and radius by type, so one place decides it */
+static void fig_sphere(const Enemy*e,float*cy,float*r){
+  if(e->type==2){ *cy=e->y+2.3f; *r=3.2f; } else { *cy=e->y+1.0f; *r=1.35f; }
+}
 static int refl=0;   /* mirror pass: flip Y of every model transform */
 static void set_uM(const float*m,float tx,float ty,float tz){
   if(refl){ float f[9]; memcpy(f,m,36); f[1]=-f[1]; f[4]=-f[4]; f[7]=-f[7];
@@ -2481,8 +3045,13 @@ static void wedge_sh(float sx,float sy,float sz){
 /* shader-lit tapered cylinder along local Y, centred. r0=bottom r1=top radius,
  * seg sides. ONE normal per facet (SUPERHOT cut): limbs read as crystal prisms,
  * each plane catching its own band of light. */
-static void cyl_sh(float r0,float r1,float h,int seg){
-  int pc=prim_open(1,r0,r1,h,seg,0); if(pc==1)return;
+/* caps: bit0 = bottom disc, bit1 = top disc. Every limb joint is buried inside a
+ * bead, a torso, a hand or a foot, so those discs are pure interior geometry —
+ * and they were HALF of every segment's triangles (seg side tris + seg per cap).
+ * prim_open's key is (type,a,b,c,seg,ring) and cyl_sh only ever passed ring=0,
+ * so the flag rides along for free without splitting the display-list cache. */
+static void cyl_shc(float r0,float r1,float h,int seg,int caps){
+  int pc=prim_open(1,r0,r1,h,seg,caps); if(pc==1)return;
   float y0=-h*0.5f,y1=h*0.5f,dr=r1-r0;
   float nl=sqrtf(h*h+dr*dr); if(nl<1e-6f)nl=1;
   glBegin(GL_TRIANGLES); glTexCoord2f(0.5f,0.5f);
@@ -2494,14 +3063,15 @@ static void cyl_sh(float r0,float r1,float h,int seg){
     glNormal3f(cosf(am)*h/nl,-dr/nl,sinf(am)*h/nl);
     glVertex3f(bx0,y0,bz0); glVertex3f(bx1,y0,bz1); glVertex3f(tx1,y1,tz1);
     glVertex3f(bx0,y0,bz0); glVertex3f(tx1,y1,tz1); glVertex3f(tx0,y1,tz0);
-    if(r0>1e-4f){ glNormal3f(0,-1,0);
+    if((caps&1)&&r0>1e-4f){ glNormal3f(0,-1,0);
       glVertex3f(0,y0,0); glVertex3f(bx1,y0,bz1); glVertex3f(bx0,y0,bz0); }
-    if(r1>1e-4f){ glNormal3f(0,1,0);
+    if((caps&2)&&r1>1e-4f){ glNormal3f(0,1,0);
       glVertex3f(0,y1,0); glVertex3f(tx0,y1,tz0); glVertex3f(tx1,y1,tz1); }
   }
   glEnd();
   if(pc==2)glEndList();
 }
+static void cyl_sh(float r0,float r1,float h,int seg){ cyl_shc(r0,r1,h,seg,3); }
 /* one ellipsoid position (normal is emitted per patch, not per vertex) */
 static void spos(float rx,float ry,float rz,float ph,float th){
   glVertex3f(rx*cosf(ph)*cosf(th), ry*sinf(ph), rz*cosf(ph)*sinf(th));
@@ -2519,8 +3089,15 @@ static void sphere_sh(float rx,float ry,float rz,int seg,int ring){
       float nx=x/(rx*rx),ny=y/(ry*ry),nz=z/(rz*rz);
       float il=1.0f/sqrtf(nx*nx+ny*ny+nz*nz+1e-9f);
       glNormal3f(nx*il,ny*il,nz*il);
-      spos(rx,ry,rz,p0,a0); spos(rx,ry,rz,p1,a0); spos(rx,ry,rz,p1,a1);
-      spos(rx,ry,rz,p0,a0); spos(rx,ry,rz,p1,a1); spos(rx,ry,rz,p0,a1);
+      /* At the poles both p0 (or both p1) samples collapse to the same point, so
+       * one of the two triangles is degenerate — seg wasted triangles per pole,
+       * 2*seg per sphere, and there are seven of these on every figure. Emit a
+       * fan there instead of a quad. */
+      int lo=cosf(p0)<1e-5f, hi=cosf(p1)<1e-5f;
+      if(!lo){ spos(rx,ry,rz,p0,a0); spos(rx,ry,rz,p1,a1); spos(rx,ry,rz,p0,a1); }
+      if(!hi){ spos(rx,ry,rz,p0,a0); spos(rx,ry,rz,p1,a0); spos(rx,ry,rz,p1,a1); }
+      if(lo){  spos(rx,ry,rz,p0,a0); spos(rx,ry,rz,p1,a0); spos(rx,ry,rz,p1,a1); }
+      else if(hi){ spos(rx,ry,rz,p0,a0); spos(rx,ry,rz,p1,a1); spos(rx,ry,rz,p0,a1); }
     }
   }
   glEnd();
@@ -2534,10 +3111,13 @@ static void put(const float*M,float bx,float by,float bz,float ax,float ay,float
 }
 /* draw one tapered limb segment hanging off joint (jx,jy,jz) in basis L: bind at
  * the centre drop, emit the cylinder, and report the next joint at the end drop. */
+/* A limb segment never shows either end: the proximal end is inside a torso or a
+ * joint bead, the distal end inside the next bead, a hand or a foot. So it draws
+ * with caps off. */
 static void limb_seg(const float*L,float jx,float jy,float jz,float cdrop,
                      float r0,float r1,float h,int seg,float edrop,
                      float*nx,float*ny,float*nz){
-  put(L,jx,jy,jz,0,cdrop,0); cyl_sh(r0,r1,h,seg);
+  put(L,jx,jy,jz,0,cdrop,0); cyl_shc(r0,r1,h,seg,0);
   float e[3]; m3v(L,0,edrop,0,e); *nx=jx+e[0]; *ny=jy+e[1]; *nz=jz+e[2];
 }
 /* orthonormal basis (col-major) whose local -Y axis points along (dx,dy,dz):
@@ -2573,13 +3153,38 @@ static void ik2(float hx,float hy,float hz,float tx,float ty,float tz,
 static void pistol_sh(const float*W,float gx,float gy,float gz,int ammo){
   float o[3],M2[9],RX[9];
   tintf(0.025f,0.030f,0.032f);
+  /* The slide is a chamfered box, not a wedge. wedge_sh tapers inward toward +Y,
+   * so the old slide was NARROWER on top than at the bottom — the opposite of a
+   * real one, and it read as a doorstop. bevbox's cut edges also catch uRim,
+   * which is the whole faceted-crystal language of these models. */
   m3v(W,0,-0.012f,-0.18f,o);
-  set_uM(W,gx+o[0],gy+o[1],gz+o[2]); wedge_sh(0.060f,0.060f,0.34f);
+  set_uM(W,gx+o[0],gy+o[1],gz+o[2]); bevbox_sh(0.058f,0.056f,0.34f,0.011f);
   m3v(W,0,-0.010f,-0.38f,o);
   set_uM(W,gx+o[0],gy+o[1],gz+o[2]); box_sh(0.050f,0.045f,0.045f);
   m3rotX(RX,-0.58f); m3mul(M2,W,RX);
   m3v(W,0,-0.145f,-0.020f,o);
   set_uM(M2,gx+o[0],gy+o[1],gz+o[2]); wedge_sh(0.058f,0.210f,0.078f);
+  /* trigger guard: one rotated chamfered box. Cheap, and it is most of what
+   * separates a pistol silhouette from a rectangle with a handle. */
+  { float GG[9],RG[9]; m3rotX(RG,0.22f); m3mul(GG,W,RG);
+    m3v(W,0,-0.062f,-0.078f,o);
+    set_uM(GG,gx+o[0],gy+o[1],gz+o[2]); bevbox_sh(0.046f,0.011f,0.072f,0.004f); }
+  /* IRON SIGHTS. The entire ADS feature culminates in this object filling the
+   * middle of a 26-degree frame about 40cm from the near plane, and it had no
+   * sights at all — nothing to align, which is what an aim-down-sights blend is
+   * FOR. Emissive so they read against a near-black slide. The front post sits
+   * 0.26 further from the eye than the rear notch, which is enough parallax at
+   * this scale to read as alignment; and because player_arm_r re-seats the whole
+   * grip basis onto the look ray with m3align, the sights are automatically on
+   * the round's real path. That is the game's stated guarantee, made visible. */
+  glUniform1f(uEmis,0.55f); tintf(0.12f,0.95f,0.42f);
+  m3v(W,0,0.040f,-0.315f,o);                          /* front post, at the muzzle */
+  set_uM(W,gx+o[0],gy+o[1],gz+o[2]); box_sh(0.008f,0.030f,0.010f);
+  for(int q=-1;q<=1;q+=2){                            /* rear notch: two blades    */
+    m3v(W,q*0.017f,0.038f,-0.055f,o);
+    set_uM(W,gx+o[0],gy+o[1],gz+o[2]); box_sh(0.009f,0.026f,0.014f);
+  }
+  tintf(0.025f,0.030f,0.032f);
   glUniform1f(uEmis,1.0f);
   int pip= ammo<6?ammo:6;
   for(int q=0;q<6;q++){
@@ -2601,7 +3206,8 @@ static void pistol_sh(const float*W,float gx,float gy,float gz,int ammo){
  * twin clawed arms, and a wide skull set with a cluster of eyes that burn from
  * emerald toward furnace-red as its phases escalate. */
 static void draw_boss(Enemy*e){
-  if(e->state==4)return;
+  float die = e->state==4 ? 1.0f-clampf(e->dieT/0.30f,0,1) : 0.0f;
+  if(e->state==4 && e->dieT<=0)return;
   primArm=1;
   float by=e->y;
   float M[9],R[9],X[9];
@@ -2613,6 +3219,9 @@ static void draw_boss(Enemy*e){
   lean += -0.34f*e->armp + 0.45f*crouch;
   if(e->state==3) lean=0.34f;                           /* melee lunge overrides */
   m3rotY(R,-e->yaw); m3rotX(X,lean); m3mul(M,R,X);
+  /* the collapse: squash down, bulge out. 0.30s for a 4.5-unit body, so the
+     OVERLORD comes apart over a beat rather than blinking into confetti. */
+  if(die>0) m3scl(M,1.0f+0.55f*die,1.0f-0.45f*die,1.0f+0.55f*die);
 
   float vr=radial_v(e->x,e->z,e->vx,e->vz);
   float dr,dg,db; dopp_rgb(vr,&dr,&dg,&db);
@@ -2627,6 +3236,11 @@ static void draw_boss(Enemy*e){
   tintf(sr+fl,sg+fl*0.6f,sb+fl*0.7f);
   glUniform1f(uRim,1.0f+0.4f*ph);
   rimf( 0.85f+0.65f*ph, 0.22f, 1.15f-0.45f*ph);
+  /* the collapse blows the body out toward white as it comes apart, so the
+   * shards look like they were shed by it rather than swapped in for it */
+  float figDim0=figDim;              /* figDim belongs to the caller: restored below */
+  if(die>0){ glUniform1f(uEmis,0.35f+0.90f*die); figDim*=1.0f+2.2f*die; }
+  if(die>0){ glUniform1f(uEmis,0.35f+0.90f*die); figDim*=1.0f+2.2f*die; }
   float breath=1.0f+0.03f*sinf(wtime*2.2f+e->bphase);
 
   /* legs: two heavy two-bone limbs. A hip swing + knee bend drive a stride that
@@ -2642,10 +3256,15 @@ static void draw_boss(Enemy*e){
     float hx=e->x+hip[0], hy=by+1.65f-0.30f*crouch, hz=e->z+hip[2];
     float UL[9],RX[9],RZ[9],S[9];
     m3rotX(RX, sw+tuck); m3rotZ(RZ, li*0.14f); m3mul(S,RX,RZ); m3mul(UL,M,S);
-    float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.46f, 0.30f,0.24f,0.95f,10, -0.92f, &kx,&ky,&kz);
-    set_uM(UL,kx,ky,kz); sphere_sh(0.24f,0.24f,0.24f,9,6);
+    float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.46f, 0.30f,0.25f,0.95f,7, -0.92f, &kx,&ky,&kz);
+    /* The bead bridges the two bones instead of sitting on them like a bead on a
+     * string: it is 20% wider than either bone end, elongated ALONG the limb, and
+     * bound in the LIMB basis so its facets share the bones' orientation. Bound
+     * in the body basis (as all of these were) you saw three unrelated facet
+     * patterns meeting at a point the moment the joint bent. */
+    set_uM(UL,kx,ky,kz); sphere_sh(0.30f,0.34f,0.30f,6,4);
     float LL[9],RK[9]; m3rotX(RK, sw+kb+tuck*0.9f); m3mul(S,RK,RZ); m3mul(LL,M,S);
-    float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.42f, 0.22f,0.15f,0.86f,10, -0.84f, &ax,&ay,&az);
+    float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.42f, 0.25f,0.15f,0.86f,7, -0.84f, &ax,&ay,&az);
     put(LL,ax,ay,az,0,-0.04f,-0.22f); wedge_sh(0.34f,0.18f,0.55f);
   }
   /* thorax: barrel waist swelling into a bulbous chest. Everything above the
@@ -2654,7 +3273,7 @@ static void draw_boss(Enemy*e){
    * and down instead of rotating each part around its own fixed point. */
   float pvY=by+1.65f;
   float Tt[9]; memcpy(Tt,M,36); m3scl(Tt,breath,1.0f,breath*0.85f);
-  glUniform3f(uNSc,1.0f/breath,1,1.0f/(breath*0.85f));
+  glUniform3f(uNSc,breath,1,breath*0.85f);
   { float o[3]; m3v(M,0,0.40f,0,o);
     set_uM(Tt,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.55f,0.72f,1.15f,10);
   { float o[3]; m3v(M,0,1.40f,0,o);
@@ -2677,17 +3296,21 @@ static void draw_boss(Enemy*e){
     float reach=e->state==3?(ai==1?1.25f:0.30f):0.0f;
     /* up: down-forward base, rears up while airborne (armp), then thrust down to
        brace on impact (crouch) so the arms visibly come out of the leap pose */
-    float up=-0.50f-reach-0.85f*e->armp+0.40f*crouch+sw+idle;
+    /* forward-POSITIVE, like the agents and the avatar: m3rotX(+t) swings the
+     * limb toward local -Z, where the skull faces. The old expression was negated
+     * throughout, so "down-and-forward" hung backward and the melee claw hooked
+     * away from the player it was swatting. Mirrored wholesale to keep the tuning. */
+    float up=0.50f+reach+0.85f*e->armp-0.40f*crouch-sw-idle;
     float eb=(e->state==3?0.35f:0.80f);            /* elbow bend                */
     float A[9],F[9],RX[9],RE[9],RZ[9],S[9];
     m3rotZ(RZ,ai*0.26f);
     m3rotX(RX,up);    m3mul(S,RX,RZ); m3mul(A,M,S);
     float sh[3]; m3v(M,ai*0.82f,1.80f,0,sh);
     float shx=e->x+sh[0], shy=pvY+sh[1], shz=e->z+sh[2];
-    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.46f, 0.24f,0.18f,0.95f,10,-0.92f,&ex,&ey,&ez);
-    set_uM(A,ex,ey,ez); sphere_sh(0.20f,0.20f,0.20f,9,6);
-    m3rotX(RE,up-eb); m3mul(S,RE,RZ); m3mul(F,M,S);
-    float wx,wy,wz; limb_seg(F,ex,ey,ez,-0.40f, 0.17f,0.12f,0.85f,10,-0.82f,&wx,&wy,&wz);
+    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.46f, 0.24f,0.19f,0.95f,7,-0.92f,&ex,&ey,&ez);
+    set_uM(A,ex,ey,ez); sphere_sh(0.23f,0.26f,0.23f,6,4);
+    m3rotX(RE,up+eb); m3mul(S,RE,RZ); m3mul(F,M,S);
+    float wx,wy,wz; limb_seg(F,ex,ey,ez,-0.40f, 0.19f,0.12f,0.85f,7,-0.82f,&wx,&wy,&wz);
     for(int c=-1;c<=1;c++){ put(F,wx,wy,wz, c*0.12f,-0.18f,-0.10f); wedge_sh(0.06f,0.10f,0.46f); }
   }
   /* neck + wide skull on a low hunting carriage: the head sits in its own
@@ -2715,6 +3338,7 @@ static void draw_boss(Enemy*e){
   float eyx[5]={-0.30f,-0.15f,0.0f,0.15f,0.30f}, eyy[5]={0.04f,0.11f,0.15f,0.11f,0.04f};
   for(int q=0;q<5;q++){ put(Hh,hcx,hcy,hcz, eyx[q],eyy[q],-0.50f); sphere_sh(0.075f,0.075f,0.05f,7,5); }
   glUniform1f(uEmis,0); glUniform1f(uRim,0);
+  figDim=figDim0;
   primArm=0;
 }
 
@@ -2722,8 +3346,12 @@ static void draw_boss(Enemy*e){
  * Hard V-taper silhouette, flat facet planes, eased motion. Suit tint =
  * charcoal mixed with the Doppler shade of their motion. */
 static void draw_agent(Enemy*e,float dim){
-  if(e->state==4)return;
+  if(e->state==4 && e->dieT<=0)return;
   primArm=1;
+  /* 0 alive -> 1 fully come apart. Squash down and bulge out, and drive the
+   * whole body toward white: the geometry is disintegrating into the shards that
+   * are already flying. uNSc gets the same scale so the normals stay honest. */
+  float die = e->state==4 ? 1.0f-clampf(e->dieT/0.13f,0,1) : 0.0f;
   float M[9],R[9],X[9];
   float by=e->y;
   float walk = sinf(e->anim), armw = cosf(e->anim); /* armw: contralateral arm phase */
@@ -2731,11 +3359,12 @@ static void draw_agent(Enemy*e,float dim){
    * tracks the AI's own difficulty-scaled lungeWind instead of the hardcoded
    * 0.32 that used to sit exactly ON the state change, and both halves ease
    * rather than snapping between two fixed leans. */
-  float lunw=0.32f-0.045f*(float)curlevel; if(lunw<0.08f)lunw=0.08f;
+  float lunw=0.32f-0.045f*(float)LEVELS[curlevel].tier; if(lunw<0.08f)lunw=0.08f;
+  float lrel  = sstep(e->lunRel);          /* 1 at the blow, eased to 0 after   */
   float lwind = e->state==3 ? sstep(clampf(e->state_t/lunw,0,1)) : 0.0f;
-  float lhit  = e->state==3 ? sstep(clampf((e->state_t-lunw)/0.18f,0,1)) : 0.0f;
+  float lhit  = e->state==3 ? sstep(clampf((e->state_t-lunw)/0.18f,0,1)) : lrel;
   float lean = e->state==3 ? (-0.38f*lwind*(1.0f-lhit) + 0.62f*lhit)
-             : (e->type==1&&e->state==0 ? 0.18f : 0.0f);
+             : (0.62f*lrel + (e->type==1&&e->state==0 ? 0.18f*(1.0f-lrel) : 0.0f));
   lean -= e->recoil*e->recoil*0.10f;            /* fire recoil rocks the torso */
   /* Enemy AI yaw uses gameplay/shot direction (sin(+yaw), -cos(yaw)), while
    * m3rotY() maps the model's local -Z forward using the opposite handedness.
@@ -2748,6 +3377,7 @@ static void draw_agent(Enemy*e,float dim){
   float Zi[9],Si[9];
   m3rotY(R,-e->yaw); m3rotZ(Zi,idlew); m3rotX(X,lean);
   m3mul(Si,Zi,X); m3mul(M,R,Si);
+  if(die>0){ float sq=1.0f-0.45f*die, sw=1.0f+0.55f*die; m3scl(M,sw,sq,sw); }
 
   float vr=radial_v(e->x,e->z,e->vx,e->vz);
   float dr,dg,db; dopp_rgb(vr,&dr,&dg,&db);
@@ -2772,8 +3402,9 @@ static void draw_agent(Enemy*e,float dim){
     fr_=fl+lk; fg_=(fl+lk)*0.13f; fb_=(fl+lk)*0.08f;
   }
   float tr_=sr+fr_, tg_=sg+fg_, tb_=sb+fb_;
-  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f); glUniform1f(uEmis,(locked?0.65f:0.12f)+fl);
-  tintf(tr_,tg_,tb_);
+  glUniform1f(uBump,0); glUniform1f(uGloss,0.6f);
+  glUniform1f(uEmis,(locked?0.65f:0.12f)+fl+0.88f*die);
+  tintf(tr_+2.4f*die,tg_+2.4f*die,tb_+2.4f*die);
   /* crystalline rim: edge glow shaded by the agent's own Doppler — closing
    * agents flare blue, receding red — so the silhouette carries the mechanic.
    * Lock paints a hot red rim instead. */
@@ -2786,15 +3417,16 @@ static void draw_agent(Enemy*e,float dim){
    * foot's backward sweep exactly cancels the agent's travel, so the old FK
    * swing's skate is gone, and strafing reads as side-steps for free because
    * the stride runs along velocity rather than facing. */
-  float asp=sqrtf(e->vx*e->vx+e->vz*e->vz);
-  float arun=clampf(asp/3.2f,0,1)*e->moveb;
+  float asp=sqrtf(e->vx*e->vx+e->vz*e->vz);   /* live, for the stride DIRECTION */
+  float aspS=e->spdS;                         /* eased, for its AMPLITUDE       */
+  float arun=clampf(aspS/3.2f,0,1)*e->moveb;
   /* Half-stride solved from the cadence law rather than tuned at one speed.
    * The stance foot sweeps 2*half per half cycle in pi/rate seconds, so
    * half = pi*sp/(2*rate) cancels the travel EXACTLY — and agents walk at
    * four different speeds (advance, strafe, cooldown drift, striker charge),
    * which is precisely where a single tuned constant skates. Tends to the
    * avatar's authored 0.338 at speed, and to zero when stopped. */
-  float ahalf=0.5f*PI*asp/(0.9f+4.65f*asp); if(ahalf>0.36f)ahalf=0.36f;
+  float ahalf=0.5f*PI*aspS/(0.9f+4.65f*aspS); if(ahalf>0.36f)ahalf=0.36f;
   float fdx,fdz;
   if(asp>0.2f){ fdx=e->vx/asp; fdz=e->vz/asp; }
   else { fdx=sinf(e->yaw); fdz=-cosf(e->yaw); }
@@ -2819,10 +3451,10 @@ static void draw_agent(Enemy*e,float dim){
     else if(dd<minr&&dd>1e-4f){ float k=minr/dd; tgx=hx+dxv*k;tgy=hy+dyv*k;tgz=hz+dzv*k; }
     float kx,ky,kz; ik2(hx,hy,hz,tgx,tgy,tgz,L1,L2,polex,polez,&kx,&ky,&kz);
     float UB[9]; aim_basis(kx-hx,ky-hy,kz-hz,UB);
-    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.105f,0.082f,L1*1.04f,10, -L1, &jx,&jy,&jz);
-    set_uM(M,jx,jy,jz); sphere_sh(0.085f,0.085f,0.085f,9,6);    /* knee cap */
+    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.105f,0.084f,L1*1.04f,7, -L1, &jx,&jy,&jz);
+    set_uM(UB,jx,jy,jz); sphere_sh(0.101f,0.121f,0.101f,6,4);   /* knee */
     float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
-    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.078f,0.052f,L2*1.04f,10, -L2, &ax,&ay,&az);
+    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.084f,0.052f,L2*1.04f,7, -L2, &ax,&ay,&az);
     float FF[9],FR[9],FX[9]; m3rotY(FR,-e->yaw);
     m3rotX(FX,0.30f*swing*arun);     /* light dorsiflexion through the swing */
     m3mul(FF,FR,FX);
@@ -2837,15 +3469,25 @@ static void draw_agent(Enemy*e,float dim){
    * (and the idle weight shift) translates the chest and head instead of
    * spinning each piece in place around its own fixed world point */
   float pvY=by+1.02f;
-  glUniform3f(uNSc,1,1,1.0f/0.60f);          /* correct normals under the slab squash */
+  glUniform3f(uNSc,1,1,0.60f);          /* correct normals under the slab squash */
   { float o[3]; m3v(M,0,0,0,o);
     set_uM(Mt,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.185f,0.165f,0.26f,9);
   float Mb[9]; memcpy(Mb,Mt,36); m3scl(Mb,br,1.0f,br);
   { float o[3]; m3v(M,0,0.38f,0,o);
     set_uM(Mb,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_sh(0.175f,0.27f,0.54f,9);
+/* Trapezius yoke. The chest ended in a flat horizontal disc 0.54 across and the
+ * neck was a 0.11 stick poking out of it, with nothing in between — from any
+ * three-quarter or elevated angle (which is most of this game, given the
+ * platforms) that is the definitive "stacked cans" read, on the part of the
+ * figure the eye goes to first. A cone from the chest radius down to the neck
+ * radius gives a ~46 degree shoulder slope: the silhouette cue for a
+ * broad-shouldered figure in a suit. Shares the squashed/breathing basis, so it
+ * inherits the z-squash and the uNSc normal correction already in flight. */
+  { float o[3]; m3v(M,0,0.615f,0,o);
+    set_uM(Mb,e->x+o[0],pvY+o[1],e->z+o[2]); } cyl_shc(0.255f,0.105f,0.16f,9,0);
   glUniform3f(uNSc,1,1,1);
   /* shoulders: small caps on a wide frame */
-  for(int si=-1;si<=1;si+=2){ put(M,e->x,pvY,e->z,si*0.29f,0.62f,0); sphere_sh(0.085f,0.085f,0.085f,9,6); }
+  for(int si=-1;si<=1;si+=2){ put(M,e->x,pvY,e->z,si*0.29f,0.62f,0); sphere_sh(0.088f,0.088f,0.088f,7,5); }
   /* tie: a darker sliver down the chest */
   tintf(0.02f,0.03f,0.025f);
   put(M,e->x,pvY,e->z, 0,0.40f,-0.132f); bevbox_sh(0.08f,0.42f,0.02f,0.012f);
@@ -2868,8 +3510,9 @@ static void draw_agent(Enemy*e,float dim){
                       : 1.45f*easeOutBack((t-0.22f)/0.78f);
       if(e->state==2) raise=1.45f*sstep(t);           /* eased lowering */
       if(e->state==3) raise=-0.30f*lwind+1.85f*lhit;   /* cock back, then throw */
+      else if(lrel>0.001f) raise = 1.85f*lrel + raise*(1.0f-lrel);  /* ...and recover */
       raise += e->recoil*e->recoil*0.35f;
-    } else raise = e->state==3? -0.30f*lwind+1.85f*lhit : 0.0f;
+    } else raise = e->state==3? -0.30f*lwind+1.85f*lhit : 1.85f*lrel;
     /* idle arm drift, antiphase across the shoulders and offset per agent, so a
      * crowd of waiting agents never breathes in unison. Faded out by moveb and
      * by any raised arm, which owns its own eased motion. */
@@ -2880,12 +3523,20 @@ static void draw_agent(Enemy*e,float dim){
     float sh[3]; m3v(M,ai?0.29f:-0.29f,0.62f,0,sh);
     float shx=e->x+sh[0],shy=pvY+sh[1],shz=e->z+sh[2];
     float A[9],RX[9],RZ[9],S[9];
-    m3rotX(RX,-raise+swA*e->fwdb); m3rotZ(RZ,-swA*e->latb*0.5f);
+    /* SIGN. limb_seg hangs along local -Y, and m3rotX(+t) swings that toward
+     * local -Z — which is the direction the face is drawn and the direction
+     * gameplay fires (update_enemies spawns rounds 0.55 in FRONT). This whole
+     * expression used to be negated, so every raised gun arm reached 180 degrees
+     * BEHIND the agent while its bullets left the front: the aim telegraph, the
+     * drawn pistol and the striker's claw all pointed the wrong way. draw_player
+     * was fixed long ago (see its own note) and the fix never reached the agents.
+     * Negated as a whole, so the stride swing keeps its tuned contralateral pairing. */
+    m3rotX(RX,raise-swA*e->fwdb); m3rotZ(RZ,-swA*e->latb*0.5f);
     m3mul(S,RX,RZ); m3mul(A,M,S);
-    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.072f,0.060f,0.38f,10, -0.37f, &ex,&ey,&ez);
-    set_uM(M,ex,ey,ez); sphere_sh(0.064f,0.064f,0.064f,9,6);   /* elbow cap */
-    float F[9],RE[9]; m3rotX(RE,-raise+swA*e->fwdb-eb); m3mul(S,RE,RZ); m3mul(F,M,S);
-    float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.17f, 0.058f,0.050f,0.36f,10, -0.36f, &hx2,&hy2,&hz2);
+    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.072f,0.062f,0.38f,7, -0.37f, &ex,&ey,&ez);
+    set_uM(A,ex,ey,ez); sphere_sh(0.075f,0.090f,0.075f,6,4);   /* elbow */
+    float F[9],RE[9]; m3rotX(RE,raise-swA*e->fwdb+eb); m3mul(S,RE,RZ); m3mul(F,M,S);
+    float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.17f, 0.062f,0.050f,0.36f,7, -0.36f, &hx2,&hy2,&hz2);
     set_uM(F,hx2,hy2,hz2); wedge_sh(0.072f,0.12f,0.060f);  /* cut mitt */
     if(ai&&e->type==0&&raise>0.05f){ /* pistol in the raised hand */
       tintf(0.03f,0.035f,0.04f);
@@ -2925,15 +3576,62 @@ static void draw_agent(Enemy*e,float dim){
   primArm=0;
 }
 
+/* Body opacity during the ADS transition. There is no threshold that both avoids
+ * clipping the head (which encloses the eye at full zoom) and avoids popping a
+ * headless torso away while the camera is still out on the boom — the camera
+ * passes THROUGH the body on the way in. So dissolve it instead, reusing the
+ * uAlpha the mirrored floor pass already established. */
+static void body_alpha(float a){
+  if(a>=0.999f){ glDisable(GL_BLEND); glUniform1f(uAlpha,1.0f); }
+  else { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
+         glUniform1f(uAlpha,a); }
+}
+/* One avatar arm: upper arm, elbow cap, forearm, cut mitt and the emissive
+ * forearm strip, reporting the solved hand. The pistol arm (posed by the shared
+ * player_arm_r solver) and the loop arms had this exact six-call sequence with
+ * all twelve dimension constants written out twice, verbatim. Leaves the suit
+ * tint and emissive restored, so callers can hang a weapon off the hand. */
+static void avatar_arm(const float*A,const float*F,
+                       float shx,float shy,float shz,float side,int vm,
+                       float*hx,float*hy,float*hz){
+  float ex,ey,ez;
+  /* vm = viewmodel (the camera is inside the head). The elbow ends up about 35cm
+   * from the eye with the arm shouldered, so the upper arm and its cap fill a
+   * third of a zoomed frame with a wall of near-plane geometry. Real viewmodels
+   * show a forearm and a weapon; solve the chain either way so the hand lands in
+   * exactly the same place, just skip drawing the part behind the elbow. */
+  if(!vm){
+    limb_seg(A,shx,shy,shz,-0.18f, 0.068f,0.058f,0.36f,7, -0.35f, &ex,&ey,&ez);
+    set_uM(A,ex,ey,ez); sphere_sh(0.070f,0.084f,0.070f,6,4);   /* elbow */
+  } else {
+    float e[3]; m3v(A,0,-0.35f,0,e); ex=shx+e[0]; ey=shy+e[1]; ez=shz+e[2];
+  }
+  limb_seg(F,ex,ey,ez,-0.16f, 0.058f,0.046f,0.34f,7, -0.33f, hx,hy,hz);
+  set_uM(F,*hx,*hy,*hz); wedge_sh(0.068f,0.110f,0.055f);
+  glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);        /* forearm strip */
+  put(F,ex,ey,ez, side*0.046f,-0.16f,0); box_sh(0.008f,0.20f,0.008f);
+  glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
+}
+
 /* third-person player avatar: compact, sleek, low-poly and readable from
  * behind. The whole figure hangs off a mid-body pivot so the dodge roll can
  * somersault it; the camera never rolls with it. */
 static void draw_player(void){
   primArm=1;
-  PPose P; player_pose(&P);
-  int rolling=P.rolling, blade=P.blade, aimStance=P.aimStance;
+  PPose P=*pose_get();
+  /* bodyA: 1 while hip-firing, dissolving to 0 as the camera enters the head.
+   * Only the weapon arm stays solid — that IS the first-person viewmodel, and
+   * it is posed by the same shared solver the ballistics read, so the sights
+   * cannot disagree with where the round goes.
+   * The band is late on purpose: it has to track where the CAMERA is, not where
+   * the blend is. At 0.55 the eye is still ~1.4 behind the body; by 0.88 it is
+   * 0.37 away and the torso is engulfing the lens, which is exactly when fading
+   * it reads as the camera passing through rather than as the body vanishing. */
+  float bodyA = 1.0f - clampf((ads_amt()-0.55f)/0.33f,0,1);
+  int hideBody = bodyA<=0.01f;
+  int rolling=P.rolling, blade=P.blade;
   float tuck=P.tuck, tk=P.tk, walk=P.walk, armw=P.armw, s=P.s, spd=P.spd,
-        run=P.run, latb=P.latb, absorb=P.absorb,
+        run=P.run, absorb=P.absorb,
         poseYaw=P.poseYaw, pcy=P.pcy;
   float M[9]; memcpy(M,P.M,36);
 
@@ -2942,6 +3640,7 @@ static void draw_player(void){
   glUniform1f(uEmis,0.08f);
   tintf(0.04f,0.05f,0.045f);
   glUniform1f(uRim,0.70f); rimf(0.10f,1.00f,0.42f);  /* emerald crystal edge */
+  body_alpha(bodyA);
 
   /* legs. Walking: 2-bone IK with foot-planting — each foot's stride sweeps
    * backward at exactly the locked cadence, so the planted foot stays put on
@@ -2957,7 +3656,7 @@ static void draw_player(void){
   float polex=-M[6], polez=-M[8];
   { float pl=sqrtf(polex*polex+polez*polez);
     if(pl>1e-4f){ polex/=pl; polez/=pl; } else { polex=0; polez=-1; } }
-  for(int li=0;li<2;li++){
+  for(int li=0;li<2&&!hideBody;li++){
     float side=li?0.14f:-0.14f;
     float hip[3]; m3v(M,side,0.37f*tk,0,hip);
     float hx=px+hip[0], hy=pcy+hip[1], hz=pz+hip[2];
@@ -2969,10 +3668,10 @@ static void draw_player(void){
        * unfold as the avatar comes back to its feet. */
       float hipc=0.30f+1.10f*tuck, knee=0.55f+1.30f*tuck;
       float UL[9],RX[9]; m3rotX(RX,hipc); m3mul(UL,M,RX);
-      float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.22f, 0.10f,0.076f,0.46f,10, -0.44f, &kx,&ky,&kz);
-      set_uM(M,kx,ky,kz); sphere_sh(0.08f,0.08f,0.08f,9,6);
+      float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.22f, 0.10f,0.078f,0.46f,7, -0.44f, &kx,&ky,&kz);
+      set_uM(UL,kx,ky,kz); sphere_sh(0.094f,0.113f,0.094f,6,4);
       float LL[9],RK[9]; m3rotX(RK,hipc+knee); m3mul(LL,M,RK);
-      float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.20f, 0.074f,0.050f,0.42f,10, -0.40f, &ax,&ay,&az);
+      float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.20f, 0.078f,0.050f,0.42f,7, -0.40f, &ax,&ay,&az);
       set_uM(LL,ax,ay,az); wedge_sh(0.12f,0.055f,0.24f);
       continue;
     }
@@ -2987,7 +3686,7 @@ static void draw_player(void){
      * Same law the agents already walk on (see draw_agent). Airborne, the
      * stride collapses and the feet tuck up under the body instead of
      * pedalling a full ground cycle against nothing. */
-    float strideHalf=0.5f*PI*spd/(0.9f+4.65f*spd);
+    float strideHalf=0.5f*PI*pspdS/(0.9f+4.65f*pspdS);
     if(strideHalf>0.36f)strideHalf=0.36f;
     strideHalf*=(1.0f-airB);
     float along=strideHalf*tri, lift=swing*0.14f*run*(1.0f-airB);
@@ -3001,10 +3700,10 @@ static void draw_player(void){
     /* upper leg hip->knee, lower leg knee->ankle; each limb_seg reports its end
      * joint, which we reuse for the next joint and the caps (no recomputation) */
     float UB[9]; aim_basis(kx-hx,ky-hy,kz-hz,UB);
-    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.10f,0.076f,L1*1.04f,10, -L1, &jx,&jy,&jz);
-    set_uM(M,jx,jy,jz); sphere_sh(0.08f,0.08f,0.08f,9,6);   /* knee cap at limb end */
+    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.10f,0.078f,L1*1.04f,7, -L1, &jx,&jy,&jz);
+    set_uM(UB,jx,jy,jz); sphere_sh(0.094f,0.113f,0.094f,6,4);  /* knee */
     float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
-    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.074f,0.050f,L2*1.04f,10, -L2, &ax,&ay,&az);
+    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.078f,0.050f,L2*1.04f,7, -L2, &ax,&ay,&az);
     glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);   /* shin light strip */
     put(LB,jx,jy,jz, li?0.043f:-0.043f,-0.24f,0); box_sh(0.007f,0.22f,0.007f);
     glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
@@ -3017,12 +3716,16 @@ static void draw_player(void){
   }
 
   /* pelvis / jacket: same V-taper language as the agents */
+  if(!hideBody){
   float Mt[9]; memcpy(Mt,M,36); m3scl(Mt,1.0f,1.0f,0.62f);
   tintf(0.03f,0.04f,0.035f);
-  glUniform3f(uNSc,1,1,1.0f/0.62f);
+  glUniform3f(uNSc,1,1,0.62f);
   { float o[3];
     m3v(M,0,0.49f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.175f,0.155f,0.24f,9);
-    m3v(M,0,0.87f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.165f,0.25f,0.50f,9); }
+    m3v(M,0,0.87f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.165f,0.25f,0.50f,9);
+    /* trapezius yoke — see draw_agent. Must sit INSIDE the uNSc=0.62 block: it
+     * shares the squashed basis, so it needs the same normal correction. */
+    m3v(M,0,1.00f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_shc(0.235f,0.095f,0.15f,9,0); }
   glUniform3f(uNSc,1,1,1);
   /* coat tails — the agents' best silhouette trick, now on the avatar: two
    * hanging panels that kick out with the stride */
@@ -3040,33 +3743,40 @@ static void draw_player(void){
   put(M,px,pcy,pz,0,0.49f*tk,-0.112f); box_sh(0.16f,0.012f,0.010f);
   glUniform1f(uEmis,0.08f);
   tintf(0.05f,0.06f,0.055f);
-  for(int si=-1;si<=1;si+=2){ put(M,px,pcy,pz,si*0.27f,1.05f*tk,0); sphere_sh(0.08f,0.08f,0.08f,9,6); }
+  for(int si=-1;si<=1;si+=2){ put(M,px,pcy,pz,si*0.27f,1.05f*tk,0); sphere_sh(0.083f,0.083f,0.083f,7,5); }
+  }   /* !hideBody: pelvis, coat, belt, shoulder caps */
 
   /* shoulders and arms. right arm: pistol carried/aimed via the SHARED solver
    * (player_arm_r — the same transform the laser and bullets read), katana
    * sweep on swing — wind-up across the left shoulder, cut down and across. */
   tintf(0.04f,0.05f,0.045f);
+  body_alpha(1.0f);          /* the weapon arm is the viewmodel: always solid */
   if(!blade){
-    ArmR a; player_arm_r(&P,&a);
-    float ex,ey,ez; limb_seg(a.A,a.sx,a.sy,a.sz,-0.18f, 0.068f,0.056f,0.36f,10, -0.35f, &ex,&ey,&ez);
-    set_uM(M,ex,ey,ez); sphere_sh(0.060f,0.060f,0.060f,9,6);   /* elbow cap */
-    float hx2,hy2,hz2; limb_seg(a.F,ex,ey,ez,-0.16f, 0.054f,0.046f,0.34f,10, -0.33f, &hx2,&hy2,&hz2);
-    set_uM(a.F,hx2,hy2,hz2); wedge_sh(0.068f,0.110f,0.055f);
-    glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);   /* forearm light strip */
-    put(a.F,ex,ey,ez, 0.046f,-0.16f,0); box_sh(0.008f,0.20f,0.008f);
-    glUniform1f(uEmis,0.08f);
+    const ArmR a=*arm_get();
+    float hx2,hy2,hz2;
+    avatar_arm(a.A,a.F,a.sx,a.sy,a.sz,+1.0f,hideBody,&hx2,&hy2,&hz2);
     tintf(0.03f,0.035f,0.04f);
-    pistol_sh(a.GP,a.gx,a.gy,a.gz,pammo);
-    glUniform1f(uEmis,0.08f);
+    /* Shrink the weapon as it becomes a viewmodel. A UNIFORM scale is safe here
+     * in a way a non-uniform one would not be: the fragment shader normalizes
+     * vN, so an even scale leaves every normal (and therefore the lighting) and
+     * the barrel direction exactly as they were — it only trims the bulk of a
+     * model that is genuinely half a metre from the lens. The alternative, a
+     * separate narrower projection for the viewmodel, would break this game's
+     * one real guarantee: that the gun you see IS the gun the bullet leaves. */
+    { float ae=ads_amt(), vs=1.0f-0.30f*ae;
+      float GS[9]; memcpy(GS,a.GP,36); m3scl(GS,vs,vs,vs);
+      pistol_sh(GS,a.gx,a.gy,a.gz,pammo); }
+    glUniform1f(uEmis,0.08f);   /* pistol_sh leaves uEmis at 1.0 for its pips */
     tintf(0.04f,0.05f,0.045f);
   }
   for(int ai=0;ai<2;ai++){
     if(ai&&!blade)continue;            /* drawn above, off the shared solver */
+    /* NB: the `continue` above means ai==1 implies blade==1. That made the whole
+     * pistol-carry branch that used to live here — and PPose.aimStance with it —
+     * unreachable: aimStance is `!rolling && !blade`, so it was provably 0 at
+     * every one of its four uses. The live pistol pose is player_arm_r's. */
     float raise, swYaw=0;
     if(ai){
-      float fr=clampf(fireCD/FIRE_TIME,0,1);
-      raise = aimStance ? (1.18f+0.12f*sstep(fr)) : (fr>0 ? (0.92f+0.42f*sstep(fr)) : 0.12f);
-      if(aimStance) swYaw = -0.12f-0.05f*latb;     /* bring pistol across centerline, not off-wrist */
       if(s>0){
         /* Katana sweep: lock the torso in combat yaw and let the arm do the
          * work.  A compact S-curve avoids the old apparent 180-degree body
@@ -3075,19 +3785,19 @@ static void draw_player(void){
         raise = 1.08f + 0.32f*sinf(s*PI) - 0.30f*cut;
         swYaw = -0.62f + 1.36f*cut;
       }
-      else if(blade){ raise=0.52f+0.26f*swRel; swYaw=0.42f+0.32f*swRel; }
       /* swRel=1 is exactly the end-of-cut pose (0.78/0.74): the arm now
        * eases into the carry instead of snapping the frame the cut ends */
+      else { raise=0.52f+0.26f*swRel; swYaw=0.42f+0.32f*swRel; }
     } else raise = 0.10f + 0.055f*sinf(gtime*1.5f)*(1.0f-run); /* low-ready + breath */
     /* the free arm swings out to balance the landing; the weapon arm holds
      * its aim so the laser never jumps when you touch down */
-    if(!(ai&&(aimStance||blade))) raise += 0.42f*absorb;
+    if(!ai) raise += 0.42f*absorb;   /* was !(ai&&(aimStance||blade)); blade is
+                                        always set when ai is, so this is !ai */
     /* both arms hug the tucked knees — but ride the curl in and out instead of
      * snapping to the hug on the frame the roll starts */
     if(rolling){ raise=0.35f+0.95f*tuck; swYaw=0; }
     float armStride=ai?armw:-armw;   /* contralateral: opposes the same-side leg */
-    float aimDamp=ai&&aimStance?0.18f:1.0f;
-    float sw = rolling? 1.0f : armStride*0.34f*run*aimDamp*clampf(1.0f-raise*1.25f,0,1);
+    float sw = rolling? 1.0f : armStride*0.34f*run*clampf(1.0f-raise*1.25f,0,1);
     float sh[3]; m3v(M,ai?0.27f:-0.27f,1.05f*tk,0,sh);
     float shx=px+sh[0], shy=pcy+sh[1], shz=pz+sh[2];
     float A[9],RX[9],RY[9],S[9];
@@ -3095,17 +3805,14 @@ static void draw_player(void){
      * (the avatar's forward).  Negative raise folds it backward over the
      * shoulder, which made the pistol look 180-degrees flipped. */
     m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(A,M,S);
-    float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.18f, 0.068f,0.056f,0.36f,10, -0.35f, &ex,&ey,&ez);
-    set_uM(M,ex,ey,ez); sphere_sh(0.060f,0.060f,0.060f,9,6);   /* elbow cap */
     float F[9],RE[9]; m3rotX(RE,raise+sw+0.16f+(ai&&s>0?0.18f+0.18f*sinf(s*PI):0.0f));
     m3mul(S,RY,RE); m3mul(F,M,S);
-    float hx2,hy2,hz2; limb_seg(F,ex,ey,ez,-0.16f, 0.054f,0.046f,0.34f,10, -0.33f, &hx2,&hy2,&hz2);
-    set_uM(F,hx2,hy2,hz2); wedge_sh(0.068f,0.110f,0.055f);
-    glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);   /* forearm light strip */
-    put(F,ex,ey,ez, ai?0.046f:-0.046f,-0.16f,0); box_sh(0.008f,0.20f,0.008f);
-    glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
-    if(ai&&blade){
-      /* the katana: dark blade, emissive emerald edge, square tsuba */
+    float hx2,hy2,hz2;
+    avatar_arm(A,F,shx,shy,shz,ai?1.0f:-1.0f,hideBody,&hx2,&hy2,&hz2);
+    if(ai&&blade&&!hideBody){
+      /* the katana: dark blade, emissive emerald edge, square tsuba. The
+       * !hideBody guard is the backstop for (1)-(3) above: whatever the blend
+       * does, a metre of blade never gets drawn from inside the head. */
       float B[9],RB[9]; m3rotX(RB,1.35f); m3mul(B,F,RB);
       tintf(0.10f,0.16f,0.12f);
       put(B,hx2,hy2,hz2,0,-0.10f,0); box_sh(0.10f,0.02f,0.10f);
@@ -3118,10 +3825,11 @@ static void draw_player(void){
     }
   }
 
+  body_alpha(bodyA);
   /* the katana when it is NOT in hand: slung diagonally across the back in a
    * dark saya with a lit seam. Previously the blade simply blinked out of
    * existence between swings, which read as the avatar having no weapon at all. */
-  if(!blade&&!rolling&&swStow<0.35f){
+  if(!blade&&!rolling&&swStow<0.35f&&!hideBody){
     float SB[9],RZs[9],RXs[9],S1[9],o[3];
     m3rotZ(RZs,0.62f); m3rotX(RXs,0.14f); m3mul(S1,RZs,RXs); m3mul(SB,M,S1);
     m3v(M,0.02f,0.86f*tk,0.20f,o);
@@ -3132,31 +3840,18 @@ static void draw_player(void){
     glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
   }
 
-  /* Dead-Space-ish health spine: five luminous segments mounted on the back.
-   * This replaces the old corner health bar with feedback that belongs to the
-   * character and stays readable in the closer over-shoulder camera. */
-  {
-    float hp=clampf(php/100.0f,0,1);
-    float hr,hg,hb;
-    if(hp>0.55f){ float k=(hp-0.55f)/0.45f; hr=0.15f*(1-k)+0.05f*k; hg=1.25f; hb=0.35f*(1-k)+0.90f*k; }
-    else if(hp>0.25f){ float k=(hp-0.25f)/0.30f; hr=1.25f*(1-k)+0.25f*k; hg=0.55f*(1-k)+1.15f*k; hb=0.10f*(1-k)+0.30f*k; }
-    else { float k=hp/0.25f; hr=1.55f; hg=0.10f+0.45f*k; hb=0.06f+0.08f*k; }
-    glUniform1f(uEmis,1.0f); glUniform1f(uGloss,0.25f);
-    for(int q=0;q<5;q++){
-      float lit=hp*5.0f-q;
-      lit=clampf(lit,0,1);
-      float pulse=(hp<0.30f)?(0.65f+0.35f*sinf(wtime*12.0f)):1.0f;
-      tintf(0.035f+hr*lit*pulse,0.060f+hg*lit*pulse,0.045f+hb*lit*pulse);
-      put(M,px,pcy,pz,0,0.58f*tk+q*0.105f*tk,0.235f); bevbox_sh(0.075f,0.070f,0.024f,0.014f);
-    }
-    glUniform1f(uGloss,0.55f); glUniform1f(uEmis,0.08f);
-  }
+  /* The health spine used to live here: five luminous pads up the avatar's back.
+   * Removed — they read as backpack clutter on a figure whose silhouette is the
+   * whole point, and they were the brightest thing on screen in a game shot
+   * almost entirely from behind. Health moved to the HUD corner with the other
+   * two readouts (see draw_hud), which is where a number belongs. */
 
   /* neck / head. The skull rides its own sub-basis (Mh) that pitches with the
    * look, exactly like the agents' head-track — the avatar's head used to be
    * welded level to the torso, so aiming up a stairwell it still stared at the
    * horizon. Damped to about half the look angle so the neck never breaks, and
    * dropped entirely during a roll, where the whole body is spinning. */
+  if(hideBody){ body_alpha(1.0f); glUniform1f(uEmis,0); glUniform1f(uRim,0); primArm=0; return; }
   float hpit = rolling? 0 : clampf(-ppitch*PI/180.0f*0.55f,-0.45f,0.45f);
   float Mh[9],HX2[9]; m3rotX(HX2,hpit); m3mul(Mh,M,HX2);
   float ho[3]; m3v(M,0,1.29f*tk,0,ho);
@@ -3182,6 +3877,7 @@ static void draw_player(void){
   }
   glUniform1f(uEmis,0.0f);
   glUniform1f(uRim,0);
+  body_alpha(1.0f);
   primArm=0;
 }
 
@@ -3345,6 +4041,11 @@ static void draw_player_laser(void){
   if(vfull<ld){ ld=vfull; hx=mx+dx*ld; hy=my+dy*ld; hz=mz+dz*ld; }
   float charge=clampf(gunCharge,0,1);
   int locked = laserTarget>=0;
+  /* The beam exists because there is no crosshair in third person. Zoomed, the
+   * reticle in draw_hud does that job better, and a full-strength beam down the
+   * middle of a narrow lens is just glare — so cross-fade rather than keeping
+   * both. The leading cap survives at partial strength: it is the charge gauge. */
+  float beamF=1.0f-0.88f*ads_amt();
   /* Keep the charge read stable: length carries the information, not flicker. */
   float grow=sstep(charge);
   float pulse=0.98f+0.02f*sinf(gtime*6.0f);
@@ -3361,9 +4062,9 @@ static void draw_player_laser(void){
   if(ld>0.03f){
     glLineWidth(1.4f+2.4f*grow);
     glBegin(GL_LINES);
-    glColor4f((locked?1.45f:0.07f)*pulse,(locked?0.20f:1.25f)*pulse,(locked?0.10f:0.58f)*pulse,0.36f+0.22f*grow);
+    glColor4f((locked?1.45f:0.07f)*pulse,(locked?0.20f:1.25f)*pulse,(locked?0.10f:0.58f)*pulse,(0.36f+0.22f*grow)*beamF);
     glVertex3f(mx,my,mz);
-    glColor4f((locked?1.05f:0.04f)*pulse,(locked?0.12f:0.90f)*pulse,(locked?0.08f:0.42f)*pulse,0.28f+0.28f*grow);
+    glColor4f((locked?1.05f:0.04f)*pulse,(locked?0.12f:0.90f)*pulse,(locked?0.08f:0.42f)*pulse,(0.28f+0.28f*grow)*beamF);
     glVertex3f(hx,hy,hz);
     glEnd();
   }
@@ -3372,8 +4073,8 @@ static void draw_player_laser(void){
   glBegin(GL_QUADS);
   /* March small ticks down the charged section so length growth is visible even at shallow angles. */
   int ticks=(int)(2+grow*11);
-  for(int q=1;q<=ticks;q++){
-    float f=(float)q/(ticks+1), a=(0.08f+0.18f*f)*(0.35f+0.65f*grow);
+  for(int q=1;q<=ticks&&beamF>0.2f;q++){
+    float f=(float)q/(ticks+1), a=(0.08f+0.18f*f)*(0.35f+0.65f*grow)*beamF;
     billboard(mx+(hx-mx)*f,my+(hy-my)*f,mz+(hz-mz)*f,0.020f+0.035f*grow,
       locked?0.95f:0.04f,locked?0.13f:0.70f+0.65f*grow,locked?0.08f:0.28f,a);
   }
@@ -3416,23 +4117,41 @@ static void draw_slash(void){
  * the emitters around IT, not whichever eight happen to hug the camera. */
 static void set_lights(float x,float z){
   float lp[SHLIGHTS*4]={0}, lc[SHLIGHTS*3]={0}; int ln=0;
-  typedef struct{float d2;int i;int tmp;}LS; LS sl[MAXLIGHT+MAXTEMPL]; int sn=0;
-  for(int i=0;i<nlights;i++){ float dx=lights[i].x-x,dz=lights[i].z-z;
-    sl[sn++] = (LS){dx*dx+dz*dz,i,0}; }
-  for(int i=0;i<MAXTEMPL;i++) if(templ_[i].life>0){ float dx=templ_[i].x-x,dz=templ_[i].z-z;
-    sl[sn++] = (LS){dx*dx+dz*dz,i,1}; }
-  /* only the nearest SHLIGHTS matter, so stop after that many selection passes */
-  int nsel=sn<SHLIGHTS?sn:SHLIGHTS;
-  for(int a=0;a<nsel;a++)for(int b=a+1;b<sn;b++) if(sl[b].d2<sl[a].d2){LS t=sl[a];sl[a]=sl[b];sl[b]=t;}
-  for(int k=0;k<sn && ln<SHLIGHTS;k++){
-    if(sl[k].tmp){ TempL*t=&templ_[sl[k].i];
+  /* Bounded insertion into an 8-slot array, one pass over the candidates. The
+   * old version ran a partial SELECTION SORT — up to 8 passes over as many as
+   * MAXLIGHT+MAXTEMPL = 80 entries — and it runs once per figure per pass, so a
+   * crowded TERMINAL was doing ~50 of them a frame for eight results. */
+  float bd[SHLIGHTS]; int bi[SHLIGHTS], bt[SHLIGHTS];
+  for(int k=0;k<SHLIGHTS;k++){ bd[k]=1e30f; bi[k]=-1; bt[k]=0; }
+  for(int pass=0;pass<2;pass++){
+    int n = pass? MAXTEMPL : nlights;
+    for(int i=0;i<n;i++){
+      float lx,lz;
+      if(pass){ if(templ_[i].life<=0)continue; lx=templ_[i].x; lz=templ_[i].z; }
+      else    { lx=lights[i].x; lz=lights[i].z; }
+      float dx=lx-x,dz=lz-z, d2=dx*dx+dz*dz;
+      if(d2>=bd[SHLIGHTS-1])continue;              /* worse than our worst */
+      int k=SHLIGHTS-1;
+      while(k>0 && bd[k-1]>d2){ bd[k]=bd[k-1]; bi[k]=bi[k-1]; bt[k]=bt[k-1]; k--; }
+      bd[k]=d2; bi[k]=i; bt[k]=pass;
+    }
+  }
+  for(int k=0;k<SHLIGHTS;k++){
+    if(bi[k]<0)break;
+    if(bt[k]){ TempL*t=&templ_[bi[k]];
       lp[ln*4]=t->x;lp[ln*4+1]=t->y;lp[ln*4+2]=t->z;lp[ln*4+3]=t->r;
       lc[ln*3]=t->cr;lc[ln*3+1]=t->cg;lc[ln*3+2]=t->cb;
-    } else { Light*l=&lights[sl[k].i];
+    } else { Light*l=&lights[bi[k]];
       lp[ln*4]=l->x;lp[ln*4+1]=l->y;lp[ln*4+2]=l->z;lp[ln*4+3]=l->r;
       lc[ln*3]=l->cr;lc[ln*3+1]=l->cg;lc[ln*3+2]=l->cb; }
     ln++;
   }
+  /* skip the two array uploads when the selected set is bit-identical to the
+   * last one — walking a corridor re-sends the same eight lights every figure */
+  static float pl[SHLIGHTS*4], pc[SHLIGHTS*3]; static int pn=-1;
+  if(pn==ln && !memcmp(pl,lp,sizeof lp) && !memcmp(pc,lc,sizeof lc)) return;
+  pn=ln; memcpy(pl,lp,sizeof lp); memcpy(pc,lc,sizeof lc);
+  if(ln>QUAL[qual].lights)ln=QUAL[qual].lights;   /* tier caps the shader loop */
   glUniform1i(uNL,ln);
   glUniform4fv(uLpos,SHLIGHTS,lp);
   glUniform3fv(uLcol,SHLIGHTS,lc);
@@ -3461,17 +4180,29 @@ static void draw_world(float camx,float camy,float camz){
 
   /* ---- the cheap planar mirror: draw the movers y-flipped under the
    * world, then lay the glossy floor OVER them at partial alpha. demo
-   * trick, not physics — but on black obsidian it reads as reflection. */
-  refl=1;
-  draw_agentsetc:;
+   * trick, not physics — but on black obsidian it reads as reflection.
+   *
+   * Two passes over the same body: pass 0 mirrored (refl=1) then the world
+   * geometry laid over it, pass 1 upright. This used to be a backwards `goto`
+   * into the middle of the function, which worked but made the block impossible
+   * to reason about or add a third path to. */
+  for(int pass=0;pass<2;pass++){
+  refl = (pass==0);
   /* props read the glow sprite's white centre texel: base = uTint verbatim */
   glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
   if(refl){
     /* mirror only grounded agents near the camera — elevated figures have
      * no floor to reflect in, and far ones aren't worth the double draw */
     for(int i=0;i<nen;i++){
+      /* Skip corpses before paying for a set_lights selection — but NOT while
+       * they are still collapsing: dieT keeps a body drawable for a beat after
+       * death so the shards emerge from it. These skips were added as a pure
+       * perf win before the death animation existed and silently suppressed it. */
+      if(en[i].state==4 && en[i].dieT<=0)continue;
       float ddx=en[i].x-camx, ddz=en[i].z-camz;
       if(ddx*ddx+ddz*ddz>22.0f*22.0f)continue;
+      { float fcy,fr; fig_sphere(&en[i],&fcy,&fr);
+        if(!frustum_sphere_m(en[i].x,fcy,en[i].z,fr,1))continue; }
       /* fade the mirror image out over the same lift the contact shadow uses,
        * instead of blinking it off the instant the figure leaves the floor */
       float rf=clampf(1.0f-en[i].y/0.9f,0,1);
@@ -3483,7 +4214,7 @@ static void draw_world(float camx,float camy,float camz){
     }
     /* the avatar reflects too — it was the one figure on the glossy floor
      * casting no mirror image, which read as the player floating above it */
-    if(gstate==ST_PLAY||gstate==ST_WIN){
+    if((gstate==ST_PLAY||gstate==ST_WIN) && ads_amt()<0.88f){
       float pf=clampf(1.0f-py/0.9f,0,1);
       if(pf>0.02f){ figDim=pf; set_lights(px,pz); draw_player(); figDim=1.0f; }
     }
@@ -3543,7 +4274,7 @@ static void draw_world(float camx,float camy,float camz){
       glDrawArrays(GL_QUADS,0,bn[3]/9);
       glUniform1f(uEmis,0);
     }
-    goto draw_agentsetc;   /* fall through to the upright pass */
+    continue;              /* pass 0 done; on to the upright pass */
   }
   glDisableClientState(GL_VERTEX_ARRAY);
   glDisableClientState(GL_NORMAL_ARRAY);
@@ -3559,9 +4290,10 @@ static void draw_world(float camx,float camy,float camz){
   glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
   glBegin(GL_QUADS);
   for(int i=0;i<nen;i++){
-    if(en[i].state==4)continue;
+    if(en[i].state==4 && en[i].dieT<=0)continue;
     float ddx=en[i].x-camx, ddz=en[i].z-camz;
     if(ddx*ddx+ddz*ddz>38.0f*38.0f)continue;
+    if(!frustum_sphere(en[i].x,floor_at(en[i].x,en[i].z),en[i].z,2.0f))continue;
     if(en[i].type==2) figure_shadow(en[i].x,en[i].y,en[i].z,1.4f,0.6f);
     else figure_shadow(en[i].x,en[i].y,en[i].z,0.52f,0.55f);
   }
@@ -3581,8 +4313,11 @@ static void draw_world(float camx,float camy,float camz){
   glUseProgram(prog);
 
   for(int i=0;i<nen;i++){       /* beyond ~36u the fog has swallowed them */
+    if(en[i].state==4 && en[i].dieT<=0)continue;   /* still collapsing? draw it */
     float ddx=en[i].x-camx, ddz=en[i].z-camz;
     if(ddx*ddx+ddz*ddz>38.0f*38.0f)continue;
+    { float fcy,fr; fig_sphere(&en[i],&fcy,&fr);
+      if(!frustum_sphere(en[i].x,fcy,en[i].z,fr))continue; }
     set_lights(en[i].x,en[i].z);   /* lit by the emitters around THEM */
     if(en[i].type==2) draw_boss(&en[i]); else draw_agent(&en[i],1.0f);
   }
@@ -3611,7 +4346,7 @@ static void draw_world(float camx,float camy,float camz){
    * you can tell who fired. They live on world time, so a flash caught at
    * MINTS hangs in the air like everything else. */
   for(int i=0;i<nen;i++){
-    if(en[i].mzT<=0)continue;
+    if(en[i].state==4||en[i].mzT<=0)continue;   /* corpses don't keep flashing */
     float a=clampf(en[i].mzT/0.07f,0,1);
     billboard(en[i].mzx,en[i].mzy,en[i].mzz,0.09f+0.09f*a, 1.9f,1.0f,0.35f,a);
     billboard(en[i].mzx,en[i].mzy,en[i].mzz,0.28f, 0.90f,0.40f,0.12f,a*0.5f);
@@ -3641,40 +4376,59 @@ static void draw_world(float camx,float camy,float camz){
   if(gstate==ST_PLAY)draw_slash();
   glDisable(GL_BLEND);
   glDepthMask(GL_TRUE);
+  }   /* end two-pass loop; pass 0 `continue`s after laying down the world */
 }
 
 /* ---------------------------------------------------------------- HUD
  * scanlines + signal glitch on damage. all text is the synthesized bitfont. */
+/* The visible HUD box in virtual coordinates. Equals 0,0..HUDW,HUDH at 16:9 and
+ * grows along the long axis otherwise — anything that fills or spans the screen
+ * has to know, or a non-16:9 window shows unwashed strips down the sides.
+ * Recomputed by draw_hud when it sets up the ortho. */
+static float hudX0=0,hudY0=0,hudX1=HUDW,hudY1=HUDH;
 static int rainInit=0;
 static float rainX[40],rainSpd[40],rainPh[40]; static int rainLen[40];
 static void draw_title_rain(void){
   if(!rainInit){ rainInit=1; unsigned sv=rngs; rngs=0xD161741u;
-    for(int i=0;i<40;i++){ rainX[i]=frand()*WINW; rainSpd[i]=60+frand()*180;
+    for(int i=0;i<40;i++){ rainX[i]=frand()*HUDW; rainSpd[i]=60+frand()*180;   /* NB: spread across the visible box below */
       rainPh[i]=frand()*2000; rainLen[i]=6+(int)(frand()*9); }
     rngs=sv; }
   for(int i=0;i<40;i++){
-    float span=WINH+rainLen[i]*20.0f;
+    float span=HUDH+rainLen[i]*20.0f;
     float hy=fmodf(rainPh[i]+gtime*rainSpd[i],span)-rainLen[i]*20.0f;
     for(int k=0;k<rainLen[i];k++){
-      float gy=hy-k*20.0f; if(gy<-20||gy>WINH)continue;
+      float gy=hy-k*20.0f; if(gy<hudY0-20||gy>hudY1)continue;
       float a=(k==0)?0.9f:0.55f*(1.0f-(float)k/rainLen[i]);
       char cs[2]={0,0};
       unsigned h=ihash((unsigned)i*131u+(unsigned)k*17u+(unsigned)(gtime*(k==0?9:2)));
       cs[0]= (h&1)? 'A'+(h>>1)%26 : '0'+(h>>1)%10;
       if(k==0)glColor4f(0.75f,1.0f,0.8f,a); else glColor4f(0.05f,0.85f,0.35f,a);
-      draw_text(rainX[i],gy,2.0f,cs);
+      draw_text(hudX0+rainX[i]*(hudX1-hudX0)/HUDW,gy,2.0f,cs);
     }
   }
 }
 /* full-window quad in HUD ortho space; caller sets the colour first */
 static void hud_fill(void){
   glBegin(GL_QUADS);
-  glVertex2f(0,0); glVertex2f(WINW,0); glVertex2f(WINW,WINH); glVertex2f(0,WINH);
+  glVertex2f(hudX0,hudY0); glVertex2f(hudX1,hudY0);
+  glVertex2f(hudX1,hudY1); glVertex2f(hudX0,hudY1);
   glEnd();
 }
 static void draw_hud(void){
   glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
-  glOrtho(0,WINW,WINH,0,-1,1);
+  /* The HUD is authored once, in a virtual 1280x720 space, and this one ortho
+   * call maps it onto whatever the drawable happens to be. That is why none of
+   * the ~40 hand-placed coordinates below had to change when the window became
+   * resizable — the alternative was rewriting every one of them in terms of fbW.
+   * Aspect is preserved and the result letterboxed, so a stretched window does
+   * not stretch the wordmark. */
+  { float sa=(float)fbW/(float)fbH, ha=(float)HUDW/(float)HUDH;
+    float vw=HUDW, vh=HUDH;
+    if(sa>ha) vw=HUDH*sa;          /* wider than 16:9: widen the HUD box   */
+    else      vh=HUDW/sa;          /* taller: heighten it                  */
+    hudX0=(HUDW-vw)*0.5f; hudX1=(HUDW+vw)*0.5f;
+    hudY0=(HUDH-vh)*0.5f; hudY1=(HUDH+vh)*0.5f;
+    glOrtho(hudX0,hudX1,hudY1,hudY0,-1,1); }
   glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
   glDisable(GL_DEPTH_TEST);
   glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
@@ -3688,23 +4442,98 @@ static void draw_hud(void){
       float k=1.0f-rollCD/ROLL_CD;
       glColor4f(0.4f,0.9f,0.6f,0.55f);
       glBegin(GL_QUADS);
-      glVertex2f(WINW/2-28,WINH-42);glVertex2f(WINW/2-28+56*k,WINH-42);
-      glVertex2f(WINW/2-28+56*k,WINH-39);glVertex2f(WINW/2-28,WINH-39);
+      glVertex2f(HUDW/2-28,HUDH-42);glVertex2f(HUDW/2-28+56*k,HUDH-42);
+      glVertex2f(HUDW/2-28+56*k,HUDH-39);glVertex2f(HUDW/2-28,HUDH-39);
       glEnd();
     }
+
+    /* ADS reticle. The world-space laser is the hip-fire affordance; zoomed, a
+     * screen-space mark is both more precise and the only thing that still works
+     * when the pistol is dry (draw_player_laser early-outs at pammo==0, which in
+     * first person would leave you with no aiming reference at all). Four ticks
+     * around a gap, so it never covers the thing you are shooting. Turns red on
+     * a charged lock, matching the beam it replaced. */
+    { float ar=ads_amt();
+      if(ar>0.12f){
+        float cx=HUDW*0.5f, cy=HUDH*0.5f;
+        float gap=7.0f-3.0f*ar, len=8.0f, th=1.6f;
+        float a=(ar-0.12f)/0.88f; a*=a;
+        int lk = laserTarget>=0;
+        /* spread opens with the gun's unsettled aim: at a dead stop the barrel
+         * IS the look ray, mid-run it is not, and the reticle should say so */
+        gap += 10.0f*(1.0f-aimSet);
+        /* TWO passes: a black bar 1px fatter, then the mark on top. An emerald
+         * reticle over an emerald agent lit by emerald bloom is invisible, which
+         * is exactly the moment you need it — the outline is what makes it read
+         * against the brightest thing in the frame. */
+        for(int pass=0;pass<2;pass++){
+          float t2 = pass? th : th+1.3f;
+          float g2 = pass? 0.0f : 1.1f;      /* backing pokes past the tips */
+          if(pass==0) glColor4f(0,0,0,0.72f*a);
+          else if(lk) glColor4f(1.7f,0.30f,0.20f,0.98f*a);
+          else        glColor4f(0.88f,1.0f,0.92f,0.95f*a);
+          glBegin(GL_QUADS);
+          for(int k=0;k<4;k++){
+            float dx=(k==0)?-1.0f:(k==1)?1.0f:0.0f;
+            float dz=(k==2)?-1.0f:(k==3)?1.0f:0.0f;
+            float x0=cx+dx*(gap-g2), y0=cy+dz*(gap-g2);
+            float x1=x0+dx*(len+2.0f*g2), y1=y0+dz*(len+2.0f*g2);
+            float px_=fabsf(dx)>0?0:t2, pz_=fabsf(dz)>0?0:t2;
+            glVertex2f(x0-px_,y0-pz_); glVertex2f(x1-px_,y1-pz_);
+            glVertex2f(x1+px_,y1+pz_); glVertex2f(x0+px_,y0+pz_);
+          }
+          glEnd();
+        }
+        /* centre dot only once fully shouldered — it is the "settled" tell */
+        if(ar>0.85f&&aimSet>0.9f){
+          glColor4f(0,0,0,0.7f);
+          glBegin(GL_QUADS);
+          glVertex2f(cx-2.4f,cy-2.4f); glVertex2f(cx+2.4f,cy-2.4f);
+          glVertex2f(cx+2.4f,cy+2.4f); glVertex2f(cx-2.4f,cy+2.4f);
+          glEnd();
+          glColor4f(lk?1.8f:0.95f,lk?0.25f:1.15f,lk?0.15f:1.0f,0.95f);
+          glBegin(GL_QUADS);
+          glVertex2f(cx-1.2f,cy-1.2f); glVertex2f(cx+1.2f,cy-1.2f);
+          glVertex2f(cx+1.2f,cy+1.2f); glVertex2f(cx-1.2f,cy+1.2f);
+          glEnd();
+        }
+      } }
 
     /* agents remaining, top right */
     { char b2[24]; snprintf(b2,24,"AGENTS %02d",nalive);
       glColor4f(0.6f,1.0f,0.75f,0.9f);
-      draw_text(WINW-30-textw(b2,2.6f),26,2.6f,b2); }
+      draw_text(HUDW-30-textw(b2,2.6f),26,2.6f,b2); }
     { char b2[24]; snprintf(b2,24,"AMMO %02d",pammo);
       glColor4f(pammo>0?0.55f:1.0f,pammo>0?1.0f:0.25f,pammo>0?0.70f:0.18f,0.9f);
-      draw_text(WINW-30-textw(b2,2.2f),58,2.2f,b2); }
+      draw_text(HUDW-30-textw(b2,2.2f),58,2.2f,b2); }
+    /* Health. It used to be five emissive pads up the avatar's spine, which is a
+     * lovely idea and was the brightest object on screen in a game viewed almost
+     * entirely from behind. Here instead, in the same corner and the same voice
+     * as AGENTS and AMMO: a number, plus a short bar so the trend reads at a
+     * glance without being counted. Goes amber under 55, red under 25, and
+     * pulses on world time once it is critical. */
+    { int hp=(int)(php+0.5f); if(hp<0)hp=0;
+      float f=clampf(php/100.0f,0,1);
+      float hr,hg,hb;
+      if(f>0.55f)      { hr=0.55f; hg=1.00f; hb=0.70f; }
+      else if(f>0.25f) { hr=1.00f; hg=0.80f; hb=0.30f; }
+      else             { float p=0.65f+0.35f*sinf(wtime*12.0f);
+                         hr=1.00f*p; hg=0.28f*p; hb=0.20f*p; }
+      char b2[24]; snprintf(b2,24,"VITALS %03d",hp);
+      glColor4f(hr,hg,hb,0.9f);
+      draw_text(HUDW-30-textw(b2,2.2f),90,2.2f,b2);
+      float bw=textw(b2,2.2f), bx=HUDW-30-bw, by=114;
+      glColor4f(hr*0.22f,hg*0.22f,hb*0.22f,0.55f);
+      glBegin(GL_QUADS); glVertex2f(bx,by); glVertex2f(bx+bw,by);
+        glVertex2f(bx+bw,by+4); glVertex2f(bx,by+4); glEnd();
+      glColor4f(hr,hg,hb,0.85f);
+      glBegin(GL_QUADS); glVertex2f(bx,by); glVertex2f(bx+bw*f,by);
+        glVertex2f(bx+bw*f,by+4); glVertex2f(bx,by+4); glEnd(); }
     /* OVERLORD health bar: violet when full, bleeds toward red; phase ticks at
        the 66% and 33% thresholds where its behaviour escalates */
     if(bossIdx>=0 && bossIdx<nen && en[bossIdx].state!=4){
       float frac=clampf((float)en[bossIdx].hp/(float)(bossMaxHp>0?bossMaxHp:1),0,1);
-      float bw=560, bx=(WINW-bw)*0.5f, by=34, bh=16;
+      float bw=560, bx=(HUDW-bw)*0.5f, by=34, bh=16;
       glColor4f(0,0,0,0.55f);
       glBegin(GL_QUADS); glVertex2f(bx-3,by-3);glVertex2f(bx+bw+3,by-3);
         glVertex2f(bx+bw+3,by+bh+3);glVertex2f(bx-3,by+bh+3); glEnd();
@@ -3717,16 +4546,16 @@ static void draw_hud(void){
         glVertex2f(xx-1,by);glVertex2f(xx+1,by);glVertex2f(xx+1,by+bh);glVertex2f(xx-1,by+bh); }
       glEnd();
       glColor4f(0.92f,0.82f,1.0f,0.95f);
-      draw_text((WINW-textw("OVERLORD",2.6f))*0.5f, by+bh+8, 2.6f, "OVERLORD");
+      draw_text((HUDW-textw("OVERLORD",2.6f))*0.5f, by+bh+8, 2.6f, "OVERLORD");
     }
     /* level intro card */
     if(msgT>0){
       float a=clampf(msgT,0,1);
       char b2[32]; snprintf(b2,32,"SECTOR %d - %s",curlevel+1,LEVELS[curlevel].name);
       glColor4f(0.7f,1.0f,0.8f,a);
-      draw_text((WINW-textw(b2,3.4f))/2,90,3.4f,b2);
+      draw_text((HUDW-textw(b2,3.4f))/2,90,3.4f,b2);
       glColor4f(0.4f,0.9f,0.6f,a*0.8f);
-      draw_text((WINW-textw("TIME MOVES WHEN YOU DO",2.0f))/2,134,2.0f,"TIME MOVES WHEN YOU DO");
+      draw_text((HUDW-textw("TIME MOVES WHEN YOU DO",2.0f))/2,134,2.0f,"TIME MOVES WHEN YOU DO");
     }
     /* damage: signal distortion — torn horizontal slices + red wash */
     if(dmgFlash>0){
@@ -3734,10 +4563,12 @@ static void draw_hud(void){
       hud_fill();
       glBlendFunc(GL_SRC_ALPHA,GL_ONE);
       for(int k=0;k<5;k++){
-        float gy=vrand()*WINH, gh=3+vrand()*14, gx=(vrand()-0.5f)*70*dmgFlash;
+        float gy=hudY0+vrand()*(hudY1-hudY0), gh=3+vrand()*14;
+        float gx=(vrand()-0.5f)*70*dmgFlash;
         glColor4f(0.05f,0.8f,0.3f,dmgFlash*0.35f);
         glBegin(GL_QUADS);
-        glVertex2f(gx,gy);glVertex2f(WINW+gx,gy);glVertex2f(WINW+gx,gy+gh);glVertex2f(gx,gy+gh);
+        glVertex2f(hudX0+gx,gy);glVertex2f(hudX1+gx,gy);
+        glVertex2f(hudX1+gx,gy+gh);glVertex2f(hudX0+gx,gy+gh);
         glEnd();
       }
       glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
@@ -3751,15 +4582,15 @@ static void draw_hud(void){
     glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
     /* shadowed wordmark */
     glColor4f(0.0f,0.25f,0.10f,0.9f);
-    draw_text((WINW-textw("^ILATION",13))/2+5,125,13,"^ILATION");
+    draw_text((HUDW-textw("^ILATION",13))/2+5,125,13,"^ILATION");
     glColor4f(0.65f,1.0f,0.75f,1);
-    draw_text((WINW-textw("^ILATION",13))/2,120,13,"^ILATION");
+    draw_text((HUDW-textw("^ILATION",13))/2,120,13,"^ILATION");
     glColor4f(0.35f,0.85f,0.55f,1);
-    draw_text((WINW-textw("TIME MOVES WHEN YOU MOVE",2.6f))/2,250,2.6f,"TIME MOVES WHEN YOU MOVE");
+    draw_text((HUDW-textw("TIME MOVES WHEN YOU MOVE",2.6f))/2,250,2.6f,"TIME MOVES WHEN YOU MOVE");
     /* level select */
     for(int i=0;i<NLEVEL;i++){
       char b2[24]; snprintf(b2,24,"%d %s",i+1,LEVELS[i].name);
-      float bw=textw(b2,2.6f)+40, bx=(WINW-bw)/2, by=326+i*52;
+      float bw=textw(b2,2.6f)+40, bx=(HUDW-bw)/2, by=326+i*52;
       if(i==curlevel){
         glColor4f(0.06f,0.55f,0.25f,0.35f+0.12f*sinf(gtime*5));
         glBegin(GL_QUADS);glVertex2f(bx,by-12);glVertex2f(bx+bw,by-12);
@@ -3769,32 +4600,40 @@ static void draw_hud(void){
       draw_text(bx+20,by,2.6f,b2);
     }
     glColor4f(0.85f,1.0f,0.6f,0.7f+0.3f*sinf(gtime*4));
-    draw_text((WINW-textw("CLICK TO JACK IN",3.2f))/2,548,3.2f,"CLICK TO JACK IN");
+    draw_text((HUDW-textw("CLICK TO JACK IN",3.2f))/2,548,3.2f,"CLICK TO JACK IN");
+    /* the seed, so a good roll can be written down and played again */
+    { char sb[64]; snprintf(sb,64,"SEED %08X - R REROLLS - Q QUALITY %s",
+                            genSeedUsed,QUAL[qual].name);
+      glColor4f(0.30f,0.62f,0.45f,0.85f);
+      draw_text((HUDW-textw(sb,1.8f))/2,584,1.8f,sb); }
     glColor4f(0.35f,0.55f,0.42f,1);
-    draw_text((WINW-textw("WASD MOVE - SPACE JUMP AND JUMP AGAIN - WALLS KICK BACK - SHIFT ROLL",1.55f))/2,608,1.55f,
+    draw_text((HUDW-textw("WASD MOVE - SPACE JUMP AND JUMP AGAIN - WALLS KICK BACK - SHIFT ROLL",1.55f))/2,608,1.55f,
       "WASD MOVE - SPACE JUMP AND JUMP AGAIN - WALLS KICK BACK - SHIFT ROLL");
-    draw_text((WINW-textw("LMB FIRE - MOVE TO CHARGE RANGE - FIND AMMO - RMB KATANA - 1-4 SECTOR",1.55f))/2,632,1.55f,
-      "LMB FIRE - MOVE TO CHARGE RANGE - FIND AMMO - RMB KATANA - 1-4 SECTOR");
+    draw_text((HUDW-textw("LMB FIRE - RMB AIM DOWN SIGHTS - F KATANA - MOVE TO CHARGE - 1-4 SECTOR",1.55f))/2,632,1.55f,
+      "LMB FIRE - RMB AIM DOWN SIGHTS - F KATANA - MOVE TO CHARGE - 1-4 SECTOR");
   } else if(gstate==ST_DEAD){
     glColor4f(0,0,0,0.6f);
     hud_fill();
     glColor4f(1.0f,0.25f,0.18f,1);
-    draw_text((WINW-textw("SIGNAL LOST",9))/2,250,9,"SIGNAL LOST");
+    draw_text((HUDW-textw("SIGNAL LOST",9))/2,250,9,"SIGNAL LOST");
     glColor4f(0.8f,0.85f,0.8f,0.85f);
-    draw_text((WINW-textw("CLICK TO RE-ENTER",3))/2,430,3,"CLICK TO RE-ENTER");
-    draw_text((WINW-textw("ESC FOR SECTOR SELECT",2))/2,480,2,"ESC FOR SECTOR SELECT");
+    draw_text((HUDW-textw("CLICK TO RE-ENTER",3))/2,430,3,"CLICK TO RE-ENTER");
+    draw_text((HUDW-textw("ESC FOR SECTOR SELECT",2))/2,480,2,"ESC FOR SECTOR SELECT");
   } else if(gstate==ST_WIN){
     glColor4f(0,0,0,0.45f);
     hud_fill();
     glColor4f(0.3f,1.0f,0.6f,1);
-    draw_text((WINW-textw("SECTOR CLEAR",8))/2,250,8,"SECTOR CLEAR");
+    draw_text((HUDW-textw("SECTOR CLEAR",8))/2,250,8,"SECTOR CLEAR");
     glColor4f(0.8f,0.9f,0.85f,0.9f);
-    char b2[64]; snprintf(b2,64,"%d SECONDS REAL - %d SIMULATED",(int)winT,(int)wtime);
-    draw_text((WINW-textw(b2,2.6f))/2,400,2.6f,b2);
+    /* tenths, not truncated whole seconds: a fast clear used to read "0 SECONDS
+     * REAL" even once winT was accumulating correctly, which made the real bug
+     * (see shatter_enemy) impossible to tell apart from a rounding artefact. */
+    char b2[64]; snprintf(b2,64,"%.1f SECONDS REAL - %.1f SIMULATED",winRealT,winSimT);
+    draw_text((HUDW-textw(b2,2.6f))/2,400,2.6f,b2);
     const char*nx = curlevel+1<NLEVEL
       ? "CLICK FOR NEXT SECTOR - ESC FOR SECTOR SELECT"
       : "CLICK TO REPLAY - ESC FOR SECTOR SELECT";
-    draw_text((WINW-textw(nx,2.2f))/2,460,2.2f,nx);
+    draw_text((HUDW-textw(nx,2.2f))/2,460,2.2f,nx);
   }
   glDisable(GL_BLEND);
   glEnable(GL_DEPTH_TEST);
@@ -3809,18 +4648,138 @@ static void draw_hud(void){
  * because tested drivers happen to preserve the back buffer — post-swap its
  * contents are undefined per spec (and GL_FRONT is empty under Xvfb). */
 static const char*pendingShot=0;
+static int strictShots, strictFails;      /* see the smoke-gate block below */
 static void shot_ppm(const char*path){
-  unsigned char*buf=malloc(WINW*WINH*3);
+  unsigned char*buf=malloc(fbW*fbH*3);
   glPixelStorei(GL_PACK_ALIGNMENT,1);
-  glReadPixels(0,0,WINW,WINH,GL_RGB,GL_UNSIGNED_BYTE,buf);
+  glReadPixels(0,0,fbW,fbH,GL_RGB,GL_UNSIGNED_BYTE,buf);
   FILE*f=fopen(path,"wb");
   if(f){
-    fprintf(f,"P6\n%d %d\n255\n",WINW,WINH);
-    for(int y=WINH-1;y>=0;y--) fwrite(buf+y*WINW*3,1,WINW*3,f);
+    fprintf(f,"P6\n%d %d\n255\n",fbW,fbH);
+    for(int y=fbH-1;y>=0;y--) fwrite(buf+y*fbW*3,1,fbW*3,f);
     fclose(f);
     printf("[dilation] wrote %s\n",path);
   }
+  /* --strict: byte-compare against the recorded reference, in-process, so
+   * proving a refactor visually neutral is one command and not a shell loop. */
+  if(strictShots){
+    char ref[128]; snprintf(ref,sizeof ref,"baseline/%s",path);
+    FILE*r=fopen(ref,"rb");
+    if(!r){ printf("[dilation] STRICT: no %s to compare against\n",ref); strictFails++; }
+    else {
+      char hdr[64]; int w=0,h=0,mx=0;
+      if(fscanf(r,"%63s %d %d %d",hdr,&w,&h,&mx)!=4||w!=fbW||h!=fbH){
+        printf("[dilation] STRICT: %s is %dx%d, we render %dx%d\n",ref,w,h,fbW,fbH);
+        strictFails++;
+      } else {
+        fgetc(r);                                  /* the single whitespace */
+        long diff=0; int mismatch=0;
+        for(int y=fbH-1;y>=0;y--)for(int x=0;x<fbW*3;x++){
+          int c=fgetc(r); if(c<0){mismatch=1;break;}
+          int got=buf[y*fbW*3+x];
+          if(c!=got){ diff++; }
+        }
+        if(mismatch||diff){
+          printf("[dilation] STRICT: %s differs (%ld of %d subpixels)\n",
+                 path,diff,fbW*fbH*3);
+          strictFails++;
+        } else printf("[dilation] STRICT: %s identical\n",path);
+      }
+      fclose(r);
+    }
+  }
   free(buf);
+}
+
+/* ------------------------------------------------------------ the smoke gate
+ * The gate used to be "the nine PPMs are byte-identical to baseline/". That is a
+ * fine way to prove a refactor neutral and a useless way to develop: any real
+ * change to the art fails it, so it gets re-recorded, and then it is asserting
+ * nothing. It is now split in two:
+ *
+ *   --smoke              structural invariants that survive visual change, run
+ *                        over many seeds. This is the gate.
+ *   --smoke --strict     additionally byte-compare each shot against baseline/.
+ *                        Turn this on when you WANT to prove a change neutral.
+ *   --seed-sweep N       invariants only, headless, across N seeds. Cheap, and
+ *                        the thing that makes procedural generation safe.
+ */
+/* strictShots / strictFails are declared above shot_ppm, which consumes them. */
+static int poolPeakBul=0, poolPeakPart=0, poolPeakShard=0;
+
+/* Structural invariants for one generated sector. gen_level already retries
+ * until gen_attempt() reports success, so this re-checks the SAME properties
+ * from the outside: if it ever fails, the generator's own soundness test and
+ * this one have drifted apart, which is exactly the bug you want caught. */
+static int validate_level(int li,unsigned seed,int verbose){
+  gen_level(li,seed);
+  const LevelDef*L=&LEVELS[li];
+  int want=L->nshoot+L->nstrike+(L->style==3?1:0);
+  int nreach=reachable();
+  int bad=0;
+  float sy=cellh((int)floorf(startx/CELL),(int)floorf(startz/CELL));
+  if(sy>100.0f||!circ_free(startx,startz,0.34f,sy)){
+    printf("  FAIL %-8s seed %08x: spawn is inside geometry\n",L->name,seed); bad=1; }
+  if(nen!=want){
+    printf("  FAIL %-8s seed %08x: placed %d agents, wanted %d\n",L->name,seed,nen,want); bad=1; }
+  if(nreach<G*G/16){
+    printf("  FAIL %-8s seed %08x: only %d cells reachable from spawn\n",L->name,seed,nreach); bad=1; }
+  for(int i=0;i<nen;i++) if(!reach_at(en[i].x,en[i].z)){
+    printf("  FAIL %-8s seed %08x: agent %d at (%.1f,%.1f) h=%.2f is stranded\n",
+           L->name,seed,i,en[i].x,en[i].z,en[i].y); bad=1; }
+  for(int i=0;i<nitems;i++) if(!reach_at(items[i].x,items[i].z)){
+    printf("  FAIL %-8s seed %08x: item %d at (%.1f,%.1f) is unreachable\n",
+           L->name,seed,i,items[i].x,items[i].z); bad=1; }
+  if(nlights>=MAXLIGHT){
+    printf("  FAIL %-8s seed %08x: light pool full (%d)\n",L->name,seed,nlights); bad=1; }
+  if(nitems>=MAXITEM){
+    printf("  FAIL %-8s seed %08x: item pool full (%d)\n",L->name,seed,nitems); bad=1; }
+  if(genAttempts>=GEN_TRIES){
+    printf("  FAIL %-8s seed %08x: exhausted %d generation attempts\n",L->name,seed,GEN_TRIES); bad=1; }
+  if(verbose)
+    printf("[dilation] %-8s: %2d agents, %2d items, %2d lights, %4d/%d reachable, %d quads, %d try%s\n",
+      L->name,nen,nitems,nlights,nreach,G*G,(bn[0]+bn[1]+bn[2])/36,
+      genAttempts,genAttempts==1?"":"s");
+  return !bad;
+}
+
+/* every sector, every seed in [0,n). Returns the number of failures. */
+static int seed_sweep(int n,unsigned base){
+  int fails=0;
+  for(int s=0;s<n;s++)
+    for(int l=0;l<NLEVEL;l++)
+      if(!validate_level(l,base+(unsigned)s*2654435761u,0))fails++;
+  printf("[dilation] seed sweep: %d seeds x %d sectors = %d layouts, %d failures\n",
+         n,NLEVEL,n*NLEVEL,fails);
+  return fails;
+}
+
+/* NaN is the failure mode that a screenshot comparison can never catch: one bad
+ * frame poisons px/pvx and every later frame is garbage that still renders. */
+static int nan_check(int frame){
+  const float v[]={px,py,pz,pvx,pvy,pvz,pyaw,ppitch,tscale,tsEff,
+                   gunCharge,camDist,camYs,avYaw,bobT,aimSet,php};
+  for(unsigned i=0;i<sizeof v/sizeof*v;i++) if(v[i]!=v[i]){
+    printf("[dilation] SMOKE FAIL: NaN in player state, slot %u, frame %d\n",i,frame);
+    return 0; }
+  for(int i=0;i<nen;i++){
+    const Enemy*e=&en[i];
+    if(e->x!=e->x||e->y!=e->y||e->z!=e->z||e->yaw!=e->yaw){
+      printf("[dilation] SMOKE FAIL: NaN in agent %d, frame %d\n",i,frame); return 0; }
+  }
+  int nb=0;
+  for(int i=0;i<MAXBUL;i++) if(bul[i].on){
+    nb++;
+    if(bul[i].x!=bul[i].x||bul[i].y!=bul[i].y||bul[i].z!=bul[i].z){
+      printf("[dilation] SMOKE FAIL: NaN in bullet %d, frame %d\n",i,frame); return 0; }
+  }
+  if(nb>poolPeakBul)poolPeakBul=nb;
+  int np=0,ns=0;
+  for(int i=0;i<MAXPART;i++) if(parts[i].life>0)np++;
+  for(int i=0;i<MAXSHARD;i++) if(shards[i].life>0)ns++;
+  if(np>poolPeakPart)poolPeakPart=np;
+  if(ns>poolPeakShard)poolPeakShard=ns;
+  return 1;
 }
 
 /* WASD -> world-space move direction, relative to the view yaw */
@@ -3835,8 +4794,16 @@ static void wasd_dir(int w,int s,int a,int d,float*mx,float*mz){
 /* ---------------------------------------------------------------- main */
 int main(int argc,char**argv){
   unsigned t0;
+  int sweepN=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--smoke"))smoke=1;
+    else if(!strcmp(argv[i],"--strict"))strictShots=1;
+    else if(!strcmp(argv[i],"--quality")&&i+1<argc){
+      const char*q=argv[++i]; qualAuto=0;
+      if(!strcmp(q,"low"))qual=0; else if(!strcmp(q,"medium")||!strcmp(q,"med"))qual=1;
+      else if(!strcmp(q,"high"))qual=2; else { qualAuto=1; }
+    }
+    else if(!strcmp(argv[i],"--seed-sweep")) sweepN = (i+1<argc)? (int)strtol(argv[++i],0,0) : 64;
     else if(!strcmp(argv[i],"--titlecap"))titlecap=1;
     else if(!strcmp(argv[i],"--seed")&&i+1<argc)gseed=(unsigned)strtoul(argv[++i],0,0);
     else if(!strcmp(argv[i],"--level")&&i+1<argc){
@@ -3844,6 +4811,16 @@ int main(int argc,char**argv){
       curlevel=(int)(l<0?0:l>=NLEVEL?NLEVEL-1:l);
     }
   }
+  /* --seed-sweep is pure CPU: gen_level, place_agent and the flood fill touch no
+   * GL and no SDL, so the sweep runs before any window exists and exits. That is
+   * what makes it usable as a fast pre-commit check over hundreds of layouts. */
+  if(sweepN>0){
+    printf("[dilation] sweeping %d seeds x %d sectors...\n",sweepN,NLEVEL);
+    int fails=seed_sweep(sweepN,gseed);
+    printf(fails? "[dilation] SWEEP FAIL\n" : "[dilation] SWEEP OK\n");
+    return fails?1:0;
+  }
+
   if(smoke||titlecap) SDL_setenv("SDL_AUDIODRIVER","dummy",1);
 
   if(SDL_Init(SDL_INIT_VIDEO)<0){ fprintf(stderr,"SDL: %s\n",SDL_GetError()); return 1; }
@@ -3857,8 +4834,19 @@ int main(int argc,char**argv){
   int msaa=4;
   SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS,1);
   SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES,msaa);
+  /* HIGHDPI is the whole point: without it a Retina display hands us a 1280x720
+   * backbuffer and upscales, which on geometry made entirely of hard bright edges
+   * against black is the worst possible trade. RESIZABLE because the post chain
+   * can now be rebuilt at any size (see free_post). */
+  Uint32 wflags = SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE|SDL_WINDOW_ALLOW_HIGHDPI;
+  /* ...except under the harness. With HIGHDPI the default framebuffer is 2x on a
+   * Retina panel, and compositing a 1280x720 viewport into a 2560x1440
+   * multisampled window shifts a few dozen subpixels by one LSB versus doing it
+   * into a plain 1280x720 one. Harmless to look at, fatal to a byte gate that is
+   * supposed to mean the same thing on every machine. */
+  if(smoke||titlecap) wflags &= ~(Uint32)SDL_WINDOW_ALLOW_HIGHDPI;
   SDL_Window*win=SDL_CreateWindow("Δilation",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
-    WINW,WINH,SDL_WINDOW_OPENGL);
+    winW,winH,wflags);
   SDL_GLContext ctx=win?SDL_GL_CreateContext(win):0;
   if(!ctx){
     msaa=0;
@@ -3866,10 +4854,20 @@ int main(int argc,char**argv){
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS,0);
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES,0);
     win=SDL_CreateWindow("Δilation",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
-      WINW,WINH,SDL_WINDOW_OPENGL);
+      winW,winH,wflags);
     ctx=win?SDL_GL_CreateContext(win):0;
   }
   if(!ctx){ fprintf(stderr,"GL: %s\n",SDL_GetError()); return 1; }
+  /* the drawable is what we actually render into, and it is NOT the window size */
+  SDL_GL_GetDrawableSize(win,&fbW,&fbH);
+  SDL_GetWindowSize(win,&winW,&winH);
+  /* --smoke and --titlecap must produce a fixed-size image regardless of the
+   * display they run on, or the shots stop being comparable between machines. */
+  if(smoke||titlecap){ fbW=HUDW; fbH=HUDH;
+    /* pin the tier for determinism, but never override an explicit --quality */
+    if(qualAuto)qual=2;
+    qualAuto=0; }
+  printf("[dilation] window %dx%d, drawable %dx%d\n",winW,winH,fbW,fbH);
   if(msaa){ SDL_GL_GetAttribute(SDL_GL_MULTISAMPLESAMPLES,&msaa);
             if(msaa>1)glEnable(GL_MULTISAMPLE); else msaa=0; }
   printf("[dilation] MSAA: %dx\n",msaa);
@@ -3880,15 +4878,13 @@ int main(int argc,char**argv){
 
   t0=SDL_GetTicks(); gen_textures();
   printf("[dilation] textures synthesized in %ums\n",SDL_GetTicks()-t0);
-  if(smoke){ /* sanity: every sector must carve and populate */
-    for(int l=0;l<NLEVEL;l++){
-      gen_level(l,gseed);
-      printf("[dilation] sector %d %-8s: %d agents, %d quads\n",
-        l+1,LEVELS[l].name,nen,(bn[0]+bn[1]+bn[2])/36);
-      float sy=cellh((int)(startx/CELL),(int)(startz/CELL));
-      if(nen<1||sy>100.0f||!circ_free(startx,startz,0.34f,sy)){
-        fprintf(stderr,"[dilation] SMOKE FAIL: bad sector %d\n",l); return 1; }
-    }
+  if(smoke){
+    /* Structural invariants, over a spread of seeds rather than just the one we
+     * are about to play. The old version checked three things at one seed. */
+    int fails=0;
+    for(int l=0;l<NLEVEL;l++) if(!validate_level(l,gseed,1))fails++;
+    fails += seed_sweep(SMOKE_SEEDS,gseed+1u);
+    if(fails){ fprintf(stderr,"[dilation] SMOKE FAIL: %d bad layouts\n",fails); return 1; }
   }
   t0=SDL_GetTicks(); reset_game();
   printf("[dilation] world carved in %ums (%d quads)\n",SDL_GetTicks()-t0,(bn[0]+bn[1]+bn[2])/36);
@@ -3908,6 +4904,14 @@ int main(int argc,char**argv){
   glClearColor(0.004f,0.012f,0.008f,1);
 
   int running=1, frame=0, wdown=0,adown=0,sdown=0,ddown=0;
+  int smokeBad=0;                                  /* sticky gate failure flag */
+  /* CPU frame-time budget. Keep the samples: the MEAN is useless here because a
+   * single descheduled frame (this runs on a shared desktop) can be 400ms and
+   * drags the average by 2ms. The median and p95 describe the frame we actually
+   * ship; max is kept only as a hitch indicator. */
+  #define FMSCAP 512
+  static float fms_[FMSCAP]; int fmsN=0;
+  float fmsMin=1e9f,fmsMax=0;
   /* sub-ms clock: SDL_GetTicks is millisecond-grained, and two frames inside
    * the same millisecond gave dt==0 — which turned pvx into 0/0 NaN and
    * poisoned bobT (and with it the camera) until the next reset. */
@@ -3920,6 +4924,29 @@ int main(int argc,char**argv){
     SDL_Event ev;
     while(SDL_PollEvent(&ev)){
       if(ev.type==SDL_QUIT)running=0;
+      /* The drawable changed: tear down and rebuild the whole post chain at the
+       * new size. Cheap enough to do synchronously on the event (the shader
+       * programs are kept, only the targets are reallocated), and SDL coalesces
+       * drag-resizes so this fires far less often than it looks. */
+      /* A held mouse button that goes away while we are not focused never sends
+       * its BUTTONUP, so alt-tabbing mid-aim used to latch ADS on permanently. */
+      else if(ev.type==SDL_WINDOWEVENT &&
+              (ev.window.event==SDL_WINDOWEVENT_FOCUS_LOST||
+               ev.window.event==SDL_WINDOWEVENT_LEAVE)){
+        adsHold=0;
+      }
+      else if(ev.type==SDL_WINDOWEVENT &&
+              (ev.window.event==SDL_WINDOWEVENT_SIZE_CHANGED||
+               ev.window.event==SDL_WINDOWEVENT_RESIZED)){
+        if(!smoke&&!titlecap){
+          int nw,nh; SDL_GL_GetDrawableSize(win,&nw,&nh);
+          SDL_GetWindowSize(win,&winW,&winH);
+          if(nw>0&&nh>0&&(nw!=fbW||nh!=fbH)){
+            fbW=nw; fbH=nh;
+            free_post(); init_post(msaa);
+          }
+        }
+      }
       else if(ev.type==SDL_KEYDOWN||ev.type==SDL_KEYUP){
         int d=ev.type==SDL_KEYDOWN;
         /* one-shot actions must ignore OS auto-repeat: a held SPACE was
@@ -3965,21 +4992,51 @@ int main(int argc,char**argv){
               if(curlevel>=NLEVEL)curlevel=NLEVEL-1;
               preview_level(); sfx(V_CLICK); }
             break;
+          case SDLK_f: if(once&&gstate==ST_PLAY)katana(); break;
+          /* Q cycles the quality tier by hand and pins it — once you have made a
+           * choice the adaptive logic must stop second-guessing you. */
+          case SDLK_q: if(once){
+              qual=(qual+1)%3; qualAuto=0;
+              free_post(); init_post(4);
+              printf("[dilation] quality: %s\n",QUAL[qual].name);
+            } break;
+          /* R rerolls the sector. The layout is fully seeded now, so this is a
+           * genuinely different building rather than the same one relit. */
+          case SDLK_r: if(once&&gstate==ST_TITLE){
+              reroll=reroll*1664525u+1013904223u;
+              preview_level(); sfx(V_CLICK); } break;
           case SDLK_m: if(once){ g_mute=!g_mute; printf("[dilation] audio %s\n",g_mute?"muted":"unmuted"); } break;
+          /* F11, or the platform-conventional Alt+Enter. FULLSCREEN_DESKTOP
+           * rather than a mode switch: no resolution change, no black flash, and
+           * the SIZE_CHANGED handler above rebuilds the post chain either way. */
+          case SDLK_F11: case SDLK_RETURN:
+            if(once && (ev.key.keysym.sym==SDLK_F11 || (ev.key.keysym.mod&KMOD_ALT))){
+              Uint32 f=SDL_GetWindowFlags(win);
+              SDL_SetWindowFullscreen(win,
+                (f&SDL_WINDOW_FULLSCREEN_DESKTOP)?0:SDL_WINDOW_FULLSCREEN_DESKTOP);
+            } break;
           case SDLK_LEFT: if(once&&gstate==ST_TITLE){ curlevel=(curlevel+NLEVEL-1)%NLEVEL; preview_level(); sfx(V_CLICK); } break;
           case SDLK_RIGHT:if(once&&gstate==ST_TITLE){ curlevel=(curlevel+1)%NLEVEL; preview_level(); sfx(V_CLICK); } break;
           case SDLK_ESCAPE:
             if(once){
               if(gstate==ST_TITLE)running=0;
-              else { gstate=ST_TITLE; laserTarget=-1; SDL_SetRelativeMouseMode(SDL_FALSE); }
+              else { gstate=ST_TITLE; laserTarget=-1; adsHold=0;
+                     SDL_SetRelativeMouseMode(SDL_FALSE); }
             } break;
         }
       }
       else if(ev.type==SDL_MOUSEMOTION && gstate==ST_PLAY && !smoke){
-        pyaw  += ev.motion.xrel*0.13f;
-        ppitch+= ev.motion.yrel*0.13f;
+        /* Zoom has to slow the mouse or ADS is unusable: the same hand movement
+         * sweeps the same number of DEGREES, which through a narrower lens is a
+         * much larger fraction of the screen. Scale by the tan ratio, which is
+         * the exact factor by which a degree got bigger on screen. mouseAcc gets
+         * the same treatment — otherwise aiming while zoomed would unfreeze time
+         * harder than aiming from the hip, for no reason the player can see. */
+        float sens=0.13f*(tanf(FOV_ADS*PI/180)/tanf(FOV_HIP*PI/180)-1.0f)*ads_amt()+0.13f;
+        pyaw  += ev.motion.xrel*sens;
+        ppitch+= ev.motion.yrel*sens;
         ppitch=ppitch>89?89:ppitch<-89?-89:ppitch;
-        mouseAcc+=fabsf((float)ev.motion.xrel)+fabsf((float)ev.motion.yrel);
+        mouseAcc+=(fabsf((float)ev.motion.xrel)+fabsf((float)ev.motion.yrel))*(sens/0.13f);
       }
       else if(ev.type==SDL_MOUSEBUTTONDOWN && ev.button.button==SDL_BUTTON_LEFT){
         if(gstate==ST_TITLE){ reset_game(); gstate=ST_PLAY; SDL_SetRelativeMouseMode(SDL_TRUE); sfx(V_CLICK); }
@@ -3991,8 +5048,13 @@ int main(int argc,char**argv){
           reset_game(); gstate=ST_PLAY; SDL_SetRelativeMouseMode(SDL_TRUE); }
         else fire();
       }
-      else if(ev.type==SDL_MOUSEBUTTONDOWN && ev.button.button==SDL_BUTTON_RIGHT && gstate==ST_PLAY)
-        katana();
+      /* RMB is ADS now; the katana moved to F. RMB-to-aim is the binding every
+       * player already has in their hands, and the katana is a deliberate,
+       * occasional commitment that reads better as its own key. */
+      else if(ev.type==SDL_MOUSEBUTTONDOWN && ev.button.button==SDL_BUTTON_RIGHT)
+        adsHold=1;
+      else if(ev.type==SDL_MOUSEBUTTONUP && ev.button.button==SDL_BUTTON_RIGHT)
+        adsHold=0;
     }
 
     Uint64 nowPC=SDL_GetPerformanceCounter();
@@ -4001,6 +5063,10 @@ int main(int argc,char**argv){
     if(dt>0.05f)dt=0.05f;
     if(dt<1e-5f)dt=1e-5f;
     gtime+=dt;
+    /* CPU cost of building this frame, measured up to SwapWindow (which blocks
+     * on vsync and would swamp the signal). Reported by the smoke gate so a perf
+     * regression shows up as a number instead of as a vibe. */
+    Uint64 fStart=SDL_GetPerformanceCounter();
 
     /* title capture: hold the title screen and dump a numbered frame sequence
      * (every 3rd internal frame -> 20fps source) for the README GIF. A short
@@ -4055,6 +5121,10 @@ int main(int argc,char**argv){
       if(frame==82)pendingShot="shot_gun_pose.ppm";
       if(frame==84)pendingShot="shot_game.ppm";
       if(frame==100&&nen>0)shatter_enemy(&en[0]);
+      /* mid-collapse: dieT is 0.13 world-seconds and the shatter lands at 100,
+       * so 103 catches the body ~40% squashed with the shards already leaving.
+       * Without this the gate had no coverage of the death animation at all. */
+      if(frame==103)pendingShot="shot_death.ppm";
       if(frame==106)pendingShot="shot_shatter.ppm";
       if(frame==112)katana();
       if(frame==118)pendingShot="shot_katana_pose.ppm";
@@ -4112,12 +5182,142 @@ int main(int argc,char**argv){
       }
       if(frame>=138&&frame<146)ppitch=4;
       if(frame==144)pendingShot="shot_dodge.ppm";
-      if(frame>=150){ printf("[dilation] SMOKE OK\n"); running=0; }
+
+      /* AGENT AIM: the gate had no shot of a raised agent arm anywhere, which is
+       * exactly how draw_agent kept a 180-degree-flipped gun arm through several
+       * animation passes — every captured agent had its arms hanging at its
+       * sides. Stage one facing us with the aim pose held at full raise. */
+      if(frame==150){
+        reset_game(); gstate=ST_PLAY;
+        float yr=smkYaw*PI/180;
+        float ex=px+sinf(yr)*6.0f, ez=pz-cosf(yr)*6.0f;
+        nen=nalive=1; memset(&en[0],0,sizeof en[0]);
+        en[0].type=0; en[0].x=en[0].lx=ex; en[0].z=en[0].lz=ez;
+        en[0].y=ground_h(ex,ez,py);
+        pyaw=smkYaw; ppitch=2;
+      }
+      if(frame>=150&&frame<160){       /* pin the aim pose: armp/flare fully up */
+        float dx=en[0].x-px, dz=en[0].z-pz;
+        en[0].yaw=atan2f(-dx,dz);       /* facing back down the sightline at us */
+        en[0].state=1; en[0].state_t=0.30f; en[0].armp=1.0f; en[0].flare=1.0f;
+        pyaw=atan2f(dx,-dz)*180/PI; ppitch=2;
+      }
+      if(frame==158)pendingShot="shot_agent_aim.ppm";
+
+      /* BOSS: never captured at all before, so its pose, its scale and its own
+       * flipped arms were entirely untested. */
+      if(frame==162){
+        curlevel=NLEVEL-1; reset_game(); gstate=ST_PLAY;
+        if(bossIdx>=0){
+          /* Stand off the throne at 22.5 degrees: the eight cover pillars sit on
+           * exact 45-degree spokes, and the default spawn looks straight down one
+           * of them — the first version of this shot photographed a pillar with
+           * the boss entirely behind it. */
+          float a=202.5f*PI/180.0f, R=11.0f;
+          px=en[bossIdx].x+sinf(a)*R; pz=en[bossIdx].z-cosf(a)*R;
+          free_spot(&px,&pz); py=ground_h(px,pz,0);
+          float dx=en[bossIdx].x-px, dz=en[bossIdx].z-pz;
+          pyaw=atan2f(dx,-dz)*180/PI; ppitch=-6;
+        }
+      }
+      if(frame>=162&&frame<172&&bossIdx>=0){
+        en[bossIdx].state=3; en[bossIdx].melT=0.20f;   /* melee swat telegraph */
+        en[bossIdx].armp=0; en[bossIdx].roar=1.0f;
+      }
+      if(frame==170)pendingShot="shot_boss.ppm";
+
+      /* WIN CARD: drive the sector to zero agents so the victory screen is
+       * actually exercised. It never was, which is exactly how it shipped
+       * reading "0 SECONDS REAL" on every single clear. */
+      if(frame==174){ for(int i=0;i<nen;i++) if(en[i].state!=4) shatter_enemy(&en[i]); }
+      if(frame==178){
+        if(gstate!=ST_WIN){ printf("[dilation] SMOKE FAIL: clearing all agents did not win\n"); smokeBad=1; }
+        else if(winRealT<=0.0f){ printf("[dilation] SMOKE FAIL: win card reports %.2f seconds real\n",winRealT); smokeBad=1; }
+        pendingShot="shot_win.ppm";
+      }
+
+      /* ADS: mid-transition and fully shouldered, with an agent to aim at. The
+       * mid shot is the one that matters — it is where the body cull, the boom
+       * pull-in and the FOV lerp can disagree with each other. */
+      if(frame==184){
+        curlevel=0; reset_game(); gstate=ST_PLAY;
+        float best=0,besta=0;
+        for(int k=0;k<64;k++){ float a=k*2*PI/64;
+          float d=ray_wall(px,EYE,pz,sinf(a),0,-cosf(a),40);
+          if(d>best){best=d;besta=a;} }
+        pyaw=besta*180/PI; ppitch=1;
+        float yr=pyaw*PI/180;
+        float ex=px+sinf(yr)*7.5f, ez=pz-cosf(yr)*7.5f;
+        nen=nalive=1; memset(&en[0],0,sizeof en[0]);
+        en[0].type=0; en[0].x=en[0].lx=ex; en[0].z=en[0].lz=ez;
+        en[0].y=ground_h(ex,ez,py); en[0].yaw=atan2f(-sinf(yr),cosf(yr));
+        adsHold=1; ads=0;
+      }
+      if(frame>=184){ adsHold=1; en[0].state=1; en[0].armp=1.0f; en[0].flare=1.0f; }
+      if(frame==189)pendingShot="shot_ads_mid.ppm";   /* mid-dissolve */
+      if(frame==200){
+        /* toward() is exponential, so it asymptotes: 16 frames at rate 11 gets
+         * to 1-(1-11/60)^16 = 0.96. The assertion is "the transition actually
+         * completes", not "it reaches 1.0 in finite time". */
+        if(ads<0.95f){ printf("[dilation] SMOKE FAIL: ads only reached %.3f\n",ads); smokeBad=1; }
+        pendingShot="shot_ads.ppm";
+      }
+
+      if(!nan_check(frame))smokeBad=1;
+      if(frame>=206){
+        printf("[dilation] pool peaks: %d/%d bullets, %d/%d particles, %d/%d shards\n",
+               poolPeakBul,MAXBUL,poolPeakPart,MAXPART,poolPeakShard,MAXSHARD);
+        if(poolPeakBul>=MAXBUL||poolPeakPart>=MAXPART||poolPeakShard>=MAXSHARD){
+          printf("[dilation] SMOKE FAIL: a fixed pool hit its cap\n"); smokeBad=1; }
+        printf("[dilation] frustum cull: %d of %d figure tests skipped (%.0f%%)\n",
+               cullSkipped,cullTested,cullTested?100.0*cullSkipped/cullTested:0.0);
+        { /* insertion sort: n is at most FMSCAP and this runs once, at exit */
+          for(int a=1;a<fmsN;a++){ float v=fms_[a]; int b=a-1;
+            while(b>=0&&fms_[b]>v){ fms_[b+1]=fms_[b]; b--; } fms_[b+1]=v; }
+          float med=fmsN?fms_[fmsN/2]:0, p95=fmsN?fms_[(int)(fmsN*0.95f)]:0;
+          printf("[dilation] frame cpu ms: min %.2f median %.2f p95 %.2f max %.2f over %d frames\n",
+                 fmsMin,med,p95,fmsMax,fmsN);
+          if(med>8.0f){ printf("[dilation] SMOKE FAIL: median frame %.2fms exceeds budget\n",med); smokeBad=1; } }
+        if(strictShots)
+          printf(strictFails? "[dilation] STRICT: %d shots differ from baseline/\n"
+                            : "[dilation] STRICT: all shots identical\n", strictFails);
+        if(strictShots&&strictFails)smokeBad=1;
+        printf(smokeBad? "[dilation] SMOKE FAIL\n" : "[dilation] SMOKE OK\n");
+        running=0;
+      }
     }
 
     if(gstate==ST_TITLE){ titleYaw+=dt*7; pyaw=titleYaw; ppitch=4;
       px=startx; pz=startz; tscale=tsEff=1; wtime=gtime; }
 
+    pose_dirty();   /* sim phase: the pose is re-solved from current state */
+    /* ADS on raw dt — shouldering a weapon is player agency and must not slow
+     * down when the world does. The MOTION of the transition counts as action
+     * (so raising the gun nudges time forward the way firing does), but holding
+     * it up does NOT: standing still while aimed has to stay frozen, because
+     * that is the entire game. Hence the rate, not the level, feeds actT.
+     *
+     * OUTSIDE the ST_PLAY block on purpose. This used to live inside it, so
+     * dying or winning while zoomed froze `ads` at whatever it held — and the
+     * camera, which reads it unconditionally, stayed jammed inside the head of a
+     * body that ST_DEAD does not even draw. The target already accounts for
+     * gstate, so running it every frame is what makes the camera ease home. */
+    { float prevAds=ads;
+      int bladeOut = swingT>0||swingCD>0;
+      ads = toward(ads, (gstate==ST_PLAY&&adsHold&&!bladeOut)?1.0f:0.0f, dt*11.0f);
+      float rate=fabsf(ads-prevAds)/(dt>1e-6f?dt:1e-6f);
+      if(rate>0.9f && actT<0.06f) actT=0.06f; }
+    /* Screen-effect decays, out here for the same reason `ads` is. These three
+     * used to live inside the ST_PLAY block while their consumers did not, and
+     * both terminal states SET them on the way out: hurt_player assigns
+     * shake=0.3/dmgFlash=0.6 and then gstate=ST_DEAD in the next statement, and
+     * shatter_enemy assigns shake=0.9 for a boss kill immediately before the
+     * nalive<=0 branch flips to ST_WIN. So the frame after you died or won, the
+     * decay stopped running and the camera kept being fed +-1 to +-3 degrees of
+     * shake, with the damage aberration pinned, until you clicked. */
+    if(dmgFlash>0)dmgFlash-=dt;
+    if(mzT>0)mzT-=dt;
+    if(shake>0)shake-=dt*1.2f;
     /* THE mechanic: world time follows your motion. walking, looking and
      * acting each push the target timescale toward 1; stillness lets it
      * sink to the MINTS creep. the player always moves in real time. */
@@ -4131,7 +5331,11 @@ int main(int argc,char**argv){
         rollT-=dt;
         if(rollT<0)rollT=0;
         move_circ(&px,&pz,rollDX*8.5f*dt,rollDZ*8.5f*dt,0.34f,py);
-        spawn_parts(2,px-rollDX*0.4f,py+0.45f,pz-rollDZ*0.4f,0.6f, 0.10f,0.50f,0.25f);
+        /* dust on a TIMER, not per frame: spawning two puffs every frame made the
+         * trail three times denser at 180fps than at 60, and drew from the sim
+         * RNG at a framerate-dependent rate. 0.02s -> the old 60fps density. */
+        for(rollPT+=dt; rollPT>0.02f; rollPT-=0.02f)
+          spawn_parts(2,px-rollDX*0.4f,py+0.45f,pz-rollDZ*0.4f,0.6f, 0.10f,0.50f,0.25f);
       } else if(ml>0.01f){
         mx/=ml;mz/=ml;
         move_circ(&px,&pz,mx*5.0f*dt,mz*5.0f*dt,0.34f,py);
@@ -4149,12 +5353,15 @@ int main(int argc,char**argv){
       }
       if(rollCD>0)rollCD-=dt;
       pvx=(px-ox)/dt; pvz=(pz-oz)/dt;
+      /* see the agents' e->spdS: same problem, same cure */
+      { float sp=sqrtf(pvx*pvx+pvz*pvz);
+        pspdS = sp>pspdS ? sp : toward(pspdS,sp,dt*7.0f); }
       pmoveb=toward(pmoveb,(ml>0.01f||rollT>0)?1.0f:0.0f,dt*9.0f);
       /* travel-locked cadence: stride phase advances with actual ground speed,
        * so the planted foot tracks the floor instead of skating. A faint idle
        * creep keeps the pose from freezing mid-step. (phase = bobT*7.5 in draw) */
       { float sp=sqrtf(pvx*pvx+pvz*pvz);
-        bobT+=dt*(0.12f+0.62f*sp); }
+        bobT+=dt*(0.12f+0.62f*pspdS); (void)sp; }
       /* the avatar's facing eases toward the roll direction and back —
        * no yaw snap entering or leaving a sideways roll */
       avYaw=angto(avYaw, rollT>0? atan2f(rollDX,-rollDZ) : pyaw*PI/180.0f,
@@ -4172,8 +5379,14 @@ int main(int argc,char**argv){
         /* knee absorb: any landing worth hearing also gets a visible dip, so
          * the avatar stops arriving on the floor rigid. Scaled by impact and
          * decayed on raw dt — this is pose feedback, not simulation. */
+        /* landT is the knee absorb. It was ASSIGNED on the touchdown frame and
+         * then decayed smoothly — so the hips dropped 26cm, the torso pitched 11
+         * degrees and the free arm threw 24 degrees all in a single frame, and
+         * only the recovery was animated. Physically it is backwards: a knee
+         * absorb has a fast but finite attack and a slower release. landTgt is
+         * the target the compression now runs TO over ~60ms. */
         { float imp=clampf(-pvy/15.0f,0,1);
-          if(imp>landT)landT=imp; }
+          if(imp>landTgt)landTgt=imp; }
         py=gh; pvy=0; jumps=1;
       }
       int air = py>gh+0.01f;
@@ -4234,11 +5447,10 @@ int main(int argc,char**argv){
       }
       if(swRel>0){ swRel-=dt*4.0f; if(swRel<0)swRel=0; }
       if(swStow>0){ swStow-=dt*3.0f; if(swStow<0)swStow=0; }
-      if(landT>0){ landT-=dt*3.6f; if(landT<0)landT=0; }
-      if(dmgFlash>0)dmgFlash-=dt;
+      /* attack toward the target fast, then release with it as it decays */
+      if(landTgt>0){ landTgt-=dt*3.6f; if(landTgt<0)landTgt=0; }
+      landT = landT<landTgt ? toward(landT,landTgt,dt*17.0f) : landTgt;
       if(hurtCD>0)hurtCD-=dt;
-      if(mzT>0)mzT-=dt;
-      if(shake>0)shake-=dt*1.2f;
       if(msgT>0)msgT-=dt;
       winT+=dt;
 
@@ -4273,6 +5485,10 @@ int main(int argc,char**argv){
       float pg=floor_at(p->x,p->z);
       if(p->y<pg+0.02f){p->y=pg+0.02f;p->vy*=-0.3f;p->vx*=0.7f;p->vz*=0.7f;}
     }
+    /* the death collapse runs on world time, so a kill at MINTS hangs exactly
+     * as long as the shards it threw do */
+    for(int i=0;i<nen;i++) if(en[i].dieT>0){
+      en[i].dieT-=wdt; if(en[i].dieT<0)en[i].dieT=0; }
     for(int i=0;i<MAXSHARD;i++){
       Shard*s=&shards[i]; if(s->life<=0)continue;
       s->life-=wdt; s->vy-=7.0f*wdt;
@@ -4285,12 +5501,19 @@ int main(int argc,char**argv){
     for(int i=0;i<MAXTEMPL;i++) if(templ_[i].life>0)templ_[i].life-=wdt;
 
     /* render */
+    pose_dirty();   /* render phase: solve once, share across every consumer */
     post_begin();
     { const LevelDef*LV=&LEVELS[curlevel];
       glClearColor(LV->fog[0],LV->fog[1],LV->fog[2],1); }
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+    float adsE=ads_amt();
     glMatrixMode(GL_PROJECTION); glLoadIdentity();
-    { float zn=0.08f, t=zn*tanf(35*PI/180), a=(float)WINW/WINH;
+    /* FOV lerped in TAN space, not in degrees: the tangent is what actually
+     * scales on screen, so interpolating the angle makes the zoom lurch through
+     * the middle of the transition. The near plane comes in as we zoom so the
+     * carried pistol, which ends up about 40cm from the eye, does not clip. */
+    { float tanF=tanf(FOV_HIP*PI/180)+(tanf(FOV_ADS*PI/180)-tanf(FOV_HIP*PI/180))*adsE;
+      float zn=0.08f-0.045f*adsE, t=zn*tanF, a=(float)fbW/fbH;
       glFrustum(-t*a,t*a,-t,t,zn,80.0f); }
     glMatrixMode(GL_MODELVIEW); glLoadIdentity();
     /* smoothed shake: per-frame white noise read as flicker, not impact.
@@ -4298,7 +5521,12 @@ int main(int argc,char**argv){
     static float shxS=0,shyS=0;
     shxS=toward(shxS, shake>0?(vrand()-0.5f)*shake*7.0f:0.0f, dt*30.0f);
     shyS=toward(shyS, shake>0?(vrand()-0.5f)*shake*7.0f:0.0f, dt*30.0f);
-    float shx=shxS, shy=shyS;
+    /* Shake is applied as raw DEGREES of view rotation. From behind the shoulder
+     * that reads as a camera jolt; from inside the head the same angle is a
+     * whiplash, and through a narrower lens it is worse again. Damp it as we
+     * zoom, by the same tan ratio the mouse uses. */
+    float shakeDamp=1.0f+(tanf(FOV_ADS*PI/180)/tanf(FOV_HIP*PI/180)*0.55f-1.0f)*adsE;
+    float shx=shxS*shakeDamp, shy=shyS*shakeDamp;
     float yr=pyaw*PI/180.0f;
     float fx=sinf(yr), fz=-cosf(yr), rx=cosf(yr), rz=sinf(yr);
     /* third-person boom with occlusion: cast at the desired offset, snap IN
@@ -4313,18 +5541,44 @@ int main(int argc,char**argv){
     float hit=ray_wall(px,camYs,pz,ux,0,uz,boom+0.30f);
     float maxd=hit-0.28f; if(maxd<0.40f)maxd=0.40f;
     float tgt=boom<maxd?boom:maxd;
-    if(tgt<camDist)camDist=tgt; else camDist=toward(camDist,tgt,dt*5.0f);
-    float camx=px+ux*camDist;
-    float camz=pz+uz*camDist;
+    /* Occlusion snapped IN in a single frame. Behind the shoulder that is the
+     * right call (never clip through a wall); from inside the head it is a
+     * teleport. Ease both directions, fast inward so cover still works. */
+    camDist=toward(camDist,tgt, dt*(tgt<camDist?18.0f:5.0f));
+    /* ADS scales the SOLVED boom length. It must be applied here, after the
+     * occlusion clamp — folding it into the offset would make the wall probe
+     * shorten with the zoom and the camera would stop respecting cover. */
+    float camDistA=camDist*(1.0f-adsE);
+    float camx=px+ux*camDistA;
+    float camz=pz+uz*camDistA;
     /* one dip per FOOTFALL (2x the per-leg rate — plants land at phase 0 and
      * PI), phase-locked with the stride and the step SFX; the old 7.0 beat
      * against the legs' 7.5 and drifted in and out of sync */
-    float camy=clampf(camYs+(gstate==ST_PLAY?sinf(bobT*15.0f)*0.016f:0.0f),
-                      0.25f,wallh-0.15f);
+    float camy3=camYs+(gstate==ST_PLAY?sinf(bobT*15.0f)*0.016f:0.0f);
+    /* The first-person eye comes from the POSE, not from EYE (1.62) — that
+     * constant matches neither the third-person pivot (py+2.02) nor where the
+     * avatar's eye slits are actually drawn. player_pose gives the mid-body
+     * pivot; the head rides 1.29*tk above it and the slits 0.036 above that, so
+     * this puts the camera exactly behind the eyes and it tracks the roll tuck
+     * and the landing absorb for free. */
+    float camyA=camy3;
+    if(gstate==ST_PLAY){
+      const PPose*EP=pose_get();
+      camyA=EP->pcy+1.29f*EP->tk+0.036f;
+    }
+    float camy=camy3+(camyA-camy3)*adsE;
+    /* Keep the eye inside the room. NB: on a double jump from a raised floor in
+     * a low sector this can still lag the body, because the player has no
+     * head-vs-ceiling collision — jumping your skull through the roof is legal.
+     * Fixing that properly means capping py, which would nerf SUBWAY's train-roof
+     * play, so it is left as a known edge. */
+    camy=clampf(camy,0.25f,wallh-0.10f);
     glRotatef(ppitch+shy,1,0,0);
     glRotatef(pyaw+shx,0,1,0);
     glTranslatef(-camx,-camy,-camz);
 
+    /* the view is final: harvest the six clip planes for this frame's culling */
+    frustum_build();
     { float yrb=pyaw*PI/180.0f, prb=ppitch*PI/180.0f;   /* billboard basis */
       bbRx=cosf(yrb); bbRz=sinf(yrb);
       bbUx=sinf(yrb)*sinf(prb); bbUy=cosf(prb); bbUz=-cosf(yrb)*sinf(prb); }
@@ -4334,6 +5588,33 @@ int main(int argc,char**argv){
     post_end(clampf((tsEff-MINTS)/(1.0f-MINTS),0,1), clampf(dmgFlash,0,1), gtime);
     draw_hud();
 
+    { float fms=(float)((SDL_GetPerformanceCounter()-fStart)/pcHz)*1000.0f;
+      /* skip warm-up (shader compiles, first-use uploads) and any frame that is
+       * about to do a glReadPixels + PPM write — that is harness cost, and it
+       * was landing on ~7% of frames, which is to say exactly on the p95. */
+      if(frame>4 && !pendingShot){
+        if(fms<fmsMin)fmsMin=fms; if(fms>fmsMax)fmsMax=fms;
+        if(fmsN<FMSCAP)fms_[fmsN++]=fms; }
+      /* Adaptive quality. We cannot ask GL2 what GPU this is in any way worth
+       * trusting, so measure instead: a slow rolling average of the REAL frame
+       * interval (not our CPU slice — the GPU is the wall on the hardware this
+       * is for). Step down when we are missing the budget, and only step back up
+       * from a comfortable margin, so a tier change can never start oscillating.
+       * A manual Q press pins the tier and switches this off for good. */
+      static float avgDt=0; static float holdT=0;
+      if(qualAuto && !smoke && !titlecap && frame>40){
+        avgDt = avgDt<=0? dt : avgDt+(dt-avgDt)*clampf(dt*1.5f,0,1);
+        holdT += dt;
+        if(holdT>1.5f){
+          if(avgDt>0.0215f && qual>0){          /* under ~46fps: drop a tier */
+            qual--; free_post(); init_post(4); holdT=0; avgDt=0;
+            printf("[dilation] quality auto -> %s (%.1f fps)\n",QUAL[qual].name,1.0f/dt);
+          } else if(avgDt<0.0092f && qual<2 && holdT>4.0f){ /* >108fps: room to spare */
+            qual++; free_post(); init_post(4); holdT=0; avgDt=0;
+            printf("[dilation] quality auto -> %s\n",QUAL[qual].name);
+          }
+        }
+      } }
     if(pendingShot){ shot_ppm(pendingShot); pendingShot=0; }
     SDL_GL_SwapWindow(win);
   }
