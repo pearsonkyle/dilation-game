@@ -210,6 +210,9 @@ static float sstep(float x){ x=clampf(x,0,1); return x*x*(3-2*x); }
 static float easeOutBack(float x){ x=clampf(x,0,1); float c=1.70158f,k=x-1;
   return 1.0f+(c+1.0f)*k*k*k+c*k*k; }
 static float toward(float v,float t,float k){ return v+(t-v)*clampf(k,0,1); }
+/* frame-rate-exact blend weight for toward(): dt*k is a first-order step that
+ * overshoots at low frame rates (dt*30 at 30fps is a full snap) */
+static float expk(float k,float dt){ return 1.0f-expf(-k*dt); }
 /* like toward, but on an angle: takes the short way around */
 static float angto(float a,float b,float k){
   float d=fmodf(b-a+PI,2*PI); if(d<0)d+=2*PI; d-=PI;
@@ -1982,6 +1985,10 @@ static float winRealT,winSimT;   /* both clocks, frozen at the moment of victory
 static float rollPT;             /* roll dust accumulator: spawn on time, not per frame */
 static float swRel,swStow;   /* katana exit blends: end-of-cut->carry, carry->pistol */
 static float gunCharge;                       /* 0..1, controls laser/shot range */
+static float pyV;       /* visual foot height: eases up steps, snaps down drops           */
+static float lookS;     /* smoothed turn rate for the aim-settle hysteresis                */
+static float fax[2],faz[2],fstep[2],fsx[2],fsz[2],ftx[2],ftz[2]; static int flock; /* planted feet */
+static float camFade=1; /* avatar fade when the boom collapses onto it                     */
 static float aimSet=1,stableT;      /* physical aim: 0 = gun rides the running
                                        body, 1 = settled on the look ray after
                                        GUN_SETTLE_TIME of stillness */
@@ -2002,13 +2009,14 @@ static void reset_game(void){
   gen_level(curlevel,gseed^reroll);
   px=startx; pz=startz; pyaw=startyaw; ppitch=0; pvx=pvz=pvy=0;
   avYaw=startyaw*PI/180.0f;
-  py=hgt[(int)(startz/CELL)][(int)(startx/CELL)];
+  py=hgt[(int)(startz/CELL)][(int)(startx/CELL)]; pyV=py;
   php=100; pammo=6; jumps=1;
   tscale=tsEff=1; actT=0; mouseAcc=0;
   aimSet=1; stableT=GUN_SETTLE_TIME;   /* you jack in standing still: settled */
   rollT=rollCD=rollDX=rollDZ=kvx=kvz=pmoveb=pspdS=0;
   coyT=hurtCD=mzT=landT=landTgt=hitstop=airB=0;
   ads=0; adsHold=0;   /* respawning mid-zoom used to drop you in already aimed */
+  lookS=0; flock=0; fstep[0]=fstep[1]=1; camFade=1;
   camDist=3.05f; camYs=-1.0f;
   fireCD=swingT=swingCD=dmgFlash=stepT=shake=bobT=winT=wtime=0;
   winRealT=winSimT=rollPT=0;
@@ -2196,55 +2204,112 @@ static void player_aim(float*dx,float*dy,float*dz){
 /* one deterministic evaluation of the avatar's whole-body stance — shared by
  * draw_player and the sim-side aiming chain below, so the drawn figure and
  * the ballistics can never drift apart. */
+/* ---- avatar anatomy, shared by the pose solver and the renderer ---------
+ * one set of numbers so the drawn figure and the ballistics can never drift */
+#define SPINE_Y    0.62f   /* upper-body pivot above the body origin        */
+#define SHOULDER_Y 1.05f
+#define ARM_X      0.29f
+#define UPPER_L    0.38f   /* shoulder -> elbow                               */
+#define FORE_L     0.35f   /* elbow -> wrist                                  */
+#define LEG_L1     0.50f
+#define LEG_L2     0.46f
+#define HIP_Y      0.37f
+/* travel-locked gait law. The phase clock bobT advances at (0.12+0.36*sp)/s
+ * and every consumer multiplies by GAIT_K, so full sprint (5 u/s) runs at
+ * 14.4 rad/s = 4.6 footfalls a second with a 1.1u step: a run, not the old
+ * 7.7 Hz scurry. */
+#define GAIT_K     7.5f
+/* one deterministic evaluation of the avatar's whole-body stance — shared by
+ * draw_player and the sim-side aiming chain below, so the drawn figure and
+ * the ballistics can never drift apart. */
 typedef struct {
   int rolling,blade;
-  float tuck,tk,walk,armw,s,spd,run,fwdb,latb,absorb,poseYaw,pcy;
-  float M[9];
+  float tuck,tk,walk,armw,s,cut,swIn,spd,run,fs,fwdb,latb,absorb,idle,breath,
+        poseYaw,pcy,bounce;
+  float M[9];       /* pelvis / legs basis                                    */
+  float Mu[9];      /* upper body: spine twist + curl + idle sway, about the
+                       spine base — the roll folds the chest onto the pelvis
+                       instead of squashing every anchor height              */
+  float ux,uy,uz;   /* spine base pivot (world)                               */
+  float eyex,eyey,eyez;   /* between the eye slits (world): the ADS camera   */
 } PPose;
+/* world position of an upper-body point given in body-local coordinates */
+static void ppos_u(const PPose*P,float x,float y,float z,float*w){
+  float o[3]; m3v(P->Mu,x,y-SPINE_Y,z,o);
+  w[0]=P->ux+o[0]; w[1]=P->uy+o[1]; w[2]=P->uz+o[2];
+}
 static void player_pose(PPose*P){
   P->rolling = rollT>0;
   float rp = P->rolling? sstep(1.0f-rollT/ROLL_TIME) : 0; /* roll progress    */
   P->tuck = P->rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
-  P->tk = 1.0f-0.50f*P->tuck;                          /* anchors pull in    */
-  P->walk = sinf(bobT*7.5f);
-  /* contralateral arm phase: the arms were driven by sin (peaking at ph=PI/2),
-   * 90 degrees out of phase with the legs' triangle stride (peaking at ph=0).
-   * cos peaks with the stride: right arm forward as the LEFT leg plants. */
-  P->armw = cosf(bobT*7.5f);
+  P->tk = 1.0f-0.10f*P->tuck;                          /* the curl does the folding now */
+  P->walk = sinf(bobT*GAIT_K);
+  /* contralateral arm phase: cos peaks with the stride, so the right arm is
+   * forward as the LEFT leg plants */
+  P->armw = cosf(bobT*GAIT_K);
   P->s = swingT>0? clampf(swingT/SWING_TIME,0,1) : 0;  /* katana swing phase */
+  P->cut  = sstep(clampf((P->s-0.08f)/0.60f,0,1));     /* a beat of wind-up, then the whip: mid-arc at the strike frame */
+  P->swIn = sstep(clampf(swingT/0.07f,0,1));           /* entry eases from the carry  */
   P->blade = P->s>0 || swingCD>0;                      /* + follow-through   */
   /* ONE yaw for every stance. avYaw lives in the aim convention (forward =
-   * (sin a, -cos a), like pyaw/player_aim) and eases toward the look yaw —
-   * or toward the roll direction mid-roll — in the main loop. m3rotY() maps
-   * local -Z forward to (-sin a, -cos a), so the model always takes the
-   * NEGATED angle. The old code negated only the combat stance and fed the
-   * raw avYaw to rolls, which mirrored sideways rolls (a strafe-right dodge
-   * faced left) and popped the body by up to 180° entering/leaving them. */
+   * (sin a, -cos a), like pyaw/player_aim) and eases toward the look yaw in
+   * the main loop. m3rotY() maps local -Z forward to (-sin a, -cos a), so the
+   * model always takes the NEGATED angle. Rolls no longer slew the yaw: the
+   * somersault axis is chosen from the roll direction instead (below). */
   P->poseYaw = -avYaw;
   P->spd=sqrtf(pvx*pvx+pvz*pvz);
-  P->run=clampf(P->spd/5.0f,0,1)*pmoveb;
+  /* run blend from the SMOOTHED speed: the sim starts and stops dead (that is
+   * the control feel), the stride eases in and out over a few frames */
+  P->run=clampf(pspdS/5.0f,0,1)*pmoveb;
+  P->fs = 0.5f-0.10f*P->run;     /* stance fraction: walk 0.5 -> sprint 0.4 (flight) */
   P->fwdb=0; P->latb=0;
   if(P->spd>0.05f){
-    /* local move blends in the aim convention (the agents' formula) — these
-     * were computed with the negated yaw, so lean/sway wandered with the
-     * world heading: running forward gave fwdb=cos(2*yaw) instead of 1. */
     float ivx=pvx/P->spd, ivz=pvz/P->spd;
     P->fwdb=ivx*sinf(avYaw)-ivz*cosf(avYaw);
     P->latb=ivx*cosf(avYaw)+ivz*sinf(avYaw);
   }
-  /* landing absorb: eased square so the dip hits hard and recovers soft. The
-   * hips drop, the IK feet stay on the floor, and the knees fold to make up
-   * the difference — the same trick the boss uses on its leap recoil. */
-  P->absorb = P->rolling? 0 : landT*landT;
-  float lean = P->rolling? rp*2*PI
-             : (0.07f+0.07f*clampf(P->fwdb,0,1))*P->run + 0.20f*P->absorb
-               + 0.10f*airB;                      /* slight airborne pitch-in */
-  float sway = P->rolling? 0
-             : (-0.10f*P->latb*P->run + 0.025f*P->walk*P->run); /* counter-tilt */
+  /* landing absorb: landT attacks toward the impact over ~60ms and releases
+   * with it, so the knees fold on contact instead of the old one-frame dip */
+  P->absorb = P->rolling? 0 : landT;
+  P->idle = (1.0f-P->run)*(1.0f-airB)*(P->rolling?0.0f:1.0f);
+  P->breath = 1.0f+0.018f*sinf(gtime*1.8f)*P->idle;
+  /* +rotX tips the head BACK, so every lean here is negated into the matrix:
+   * forward into the run, back on the rise of a jump, forward on the fall */
+  float lean = (0.10f+0.08f*clampf(P->fwdb,0,1))*P->run + 0.12f*P->absorb
+             + airB*clampf(-pvy/9.0f,-0.08f,0.14f)
+             + 0.02f*sinf(gtime*1.3f)*P->idle;
+  float sway = -0.10f*P->latb*P->run + 0.025f*P->walk*P->run
+             + 0.035f*sinf(gtime*0.8f)*P->idle;      /* idle weight shift */
   float R[9],X[9],Z[9],S0[9];
-  m3rotY(R,P->poseYaw); m3rotZ(Z,sway); m3rotX(X,lean); m3mul(S0,Z,X); m3mul(P->M,R,S0);
-  P->pcy=py+0.55f+0.25f*P->tuck-0.26f*P->absorb
-        + (P->rolling?0:0.025f*fabsf(P->walk)*P->run); /* ball clears floor */
+  m3rotY(R,P->poseYaw); m3rotZ(Z,sway); m3rotX(X,-lean); m3mul(S0,Z,X);
+  if(P->rolling){
+    /* somersault about the axis perpendicular to the ROLL direction, in the
+     * body frame: forward input rolls forward, S rolls backward, A/D cartwheel
+     * sideways — the body never has to spin round to face the roll first */
+    float f=rollDX*sinf(avYaw)-rollDZ*cosf(avYaw), l=rollDX*cosf(avYaw)+rollDZ*sinf(avYaw);
+    float phi=atan2f(-l,f), RY1[9],RY2[9],RXr[9],T[9];
+    m3rotY(RY1,phi); m3rotX(RXr,-rp*2*PI); m3rotY(RY2,-phi);
+    m3mul(T,RY1,RXr); m3mul(S0,T,RY2);
+  }
+  m3mul(P->M,R,S0);
+  /* body height: the running crouch buys the longer stride its reach, and a
+   * flight-phase bounce (lowest at mid-stance, highest between plants) */
+  { float ph=bobT*GAIT_K;
+    P->bounce=(0.5f-0.5f*cosf(2.0f*ph-2.0f*PI*P->fs))*P->run*P->run*(1.0f-airB)*(P->rolling?0.0f:1.0f); }
+  P->pcy=pyV+0.55f+0.25f*P->tuck-0.30f*P->absorb-0.09f*P->run+0.035f*P->bounce;
+  /* upper body: the katana cut winds the torso up to the left and follows
+   * through to the right, the roll curls the chest onto the pelvis, and the
+   * settled stance blades the torso toward the pistol (which also brings the
+   * support hand within reach of the grip) */
+  float twist = (0.30f-0.62f*P->cut)*P->swIn*(P->s>0?1.0f:0.0f);
+  if(P->blade && P->s<=0) twist = -0.32f*sstep(swRel);   /* end-of-cut pose easing out */
+  if(!P->blade) twist += -0.26f*sstep(aimSet)*(1.0f-airB)*(1.0f-P->tuck)*(1.0f-ads_amt());
+  float curl  = 0.75f*P->tuck + 0.15f*P->cut*P->swIn;
+  float TY[9],TX[9],TT[9]; m3rotY(TY,twist); m3rotX(TX,-curl); m3mul(TT,TY,TX);
+  m3mul(P->Mu,P->M,TT);
+  float sp[3]; m3v(P->M,0,SPINE_Y,0,sp);
+  P->ux=px+sp[0]; P->uy=P->pcy+sp[1]; P->uz=pz+sp[2];
+  { float e[3]; ppos_u(P,0,1.29f+0.036f,0,e); P->eyex=e[0]; P->eyey=e[1]; P->eyez=e[2]; }
 }
 
 /* the right arm + pistol, solved once for BOTH the renderer and the sim.
@@ -2258,62 +2323,47 @@ static void player_pose(PPose*P){
 typedef struct {
   float A[9],F[9],GP[9];          /* upper arm / forearm / gun grip bases */
   float sx,sy,sz;                 /* shoulder joint (world)               */
+  float ex,ey,ez;                 /* elbow (world)                        */
+  float hx,hy,hz;                 /* wrist (world)                        */
   float gx,gy,gz;                 /* gun origin (world)                   */
   float tipx,tipy,tipz;           /* barrel tip — muzzle                  */
   float bdx,bdy,bdz;              /* barrel direction (unit)              */
 } ArmR;
 static void player_arm_r(const PPose*P,ArmR*o){
-  float fr=clampf(fireCD/FIRE_TIME,0,1);
-  float raise,swYaw,sw;
-  if(P->rolling){ raise=0.35f+0.95f*P->tuck; swYaw=0; sw=1.0f; }
-  else {
-    float prad=ppitch*PI/180.0f;
-    float rs=1.18f+0.12f*sstep(fr)-prad*0.90f;    /* settled: on the look ray */
-    float rc=0.55f+0.30f*sstep(fr)-prad*0.30f;    /* carry: low, half-hearted */
-    raise = rc+(rs-rc)*aimSet;
-    swYaw = 0.06f*(1.0f-aimSet)+(-0.12f-0.05f*P->latb)*aimSet;
-    float aimDamp=1.0f+(0.18f-1.0f)*aimSet;       /* settle kills the pumping */
-    sw = P->armw*0.42f*P->run*aimDamp*clampf(1.3f-raise,0,1);
-    raise += 0.42f*P->absorb*(1.0f-aimSet);       /* landings jolt the carry  */
-    /* re-stow: the frame the katana leaves the hand the arm was at the
-     * 0.52/0.42 carry — ease from there into the pistol pose. The alignment
-     * below keeps the barrel exact regardless of the blended raise. */
-    raise += (0.52f-raise)*swStow;
-    swYaw += (0.42f-swYaw)*swStow;
-    /* ADS: bring the gun UP to eye level and IN across the centreline, so from
-     * inside the head it reads as a sight picture instead of a hand dangling in
-     * the corner of the frame. This changes the gun's POSITION only — the
-     * m3align below re-seats the barrel onto mix(pose, look ray, aimSet)
-     * regardless, so the ballistics are untouched and the sights still cannot
-     * disagree with where the round goes. Bringing it inboard also shrinks the
-     * muzzle-to-eye parallax, which is what makes the reticle honest up close. */
-    /* Raise target solved, not guessed: the eye sits 0.24 above the shoulder and
-     * the arm is 0.68 long, so the hand reaches eye level at acos(-0.24/0.68) =
-     * 1.93 rad. Below that the sights sit under the sight line and there is
-     * nothing to align — which is the entire point of the mode. */
-    { float ae=ads_amt();
-      raise += (1.66f-raise)*ae;
-      swYaw += (-0.42f-swYaw)*ae; }
-  }
-  /* Shouldering the weapon rolls the shoulder inboard AND presents it forward.
-   * Inboard because the real motion is a cheek weld, and without it the gun
-   * stays a hand's width to the right of where you are looking. Forward because
-   * the arm is only 0.68 long: with the shoulder at the eye, the whole weapon
-   * sits well inside half a metre and fills a zoomed frame. Pushing the shoulder
-   * out along the look direction buys apparent distance, which is the only lever
-   * available without giving the viewmodel its own projection. */
-  { float ae=P->rolling?0.0f:ads_amt();
-    /* all the way onto the centreline, not merely inboard: the sights have to be
-     * under the eye or they are decoration */
-    float sh[3]; m3v(P->M,0.27f-0.20f*ae,1.05f*P->tk,-0.22f*ae,sh);
-    o->sx=px+sh[0]; o->sy=P->pcy+sh[1]; o->sz=pz+sh[2]; }
+  float fr=clampf(fireCD/FIRE_TIME,0,1), fr2=fr*fr;   /* sharp kick, eased settle */
+  float prad=ppitch*PI/180.0f;
+  float rs=1.18f+0.12f*fr2-prad*0.90f;    /* settled: on the look ray */
+  float rc=0.55f+0.30f*fr2-prad*0.30f;    /* carry: low, half-hearted */
+  float raise = rc+(rs-rc)*aimSet;
+  float swYaw = 0.06f*(1.0f-aimSet)+(-0.12f-0.05f*P->latb)*aimSet;
+  float aimDamp=1.0f+(0.18f-1.0f)*aimSet;       /* settle kills the pumping */
+  float sw = P->armw*0.42f*P->run*aimDamp*clampf(1.3f-raise,0,1);
+  raise += 0.42f*P->absorb*(1.0f-aimSet);       /* landings jolt the carry  */
+  float elb = 0.16f+0.10f*(1.0f-aimSet);
+  /* ADS: bring the gun UP to eye level and IN across the centreline, so from
+   * inside the head it reads as a sight picture instead of a hand dangling in
+   * the corner of the frame. Position only — the m3align below re-seats the
+   * barrel onto mix(pose, look ray, aimSet) regardless, so the ballistics are
+   * untouched and the sights still cannot disagree with where the round goes. */
+  float ae = P->rolling?0.0f:ads_amt();
+  raise += (1.66f-raise)*ae;
+  swYaw += (-0.42f-swYaw)*ae;
+  sw *= (1.0f-ae);
+  /* the roll is a DELTA on whatever the arm was doing, scaled by the tuck —
+   * zero at both ends, so nothing pops entering or leaving it */
+  raise += (1.30f-raise)*P->tuck; sw*=(1.0f-P->tuck); swYaw*=(1.0f-P->tuck);
+  elb += 1.5f*P->tuck;
+  /* shouldering rolls the shoulder inboard AND presents it forward: a cheek
+   * weld, and the only way a 0.73 arm gets the weapon far enough from the eye */
+  float sh[3]; ppos_u(P,ARM_X-0.20f*ae,SHOULDER_Y,-0.22f*ae,sh);
+  o->sx=sh[0]; o->sy=sh[1]; o->sz=sh[2];
   float RX[9],RY[9],S[9],e[3],h[3];
-  m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(o->A,P->M,S);
-  m3v(o->A,0,-0.35f,0,e);
-  float ex=o->sx+e[0], ey=o->sy+e[1], ez=o->sz+e[2];
-  float RE[9]; m3rotX(RE,raise+sw+0.16f); m3mul(S,RY,RE); m3mul(o->F,P->M,S);
-  m3v(o->F,0,-0.33f,0,h);
-  float hx=ex+h[0], hy=ey+h[1], hz=ez+h[2];
+  m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(o->A,P->Mu,S);
+  m3v(o->A,0,-UPPER_L,0,e);
+  o->ex=o->sx+e[0]; o->ey=o->sy+e[1]; o->ez=o->sz+e[2];
+  float RE[9]; m3rotX(RE,raise+sw+elb); m3mul(S,RY,RE); m3mul(o->F,P->Mu,S);
+  m3v(o->F,0,-FORE_L,0,h);
+  o->hx=o->ex+h[0]; o->hy=o->ey+h[1]; o->hz=o->ez+h[2];
   /* grip: pistol_sh() barrels down local -Z; roll the basis into the palm */
   float GY[9],GX[9],GZ[9],GT[9];
   m3rotY(GY,0.04f); m3rotX(GX,-PI*0.5f-0.06f); m3rotZ(GZ,0.04f);
@@ -2329,35 +2379,89 @@ static void player_arm_r(const PPose*P,ArmR*o){
   /* ROLL LEVELLING. m3align above pins the barrel DIRECTION but says nothing
    * about the gun's rotation around it — that comes from wherever the wrist
    * happens to be, which is fine for a carried weapon and useless for a sighted
-   * one: raise the arm and the iron sights rotate off to the side. Roll the grip
-   * about its own barrel until the gun's local up meets world up, blended in by
-   * ads_amt() so the hip-fire pose keeps the wrist's character and the shouldered
-   * pose gets a true sight picture. Rolling ABOUT the barrel cannot disturb it,
-   * so the ballistics guarantee is untouched. */
-  { float ae=P->rolling?0.0f:ads_amt();
-    if(ae>0.001f){
-      float f[3]; m3v(o->GP,0,0,-1,f);
-      float u[3]; m3v(o->GP,0,1,0,u);
-      /* world up with the barrel component removed = the up we want, unless we
-       * are aiming straight up or down, where it degenerates and we leave it */
-      float d=f[1];
-      float vx=-f[0]*d, vy=1.0f-f[1]*d, vz=-f[2]*d;
-      float vl=sqrtf(vx*vx+vy*vy+vz*vz);
-      if(vl>0.15f){
-        vx/=vl; vy/=vl; vz/=vl;
-        float wx=u[0]+(vx-u[0])*ae, wy=u[1]+(vy-u[1])*ae, wz=u[2]+(vz-u[2])*ae;
-        float wl=sqrtf(wx*wx+wy*wy+wz*wz);
-        if(wl>1e-5f) m3align(o->GP, u[0],u[1],u[2], wx/wl,wy/wl,wz/wl);
-      }
-    } }
-  /* anchor the grip into the palm (inverse of pistol_sh's grip offset), with
-   * a small forearm-up lift that seats it visibly in the hand */
-  float go[3],lift[3]; m3v(o->GP,0,0.145f,0.020f,go); m3v(o->F,0,0.125f,0,lift);
-  o->gx=hx+go[0]+lift[0]; o->gy=hy+go[1]+lift[1]; o->gz=hz+go[2]+lift[2];
+   * one. Roll the grip about its own barrel until the gun's local up meets
+   * world up, blended in by ads_amt(). Rolling ABOUT the barrel cannot disturb
+   * it, so the ballistics guarantee is untouched. */
+  if(ae>0.001f){
+    float f[3]; m3v(o->GP,0,0,-1,f);
+    float u[3]; m3v(o->GP,0,1,0,u);
+    float d=f[1];
+    float vx=-f[0]*d, vy=1.0f-f[1]*d, vz=-f[2]*d;
+    float vl=sqrtf(vx*vx+vy*vy+vz*vz);
+    if(vl>0.15f){
+      vx/=vl; vy/=vl; vz/=vl;
+      float wx=u[0]+(vx-u[0])*ae, wy=u[1]+(vy-u[1])*ae, wz=u[2]+(vz-u[2])*ae;
+      float wl=sqrtf(wx*wx+wy*wy+wz*wz);
+      if(wl>1e-5f) m3align(o->GP, u[0],u[1],u[2], wx/wl,wy/wl,wz/wl);
+    }
+  }
+  /* recoil AFTER the alignment: the muzzle flips up and the slide rides back
+   * for the length of fireCD. A round only ever leaves at fr=0 (fire() is
+   * gated on fireCD), so the kick is pure feedback — the laser jumps with it */
+  { float KX[9]; m3rotX(KX,0.10f*fr2); m3mul(o->GP,o->GP,KX); }
+  /* seat the grip in the fist: the grip centre sits 0.06 below the wrist
+   * (pistol_sh hangs it at -0.145 in grip space) and the slide runs over the
+   * knuckles, instead of the old anchor that put the grip up the forearm */
+  float go[3]; m3v(o->GP,0,0.085f,0.010f+0.030f*fr2,go);
+  o->gx=o->hx+go[0]; o->gy=o->hy+go[1]; o->gz=o->hz+go[2];
   float t[3]; m3v(o->GP,0,-0.010f,-0.40f,t);
   o->tipx=o->gx+t[0]; o->tipy=o->gy+t[1]; o->tipz=o->gz+t[2];
   float b2[3]; m3v(o->GP,0,0,-1,b2);
   o->bdx=b2[0]; o->bdy=b2[1]; o->bdz=b2[2];
+}
+
+/* the stride's foot target for leg li: hip + travel-locked sweep + swing lift
+ * (+ the airborne lead-leg split). Shared by the renderer and the planter. */
+static void foot_stride(const PPose*P,int li,float*hip,float*tg){
+  float side=li?0.14f:-0.14f, h[3]; m3v(P->M,side,HIP_Y,0,h);
+  hip[0]=px+h[0]; hip[1]=P->pcy+h[1]; hip[2]=pz+h[2];
+  float fdx,fdz;
+  if(P->spd>0.2f){ fdx=pvx/P->spd; fdz=pvz/P->spd; }
+  else { fdx=sinf(avYaw); fdz=-cosf(avYaw); }
+  /* stance sweeps straight back over the stance fraction of the cycle, the
+   * swing arcs forward over the rest; antiphase feet, a flight gap at speed */
+  float ph=fmodf(bobT*GAIT_K + (li?PI:0.0f), 2*PI); if(ph<0)ph+=2*PI;
+  float st=2*PI*P->fs, tri, swing;
+  if(ph<st){ float u=ph/st; tri=1.0f-2.0f*u; swing=0; }
+  else { float u=(ph-st)/(2*PI-st); tri=-1.0f+2.0f*u; swing=sinf(u*PI); }
+  /* half-stride from the cadence law: the stance foot sweeps 2*half in its
+   * stance time at exactly the ground speed, so planted feet never skate */
+  float half=PI*P->fs*pspdS/(0.9f+2.7f*pspdS); if(half>0.50f)half=0.50f;
+  half*=(1.0f-airB);
+  float along=half*tri + airB*(li?0.16f:-0.12f);        /* lead knee in the air */
+  float lift=swing*0.16f*P->run*(1.0f-airB);
+  tg[0]=hip[0]+fdx*along; tg[2]=hip[2]+fdz*along;
+  tg[1]=pyV+0.03f+lift+airB*(0.26f+(li?0.08f:-0.04f));
+  tg[3]=swing;
+}
+/* planted feet. While the avatar stands, each foot keeps a world anchor and
+ * moves only by taking a STEP once the body has turned or drifted far enough
+ * from it — the IK targets used to hang off the pelvis basis, so turning in
+ * place swivelled the feet round the hips like a turret. Pose state on raw
+ * dt, cleared by reset_game. */
+static void update_feet(float dt){
+  PPose P; player_pose(&P);
+  int standing = pspdS<0.6f && !P.rolling && airB<0.5f;
+  if(!standing){ flock=0; return; }
+  float home[2][2]; int stepping=0;
+  for(int li=0;li<2;li++){
+    float hip[3],tg[4]; foot_stride(&P,li,hip,tg);
+    home[li][0]=hip[0]; home[li][1]=hip[2];
+    if(!flock){ fax[li]=tg[0]; faz[li]=tg[2]; fstep[li]=1; }   /* plant where the stride left them */
+    else if(fstep[li]<1){
+      fstep[li]+=dt/0.16f; if(fstep[li]>1)fstep[li]=1;
+      float k=sstep(fstep[li]);
+      fax[li]=fsx[li]+(ftx[li]-fsx[li])*k; faz[li]=fsz[li]+(ftz[li]-fsz[li])*k;
+      stepping=1;
+    }
+  }
+  flock=1;
+  if(!stepping){   /* one foot at a time: the one farthest from home goes first */
+    float best=0.12f; int bi=-1;
+    for(int li=0;li<2;li++){ float dx=fax[li]-home[li][0], dz=faz[li]-home[li][1];
+      float d=sqrtf(dx*dx+dz*dz); if(d>best){best=d;bi=li;} }
+    if(bi>=0){ fstep[bi]=0; fsx[bi]=fax[bi]; fsz[bi]=faz[bi]; ftx[bi]=home[bi][0]; ftz[bi]=home[bi][1]; }
+  }
 }
 
 /* ---------------------------------------------------------------- pose cache
@@ -2392,7 +2496,7 @@ static void player_laser(float*mx,float*my,float*mz,float*dx,float*dy,float*dz,
   *hx=*mx+*dx*d; *hy=*my+*dy*d; *hz=*mz+*dz*d; *dist=d;
 }
 static int laser_target(void){
-  if(gstate!=ST_PLAY||pammo<=0||rollT>0||swingT>0||swingCD>0)return -1;
+  if(gstate!=ST_PLAY||pammo<=0||rollT>0||swingT>0)return -1;
   float mx,my,mz,dx,dy,dz,hx,hy,hz,range;
   player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&range);
   float wall=ray_wall(mx,my,mz,dx,dy,dz,range);
@@ -2424,7 +2528,7 @@ static void fire(void){
    * and the lock-on already gate on it. Without it there was a ~0.24s window
    * where a round left a gun that is not drawn — flash, report and ammo spent
    * from a phantom pistol beside the katana. */
-  if(fireCD>0||rollT>0||swingT>0||swingCD>0)return;
+  if(fireCD>0||rollT>0||swingT>0)return;   /* the body is busy: not during the cut itself */
   if(pammo<=0){ sfx(V_CLICK); fireCD=0.3f; gunCharge=0; return; }
   /* sample the barrel FIRST: the round leaves the gun as it was at trigger
    * pull — where the gun physically points, not where the camera looks —
@@ -3187,16 +3291,35 @@ static void aim_basis(float dx,float dy,float dz,float*M){
 }
 /* 2-bone IK: knee for a leg from hip H to foot T, bones L1/L2, bending toward
  * the world pole (px,pz) (knees forward). Writes the knee world position. */
+/* basis with local -Y along (dx,dy,dz) and local X = the HINT projected off
+ * the axis: a figure that passes its own lateral axis keeps facets and light
+ * strips on the same side of every limb at any yaw or raise */
+static void aim_basis_h(float dx,float dy,float dz,float hx,float hy,float hz,float*M){
+  float l=sqrtf(dx*dx+dy*dy+dz*dz); if(l<1e-5f){ m3id(M); return; }
+  float yx=-dx/l, yy=-dy/l, yz=-dz/l;
+  float d=hx*yx+hy*yy+hz*yz;
+  float xx=hx-yx*d, xy=hy-yy*d, xz=hz-yz*d;
+  float xl=sqrtf(xx*xx+xy*xy+xz*xz);
+  if(xl<1e-3f){ /* hint parallel to the limb: any perpendicular will do */
+    xx=yy; xy=-yx; xz=0.0f;                                  /* Y x (0,0,1) */
+    if(fabsf(yz)>0.85f){ xx=0.0f; xy=yz; xz=-yy; }             /* Y x (1,0,0) */
+    xl=sqrtf(xx*xx+xy*xy+xz*xz); if(xl<1e-5f)xl=1; }
+  xx/=xl;xy/=xl;xz/=xl;
+  float zx=xy*yz-xz*yy, zy=xz*yx-xx*yz, zz=xx*yy-xy*yx;       /* Z = X×Y */
+  M[0]=xx;M[1]=xy;M[2]=xz; M[3]=yx;M[4]=yy;M[5]=yz; M[6]=zx;M[7]=zy;M[8]=zz;
+}
+/* 2-bone IK: middle joint for a limb from H to T, bones L1/L2, bending toward
+ * the 3D pole direction (knees forward, elbows out/down). */
 static void ik2(float hx,float hy,float hz,float tx,float ty,float tz,
-                float L1,float L2,float polex,float polez,
+                float L1,float L2,float polex,float poley,float polez,
                 float*kx,float*ky,float*kz){
   float dx=tx-hx,dy=ty-hy,dz=tz-hz;
   float dist=sqrtf(dx*dx+dy*dy+dz*dz); if(dist<1e-4f)dist=1e-4f;
   float ux=dx/dist,uy=dy/dist,uz=dz/dist;
   float d1=(dist*dist+L1*L1-L2*L2)/(2.0f*dist);
   float hh=L1*L1-d1*d1; hh=hh>0?sqrtf(hh):0;
-  float pdot=polex*ux+polez*uz;                 /* project pole ⟂ to u */
-  float nx=polex-ux*pdot, ny=-uy*pdot, nz=polez-uz*pdot;
+  float pdot=polex*ux+poley*uy+polez*uz;        /* project pole ⟂ to u */
+  float nx=polex-ux*pdot, ny=poley-uy*pdot, nz=polez-uz*pdot;
   float nl=sqrtf(nx*nx+ny*ny+nz*nz);
   if(nl<1e-3f){ nx=0;ny=0;nz=1; nl=1; }
   nx/=nl;ny/=nl;nz/=nl;
@@ -3205,7 +3328,7 @@ static void ik2(float hx,float hy,float hz,float tx,float ty,float tz,
 
 static void pistol_sh(const float*W,float gx,float gy,float gz,int ammo){
   float o[3],M2[9],RX[9];
-  tintf(0.025f,0.030f,0.032f);
+  tintf(0.040f,0.048f,0.052f);
   /* The slide is a chamfered box, not a wedge. wedge_sh tapers inward toward +Y,
    * so the old slide was NARROWER on top than at the bottom — the opposite of a
    * real one, and it read as a doorstop. bevbox's cut edges also catch uRim,
@@ -3237,7 +3360,7 @@ static void pistol_sh(const float*W,float gx,float gy,float gz,int ammo){
     m3v(W,q*0.017f,0.038f,-0.055f,o);
     set_uM(W,gx+o[0],gy+o[1],gz+o[2]); box_sh(0.009f,0.026f,0.014f);
   }
-  tintf(0.025f,0.030f,0.032f);
+  tintf(0.040f,0.048f,0.052f);
   glUniform1f(uEmis,1.0f);
   int pip= ammo<6?ammo:6;
   for(int q=0;q<6;q++){
@@ -3502,7 +3625,7 @@ static void draw_agent(Enemy*e,float dim){
     float dxv=tgx-hx,dyv=tgy-hy,dzv=tgz-hz, dd=sqrtf(dxv*dxv+dyv*dyv+dzv*dzv);
     if(dd>maxr){ float k=maxr/dd; tgx=hx+dxv*k;tgy=hy+dyv*k;tgz=hz+dzv*k; }
     else if(dd<minr&&dd>1e-4f){ float k=minr/dd; tgx=hx+dxv*k;tgy=hy+dyv*k;tgz=hz+dzv*k; }
-    float kx,ky,kz; ik2(hx,hy,hz,tgx,tgy,tgz,L1,L2,polex,polez,&kx,&ky,&kz);
+    float kx,ky,kz; ik2(hx,hy,hz,tgx,tgy,tgz,L1,L2,polex,0,polez,&kx,&ky,&kz);
     float UB[9]; aim_basis(kx-hx,ky-hy,kz-hz,UB);
     float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.105f,0.084f,L1*1.04f,7, -L1, &jx,&jy,&jz);
     set_uM(UB,jx,jy,jz); sphere_sh(0.101f,0.121f,0.101f,6,4);   /* knee */
@@ -3639,54 +3762,56 @@ static void body_alpha(float a){
   else { glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE_MINUS_SRC_ALPHA);
          glUniform1f(uAlpha,a); }
 }
-/* One avatar arm: upper arm, elbow cap, forearm, cut mitt and the emissive
- * forearm strip, reporting the solved hand. The pistol arm (posed by the shared
- * player_arm_r solver) and the loop arms had this exact six-call sequence with
- * all twelve dimension constants written out twice, verbatim. Leaves the suit
- * tint and emissive restored, so callers can hang a weapon off the hand. */
-static void avatar_arm(const float*A,const float*F,
-                       float shx,float shy,float shz,float side,int vm,
-                       float*hx,float*hy,float*hz){
-  float ex,ey,ez;
-  /* vm = viewmodel (the camera is inside the head). The elbow ends up about 35cm
-   * from the eye with the arm shouldered, so the upper arm and its cap fill a
-   * third of a zoomed frame with a wall of near-plane geometry. Real viewmodels
-   * show a forearm and a weapon; solve the chain either way so the hand lands in
-   * exactly the same place, just skip drawing the part behind the elbow. */
+/* one avatar arm drawn joint to joint: upper arm (skipped for the first-person
+ * viewmodel, whose elbow would fill the frame), elbow bead, forearm, wrist bead
+ * and the emissive strip on the outer side. Bases come from the joint points
+ * with the torso's lateral axis as the X hint, so facets and strips stay on the
+ * same side of the limb in every pose. */
+static void avatar_arm(float sx,float sy,float sz,float ex,float ey,float ez,
+                       float hx,float hy,float hz,float side,int vm,
+                       float lx,float ly,float lz,float*FB){
+  float UB[9];
   if(!vm){
-    limb_seg(A,shx,shy,shz,-0.18f, 0.068f,0.058f,0.36f,7, -0.35f, &ex,&ey,&ez);
-    set_uM(A,ex,ey,ez); sphere_sh(0.070f,0.084f,0.070f,6,4);   /* elbow */
-  } else {
-    float e[3]; m3v(A,0,-0.35f,0,e); ex=shx+e[0]; ey=shy+e[1]; ez=shz+e[2];
+    aim_basis_h(ex-sx,ey-sy,ez-sz,lx,ly,lz,UB);
+    put(UB,sx,sy,sz,0,-UPPER_L*0.5f,0); cyl_shc(0.056f,0.068f,UPPER_L*1.02f,7,0);
+    set_uM(UB,ex,ey,ez); sphere_sh(0.070f,0.084f,0.070f,6,4);      /* elbow */
   }
-  limb_seg(F,ex,ey,ez,-0.16f, 0.058f,0.046f,0.34f,7, -0.33f, hx,hy,hz);
-  set_uM(F,*hx,*hy,*hz); wedge_sh(0.068f,0.110f,0.055f);
-  glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);        /* forearm strip */
-  put(F,ex,ey,ez, side*0.046f,-0.16f,0); box_sh(0.008f,0.20f,0.008f);
+  aim_basis_h(hx-ex,hy-ey,hz-ez,lx,ly,lz,FB);
+  put(FB,ex,ey,ez,0,-FORE_L*0.5f,0); cyl_shc(0.042f,0.054f,FORE_L*1.02f,7,0);
+  glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);
+  put(FB,ex,ey,ez, side*0.049f,-0.16f,0); box_sh(0.012f,0.20f,0.011f);   /* forearm strip */
   glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
+  set_uM(FB,hx,hy,hz); sphere_sh(0.046f,0.054f,0.046f,6,4);            /* wrist */
 }
 
 /* third-person player avatar: compact, sleek, low-poly and readable from
- * behind. The whole figure hangs off a mid-body pivot so the dodge roll can
- * somersault it; the camera never rolls with it. */
+ * behind. Pistol in the right hand (the shared solver), katana in the LEFT —
+ * the two weapons are always on the body, nothing ever blinks in or out.
+ * The lower body rides M, everything above the spine base rides Mu. */
+static void put_u(const PPose*P,const float*B,float x,float y,float z){
+  float w[3]; ppos_u(P,x,y,z,w); set_uM(B,w[0],w[1],w[2]);
+}
 static void draw_player(void){
   primArm=1;
   PPose P=*pose_get();
+  ArmR a=*arm_get();
   /* bodyA: 1 while hip-firing, dissolving to 0 as the camera enters the head.
    * Only the weapon arm stays solid — that IS the first-person viewmodel, and
    * it is posed by the same shared solver the ballistics read, so the sights
-   * cannot disagree with where the round goes.
-   * The band is late on purpose: it has to track where the CAMERA is, not where
-   * the blend is. At 0.55 the eye is still ~1.4 behind the body; by 0.88 it is
-   * 0.37 away and the torso is engulfing the lens, which is exactly when fading
-   * it reads as the camera passing through rather than as the body vanishing. */
+   * cannot disagree with where the round goes. The band is late on purpose: it
+   * tracks where the CAMERA is, not where the blend is. */
   float bodyA = 1.0f - clampf((ads_amt()-0.55f)/0.33f,0,1);
   int hideBody = bodyA<=0.01f;
   int rolling=P.rolling, blade=P.blade;
-  float tuck=P.tuck, tk=P.tk, walk=P.walk, armw=P.armw, s=P.s, spd=P.spd,
-        run=P.run, absorb=P.absorb,
-        poseYaw=P.poseYaw, pcy=P.pcy;
+  float tuck=P.tuck, walk=P.walk, armw=P.armw, s=P.s, cut=P.cut,
+        run=P.run, absorb=P.absorb, pcy=P.pcy;
   float M[9]; memcpy(M,P.M,36);
+  float Mu[9]; memcpy(Mu,P.Mu,36);
+  /* body axes: forward (-Z) for knee poles, lateral (+X) as the limb X hint so
+   * facets and the TRON strips stay on the outer side of every limb */
+  float bfx=-M[6], bfy=-M[7], bfz=-M[8];
+  float blx=M[0], bly=M[1], blz=M[2];
+  float ulx=Mu[0], uly=Mu[1], ulz=Mu[2];
 
   glUniform1f(uBump,0);
   glUniform1f(uGloss,0.55f);
@@ -3695,238 +3820,223 @@ static void draw_player(void){
   glUniform1f(uRim,0.70f); rimf(0.10f,1.00f,0.42f);  /* emerald crystal edge */
   body_alpha(bodyA);
 
-  /* legs. Walking: 2-bone IK with foot-planting — each foot's stride sweeps
-   * backward at exactly the locked cadence, so the planted foot stays put on
-   * the floor instead of skating, while the swing foot arcs forward. Rolling
-   * keeps the old tucked FK curl. Bones are a touch longer than hip height so
-   * the feet reach the ground with a real, athletic knee bend. */
-  float fdx,fdz;                                  /* world ground move dir (stride) */
-  if(spd>0.2f){ fdx=pvx/spd; fdz=pvz/spd; }
-  else { fdx=sinf(avYaw); fdz=-cosf(avYaw); }     /* aim convention, not the negated poseYaw */
-  /* knee pole = the body's TRUE forward (local -Z, where the face is drawn), so
-   * knees always bend forward even when backpedalling or strafing — never the
-   * reversed insect-leg bend that pointing the pole along travel produced. */
-  float polex=-M[6], polez=-M[8];
-  { float pl=sqrtf(polex*polex+polez*polez);
-    if(pl>1e-4f){ polex/=pl; polez/=pl; } else { polex=0; polez=-1; } }
+  /* ---- legs: 2-bone IK on a foot target that is the travel-locked stride
+   * while moving, the PLANTED anchor while standing, and a tucked body-space
+   * point in a roll — blended by weight so no hand-off pops */
+  float rollW = rolling? sstep(clampf(tuck*2.5f,0,1)) : 0;
+  float lockW = flock? clampf(1.0f-pspdS,0,1)*(1.0f-airB)*(1.0f-rollW) : 0;
+  float knee[2][3]={{0,0,0},{0,0,0}};
   for(int li=0;li<2&&!hideBody;li++){
     float side=li?0.14f:-0.14f;
-    float hip[3]; m3v(M,side,0.37f*tk,0,hip);
-    float hx=px+hip[0], hy=pcy+hip[1], hz=pz+hip[2];
-    if(rolling){
-      /* Tucked FK curl, driven by the ROLL's own curl amount — not by fwdb,
-       * which is a -1..1 movement blend that happens to sit near zero on a
-       * sideways roll and left the legs sticking straight out of a
-       * somersaulting torso. Hips and knees now fold with the tuck and
-       * unfold as the avatar comes back to its feet. */
-      float hipc=0.30f+1.10f*tuck, knee=0.55f+1.30f*tuck;
-      float UL[9],RX[9]; m3rotX(RX,hipc); m3mul(UL,M,RX);
-      float kx,ky,kz; limb_seg(UL,hx,hy,hz,-0.22f, 0.10f,0.078f,0.46f,7, -0.44f, &kx,&ky,&kz);
-      set_uM(UL,kx,ky,kz); sphere_sh(0.094f,0.113f,0.094f,6,4);
-      float LL[9],RK[9]; m3rotX(RK,hipc+knee); m3mul(LL,M,RK);
-      float ax,ay,az; limb_seg(LL,kx,ky,kz,-0.20f, 0.078f,0.050f,0.42f,7, -0.40f, &ax,&ay,&az);
-      set_uM(LL,ax,ay,az); wedge_sh(0.12f,0.055f,0.24f);
-      continue;
-    }
-    /* stride phase: antiphase feet, triangle sweep + swing-half lift. The
-     * triangle's backward slope is tuned to the cadence so stance feet lock. */
-    float ph=fmodf(bobT*7.5f + (li?PI:0.0f), 2*PI); if(ph<0)ph+=2*PI;
-    float tri   = ph<PI ? 1.0f-2.0f*ph/PI : -1.0f+2.0f*(ph-PI)/PI;
-    float swing = ph<PI ? 0.0f : sinf(ph-PI);
-    /* half-stride solved from the cadence law (bobT rate is 0.9+4.65*sp), so
-     * the stance foot's backward sweep cancels the travel at EVERY speed —
-     * the fixed 0.33*run only locked at full sprint and skated below it.
-     * Same law the agents already walk on (see draw_agent). Airborne, the
-     * stride collapses and the feet tuck up under the body instead of
-     * pedalling a full ground cycle against nothing. */
-    float strideHalf=0.5f*PI*pspdS/(0.9f+4.65f*pspdS);
-    if(strideHalf>0.36f)strideHalf=0.36f;
-    strideHalf*=(1.0f-airB);
-    float along=strideHalf*tri, lift=swing*0.14f*run*(1.0f-airB);
-    float tgx=hx+fdx*along, tgz=hz+fdz*along, tgy=py+0.03f+lift+0.26f*airB;
+    float hip[3],tg[4]; foot_stride(&P,li,hip,tg);
+    float hx=hip[0],hy=hip[1],hz=hip[2], tgx=tg[0],tgy=tg[1],tgz=tg[2], swing=tg[3];
+    if(lockW>0){ tgx+=(fax[li]-tgx)*lockW; tgz+=(faz[li]-tgz)*lockW;
+                 tgy+=(pyV+0.03f+0.07f*sinf(fstep[li]*PI)-tgy)*lockW; }
+    if(rollW>0){ float t[3]; m3v(M,side,HIP_Y-0.94f+0.72f*tuck,-0.30f*tuck,t);
+      tgx+=(px+t[0]-tgx)*rollW; tgy+=(pcy+t[1]-tgy)*rollW; tgz+=(pz+t[2]-tgz)*rollW; }
     /* keep the target inside the leg's reach so the knee never snaps straight */
-    float L1=0.50f,L2=0.46f, maxr=(L1+L2)*0.985f, minr=0.10f;
+    float maxr=(LEG_L1+LEG_L2)*0.985f, minr=0.10f;
     float dxv=tgx-hx,dyv=tgy-hy,dzv=tgz-hz, dd=sqrtf(dxv*dxv+dyv*dyv+dzv*dzv);
     if(dd>maxr){ float k=maxr/dd; tgx=hx+dxv*k;tgy=hy+dyv*k;tgz=hz+dzv*k; }
     else if(dd<minr&&dd>1e-4f){ float k=minr/dd; tgx=hx+dxv*k;tgy=hy+dyv*k;tgz=hz+dzv*k; }
-    float kx,ky,kz; ik2(hx,hy,hz,tgx,tgy,tgz,L1,L2,polex,polez,&kx,&ky,&kz);
-    /* upper leg hip->knee, lower leg knee->ankle; each limb_seg reports its end
-     * joint, which we reuse for the next joint and the caps (no recomputation) */
-    float UB[9]; aim_basis(kx-hx,ky-hy,kz-hz,UB);
-    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-L1*0.52f, 0.10f,0.078f,L1*1.04f,7, -L1, &jx,&jy,&jz);
-    set_uM(UB,jx,jy,jz); sphere_sh(0.094f,0.113f,0.094f,6,4);  /* knee */
-    float LB[9]; aim_basis(tgx-jx,tgy-jy,tgz-jz,LB);
-    float ax,ay,az; limb_seg(LB,jx,jy,jz,-L2*0.52f, 0.078f,0.050f,L2*1.04f,7, -L2, &ax,&ay,&az);
-    glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);   /* shin light strip */
-    put(LB,jx,jy,jz, li?0.043f:-0.043f,-0.24f,0); box_sh(0.007f,0.22f,0.007f);
+    float kx,ky,kz; ik2(hx,hy,hz,tgx,tgy,tgz,LEG_L1,LEG_L2,bfx,bfy,bfz,&kx,&ky,&kz);
+    knee[li][0]=kx; knee[li][1]=ky; knee[li][2]=kz;
+    set_uM(M,hx,hy,hz); sphere_sh(0.10f,0.10f,0.10f,7,5);       /* hip cap */
+    float UB[9]; aim_basis_h(kx-hx,ky-hy,kz-hz,blx,bly,blz,UB);
+    float jx,jy,jz; limb_seg(UB,hx,hy,hz,-LEG_L1*0.52f, 0.080f,0.100f,LEG_L1*1.04f,7, -LEG_L1, &jx,&jy,&jz);
+    set_uM(UB,jx,jy,jz); sphere_sh(0.094f,0.113f,0.094f,6,4);   /* knee bead, along the limb */
+    float LB[9]; aim_basis_h(tgx-jx,tgy-jy,tgz-jz,blx,bly,blz,LB);
+    float ax,ay,az; limb_seg(LB,jx,jy,jz,-LEG_L2*0.52f, 0.052f,0.074f,LEG_L2*1.04f,7, -LEG_L2, &ax,&ay,&az);
+    glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);         /* shin strip, proud of the facet */
+    put(LB,jx,jy,jz, li?0.061f:-0.061f,-0.24f,0); box_sh(0.013f,0.22f,0.012f);
     glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
-    float FF[9],FR[9],FX[9]; m3rotY(FR,poseYaw);
-    m3rotX(FX,0.30f*swing*run);      /* light dorsiflexion through the swing */
-    m3mul(FF,FR,FX);
-    /* the ankle the IK actually solved — the foot used to stay welded to
-     * floor height while the shin lifted, detaching at every swing */
-    set_uM(FF,ax,ay-0.003f,az); wedge_sh(0.12f,0.055f,0.26f);
+    /* foot: flat on the floor and yawed with the body, folding up onto the
+     * shin as the roll tucks; the ankle sits a quarter back from the heel */
+    float upx=0,upy=1,upz=0;
+    if(rollW>0){ float sx_=jx-ax,sy_=jy-ay,sz_=jz-az, sl=sqrtf(sx_*sx_+sy_*sy_+sz_*sz_+1e-9f);
+      upx+=(sx_/sl-upx)*rollW; upy+=(sy_/sl-upy)*rollW; upz+=(sz_/sl-upz)*rollW; }
+    float FB[9],FX[9],FF[9]; aim_basis_h(-upx,-upy,-upz,blx,bly,blz,FB);
+    m3rotX(FX,0.30f*swing*run); m3mul(FF,FB,FX);
+    put(FF,ax,ay-0.003f,az, 0,0,-0.055f); wedge_sh(0.12f,0.055f,0.26f);
   }
 
-  /* pelvis / jacket: same V-taper language as the agents */
   if(!hideBody){
-  float Mt[9]; memcpy(Mt,M,36); m3scl(Mt,1.0f,1.0f,0.62f);
+  /* ---- pelvis on M, chest on Mu: the V-taper, deep enough that the thighs
+   * no longer shelf out of a paper-thin slab; the chest breathes at idle, and
+   * a trapezius yoke slopes the chest into the neck instead of a flat disc */
+  float Mt[9]; memcpy(Mt,M,36); m3scl(Mt,1.0f,1.0f,0.70f);
   tintf(0.03f,0.04f,0.035f);
-  glUniform3f(uNSc,1,1,0.62f);
-  { float o[3];
-    m3v(M,0,0.49f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.175f,0.155f,0.24f,9);
-    m3v(M,0,0.87f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_sh(0.165f,0.25f,0.50f,9);
-    /* trapezius yoke — see draw_agent. Must sit INSIDE the uNSc=0.62 block: it
-     * shares the squashed basis, so it needs the same normal correction. */
-    m3v(M,0,1.00f*tk,0,o); set_uM(Mt,px+o[0],pcy+o[1],pz+o[2]); cyl_shc(0.235f,0.095f,0.15f,9,0); }
+  glUniform3f(uNSc,1,1,0.70f);
+  put(Mt,px,pcy,pz,0,0.49f,0); cyl_sh(0.175f,0.155f,0.24f,9);
+  { float Mc[9]; memcpy(Mc,Mu,36); m3scl(Mc,P.breath,1.0f,0.70f*P.breath);
+    glUniform3f(uNSc,P.breath,1,0.70f*P.breath);
+    put_u(&P,Mc,0,0.87f,0); cyl_sh(0.165f,0.24f,0.50f,9);
+    put_u(&P,Mc,0,1.00f,0); cyl_shc(0.225f,0.095f,0.15f,9,0); }
   glUniform3f(uNSc,1,1,1);
-  /* coat tails — the agents' best silhouette trick, now on the avatar: two
-   * hanging panels that kick out with the stride */
-  if(!rolling){
-    float flap=0.22f*run+0.16f*walk*run;
+  /* coat tails: two hanging panels that kick out with the stride and stream
+   * in the air; they ride the pelvis so the roll tumbles them with the body */
+  { float flap=(0.22f*run+0.16f*walk*run+0.35f*airB)*(1.0f-tuck);
     float CT[9],RXc[9]; m3rotX(RXc,-flap); m3mul(CT,M,RXc);
     tintf(0.024f,0.032f,0.028f);
     for(int ci=-1;ci<=1;ci+=2){
       float o[3]; m3v(CT,ci*0.092f,-0.26f,0.118f,o);
-      set_uM(CT,px+o[0],pcy+0.49f*tk+o[1],pz+o[2]); bevbox_sh(0.175f,0.48f,0.042f,0.018f);
-    }
-  }
+      set_uM(CT,px+o[0],pcy+0.49f+o[1],pz+o[2]); bevbox_sh(0.175f,0.48f,0.042f,0.018f);
+    } }
   /* TRON belt bar: a thin emissive line across the waist front */
   glUniform1f(uEmis,0.85f); tintf(0.10f,1.15f,0.50f);
-  put(M,px,pcy,pz,0,0.49f*tk,-0.112f); box_sh(0.16f,0.012f,0.010f);
+  put(M,px,pcy,pz,0,0.49f,-0.125f); box_sh(0.16f,0.012f,0.010f);
   glUniform1f(uEmis,0.08f);
   tintf(0.05f,0.06f,0.055f);
-  for(int si=-1;si<=1;si+=2){ put(M,px,pcy,pz,si*0.27f,1.05f*tk,0); sphere_sh(0.083f,0.083f,0.083f,7,5); }
-  }   /* !hideBody: pelvis, coat, belt, shoulder caps */
+  for(int si=-1;si<=1;si+=2){ put_u(&P,Mu,si*ARM_X,SHOULDER_Y,0); sphere_sh(0.083f,0.083f,0.083f,7,5); }
+  }
 
-  /* shoulders and arms. right arm: pistol carried/aimed via the SHARED solver
-   * (player_arm_r — the same transform the laser and bullets read), katana
-   * sweep on swing — wind-up across the left shoulder, cut down and across. */
+  /* ---- right arm: pistol, on the SHARED solver (the transform the laser and
+   * bullets read). The weapon arm is the viewmodel: always solid. */
   tintf(0.04f,0.05f,0.045f);
-  body_alpha(1.0f);          /* the weapon arm is the viewmodel: always solid */
-  if(!blade){
-    const ArmR a=*arm_get();
-    float hx2,hy2,hz2;
-    avatar_arm(a.A,a.F,a.sx,a.sy,a.sz,+1.0f,hideBody,&hx2,&hy2,&hz2);
+  body_alpha(1.0f);
+  { float FB[9];
+    avatar_arm(a.sx,a.sy,a.sz,a.ex,a.ey,a.ez,a.hx,a.hy,a.hz,+1.0f,hideBody,ulx,uly,ulz,FB);
+    /* the fist wraps the grip: drawn in grip space, tilted with it */
+    float M2[9],RXg[9]; m3rotX(RXg,-0.58f); m3mul(M2,a.GP,RXg);
+    put(M2,a.gx,a.gy,a.gz,0,-0.135f,-0.020f); wedge_sh(0.080f,0.090f,0.085f);
     tintf(0.03f,0.035f,0.04f);
-    /* Shrink the weapon as it becomes a viewmodel. A UNIFORM scale is safe here
-     * in a way a non-uniform one would not be: the fragment shader normalizes
-     * vN, so an even scale leaves every normal (and therefore the lighting) and
-     * the barrel direction exactly as they were — it only trims the bulk of a
-     * model that is genuinely half a metre from the lens. The alternative, a
-     * separate narrower projection for the viewmodel, would break this game's
-     * one real guarantee: that the gun you see IS the gun the bullet leaves. */
+    /* shrink the weapon as it becomes a viewmodel: a UNIFORM scale leaves every
+     * normal and the barrel direction exactly as they were */
     { float ae=ads_amt(), vs=1.0f-0.30f*ae;
       float GS[9]; memcpy(GS,a.GP,36); m3scl(GS,vs,vs,vs);
       pistol_sh(GS,a.gx,a.gy,a.gz,pammo); }
-    glUniform1f(uEmis,0.08f);   /* pistol_sh leaves uEmis at 1.0 for its pips */
-    tintf(0.04f,0.05f,0.045f);
-  }
-  for(int ai=0;ai<2;ai++){
-    if(ai&&!blade)continue;            /* drawn above, off the shared solver */
-    /* NB: the `continue` above means ai==1 implies blade==1. That made the whole
-     * pistol-carry branch that used to live here — and PPose.aimStance with it —
-     * unreachable: aimStance is `!rolling && !blade`, so it was provably 0 at
-     * every one of its four uses. The live pistol pose is player_arm_r's. */
-    float raise, swYaw=0;
-    if(ai){
-      if(s>0){
-        /* Katana sweep: lock the torso in combat yaw and let the arm do the
-         * work.  A compact S-curve avoids the old apparent 180-degree body
-         * flip while still reading as a right-shoulder-to-left-hip cut. */
-        float cut=sstep(s);
-        raise = 1.08f + 0.32f*sinf(s*PI) - 0.30f*cut;
-        swYaw = -0.62f + 1.36f*cut;
-      }
-      /* swRel=1 is exactly the end-of-cut pose (0.78/0.74): the arm now
-       * eases into the carry instead of snapping the frame the cut ends */
-      else { raise=0.52f+0.26f*swRel; swYaw=0.42f+0.32f*swRel; }
-    } else raise = 0.10f + 0.055f*sinf(gtime*1.5f)*(1.0f-run); /* low-ready + breath */
-    /* the free arm swings out to balance the landing; the weapon arm holds
-     * its aim so the laser never jumps when you touch down */
-    if(!ai) raise += 0.42f*absorb;   /* was !(ai&&(aimStance||blade)); blade is
-                                        always set when ai is, so this is !ai */
-    /* both arms hug the tucked knees — but ride the curl in and out instead of
-     * snapping to the hug on the frame the roll starts */
-    if(rolling){ raise=0.35f+0.95f*tuck; swYaw=0; }
-    float armStride=ai?armw:-armw;   /* contralateral: opposes the same-side leg */
-    float sw = rolling? 1.0f : armStride*0.34f*run*clampf(1.0f-raise*1.25f,0,1);
-    float sh[3]; m3v(M,ai?0.27f:-0.27f,1.05f*tk,0,sh);
-    float shx=px+sh[0], shy=pcy+sh[1], shz=pz+sh[2];
-    float A[9],RX[9],RY[9],S[9];
-    /* Positive X raise swings the arm's local -Y chain toward local -Z
-     * (the avatar's forward).  Negative raise folds it backward over the
-     * shoulder, which made the pistol look 180-degrees flipped. */
-    m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(A,M,S);
-    float F[9],RE[9]; m3rotX(RE,raise+sw+0.16f+(ai&&s>0?0.18f+0.18f*sinf(s*PI):0.0f));
-    m3mul(S,RY,RE); m3mul(F,M,S);
-    float hx2,hy2,hz2;
-    avatar_arm(A,F,shx,shy,shz,ai?1.0f:-1.0f,hideBody,&hx2,&hy2,&hz2);
-    if(ai&&blade&&!hideBody){
-      /* the katana: dark blade, emissive emerald edge, square tsuba. The
-       * !hideBody guard is the backstop for (1)-(3) above: whatever the blend
-       * does, a metre of blade never gets drawn from inside the head. */
-      float B[9],RB[9]; m3rotX(RB,1.35f); m3mul(B,F,RB);
-      tintf(0.10f,0.16f,0.12f);
-      put(B,hx2,hy2,hz2,0,-0.10f,0); box_sh(0.10f,0.02f,0.10f);
-      tintf(0.45f,0.55f,0.50f); glUniform1f(uEmis,0.30f);
-      put(B,hx2,hy2,hz2,0,-0.62f,0); box_sh(0.022f,1.05f,0.045f);
-      tintf(0.30f,2.0f,0.9f); glUniform1f(uEmis,1.0f);
-      put(B,hx2,hy2,hz2,-0.014f,-0.62f,0); box_sh(0.006f,1.05f,0.03f);
-      glUniform1f(uEmis,0.08f);
-      tintf(0.04f,0.05f,0.045f);
-    }
-  }
-
-  body_alpha(bodyA);
-  /* the katana when it is NOT in hand: slung diagonally across the back in a
-   * dark saya with a lit seam. Previously the blade simply blinked out of
-   * existence between swings, which read as the avatar having no weapon at all. */
-  if(!blade&&!rolling&&swStow<0.35f&&!hideBody){
-    float SB[9],RZs[9],RXs[9],S1[9],o[3];
-    m3rotZ(RZs,0.62f); m3rotX(RXs,0.14f); m3mul(S1,RZs,RXs); m3mul(SB,M,S1);
-    m3v(M,0.02f,0.86f*tk,0.20f,o);
-    tintf(0.055f,0.065f,0.060f);
-    set_uM(SB,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.048f,0.98f,0.048f);
-    tintf(0.10f,0.85f,0.42f); glUniform1f(uEmis,0.60f);
-    set_uM(SB,px+o[0],pcy+o[1],pz+o[2]); box_sh(0.014f,1.00f,0.014f);
     glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
   }
 
-  /* The health spine used to live here: five luminous pads up the avatar's back.
-   * Removed — they read as backpack clutter on a figure whose silhouette is the
-   * whole point, and they were the brightest thing on screen in a game shot
-   * almost entirely from behind. Health moved to the HUD corner with the other
-   * two readouts (see draw_hud), which is where a number belongs. */
+  /* ---- left arm: katana hand. FK for the carry, the run swing and the cut;
+   * IK onto the pistol as a support hand when the aim is settled, and onto
+   * the tucked knee in a roll. Every mode is a blend so hand-offs never pop.
+   * It dissolves with the body (the viewmodel is the weapon arm alone). */
+  body_alpha(bodyA);
+  if(!hideBody){
+    float raise = 0.10f + 0.055f*sinf(gtime*1.5f)*(1.0f-run);      /* low-ready + breath */
+    raise += 0.42f*absorb + 0.35f*airB*clampf(-pvy/8.0f,0,1);      /* balance the landing / the fall */
+    float swYaw=0, elb=0.20f+0.75f*run;
+    float sw = -armw*0.34f*run*clampf(1.0f-raise*1.25f,0,1);      /* contralateral swing */
+    float bl=0.20f;                                                 /* blade angle off the forearm */
+    if(blade){
+      float rK,yK,eK,w;
+      if(s>0){ /* wind up high over the left shoulder, whip down across to the right hip */
+        rK=2.30f-1.80f*cut; yK=0.70f-1.36f*cut; eK=0.55f*(1.0f-cut)+0.15f; w=P.swIn;
+        bl=1.55f-1.35f*cut; }
+      else { /* follow-through: the end-of-cut pose eases into a low carry */
+        float k=sstep(swRel); rK=0.35f+0.15f*k; yK=0.15f-0.81f*k; eK=0.25f; w=1.0f; }
+      raise+=(rK-raise)*w; swYaw+=(yK-swYaw)*w; elb+=(eK-elb)*w; sw*=(1.0f-w);
+    } else if(swStow>0){   /* the katana just went back: ease from the carry */
+      float k=sstep(swStow);
+      raise+=(0.35f-raise)*k; swYaw+=(0.15f-swYaw)*k; elb+=(0.25f-elb)*k; sw*=(1.0f-k);
+    }
+    raise+=(1.30f-raise)*tuck; sw*=(1.0f-tuck); swYaw*=(1.0f-tuck); elb+=1.5f*tuck;
+    float sh[3]; ppos_u(&P,-ARM_X,SHOULDER_Y,0,sh);
+    float A[9],RX[9],RY[9],S[9],e[3],h[3];
+    m3rotX(RX,raise+sw); m3rotY(RY,swYaw); m3mul(S,RY,RX); m3mul(A,Mu,S);
+    m3v(A,0,-UPPER_L,0,e);
+    float ex=sh[0]+e[0], ey=sh[1]+e[1], ez=sh[2]+e[2];
+    float F[9],RE[9]; m3rotX(RE,raise+sw+elb); m3mul(S,RY,RE); m3mul(F,Mu,S);
+    m3v(F,0,-FORE_L,0,h);
+    float hx=ex+h[0], hy=ey+h[1], hz=ez+h[2];
+    /* IK overrides: support hand under the pistol, or hugging the knee */
+    float sup = (blade||rolling)? 0 : sstep(aimSet)*(1.0f-airB)*(1.0f-sstep(swStow))*(1.0f-ads_amt());
+    float tx=0,ty=0,tz=0,iw=0;
+    if(sup>0.001f){ float tg[3]; m3v(a.GP,-0.035f,-0.19f,-0.03f,tg);
+      tx=a.gx+tg[0]; ty=a.gy+tg[1]; tz=a.gz+tg[2]; iw=sup; }
+    if(rollW>0.001f){ float o[3]; m3v(Mu,-0.06f,0.05f,-0.04f,o);
+      tx=knee[0][0]+o[0]; ty=knee[0][1]+o[1]; tz=knee[0][2]+o[2]; iw=rollW; }
+    if(iw>0){
+      float dxv=tx-sh[0],dyv=ty-sh[1],dzv=tz-sh[2], dd=sqrtf(dxv*dxv+dyv*dyv+dzv*dzv);
+      float maxr=(UPPER_L+FORE_L)*0.985f;
+      if(dd>maxr){ float k=maxr/dd; tx=sh[0]+dxv*k;ty=sh[1]+dyv*k;tz=sh[2]+dzv*k; }
+      float pole[3]; m3v(Mu,-0.7f,-0.6f,-0.2f,pole);      /* elbow out-left and down */
+      float kx,ky,kz; ik2(sh[0],sh[1],sh[2],tx,ty,tz,UPPER_L,FORE_L,pole[0],pole[1],pole[2],&kx,&ky,&kz);
+      ex+=(kx-ex)*iw; ey+=(ky-ey)*iw; ez+=(kz-ez)*iw;
+      hx+=(tx-hx)*iw; hy+=(ty-hy)*iw; hz+=(tz-hz)*iw;
+    }
+    float FB[9];
+    avatar_arm(sh[0],sh[1],sh[2],ex,ey,ez,hx,hy,hz,-1.0f,0,ulx,uly,ulz,FB);
+    float bladeVis = s>0? P.swIn : (blade? clampf(swingCD/0.12f,0,1) : 0.0f);
+    if(blade){
+      /* the katana: tsuka through the fist, square tsuba, a blade that is
+       * WIDE across the cut and thin through it, emerald edge on the leading
+       * side. It grows out of the fist on the draw and shrinks back on the
+       * sheath, so the hand is never empty for a frame. */
+      float B[9],RB[9]; m3rotX(RB,bl); m3mul(B,FB,RB);
+      put(B,hx,hy,hz,0,-0.08f,0); wedge_sh(0.080f,0.100f,0.085f);          /* fist */
+      tintf(0.06f,0.07f,0.065f);
+      put(B,hx,hy,hz,0,-0.11f,0); box_sh(0.032f,0.24f,0.036f);             /* tsuka */
+      tintf(0.10f,0.16f,0.12f);
+      put(B,hx,hy,hz,0,-0.25f,0); box_sh(0.10f,0.02f,0.10f);               /* tsuba */
+      if(bladeVis>0.03f){
+        float Bs[9]; memcpy(Bs,B,36); m3scl(Bs,1,bladeVis,1);
+        float o[3]; m3v(B,0,-0.26f-0.50f*bladeVis,0,o);
+        tintf(0.45f,0.55f,0.50f); glUniform1f(uEmis,0.30f);
+        set_uM(Bs,hx+o[0],hy+o[1],hz+o[2]); box_sh(0.045f,1.00f,0.010f);
+        tintf(0.30f,2.0f,0.9f); glUniform1f(uEmis,1.0f);
+        m3v(B,0.024f,-0.26f-0.50f*bladeVis,0,o);
+        set_uM(Bs,hx+o[0],hy+o[1],hz+o[2]); box_sh(0.006f,1.00f,0.012f);
+      }
+      glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
+    } else {
+      put(FB,hx,hy,hz,0,-0.045f,0); wedge_sh(0.085f,0.115f,0.045f);       /* hand */
+    }
 
-  /* neck / head. The skull rides its own sub-basis (Mh) that pitches with the
-   * look, exactly like the agents' head-track — the avatar's head used to be
-   * welded level to the torso, so aiming up a stairwell it still stared at the
-   * horizon. Damped to about half the look angle so the neck never breaks, and
-   * dropped entirely during a roll, where the whole body is spinning. */
+    /* ---- the saya on the back, always: a dark scabbard in a strap loop. Its
+     * lit seam and the sheathed hilt fade out exactly as the blade appears in
+     * the hand, so the katana is one object that moves, never two that swap. */
+    float SB[9],RZs[9],RXs[9],S1[9];
+    m3rotZ(RZs,0.62f); m3rotX(RXs,0.14f); m3mul(S1,RZs,RXs); m3mul(SB,Mu,S1);
+    float sw_[3]; ppos_u(&P,0.02f,0.86f,0.215f,sw_);
+    tintf(0.055f,0.065f,0.060f);
+    set_uM(SB,sw_[0],sw_[1],sw_[2]); box_sh(0.048f,1.02f,0.048f);
+    tintf(0.03f,0.04f,0.035f);
+    put(SB,sw_[0],sw_[1],sw_[2],0,0.16f,0); box_sh(0.072f,0.05f,0.072f);   /* strap loop */
+    if(bladeVis<0.97f){
+      float o[3];
+      tintf(0.06f,0.07f,0.065f);
+      float k=1.0f-bladeVis;
+      m3v(SB,0,0.51f+0.12f*k,0,o); float Ss[9]; memcpy(Ss,SB,36); m3scl(Ss,1,k,1);
+      set_uM(Ss,sw_[0]+o[0],sw_[1]+o[1],sw_[2]+o[2]); box_sh(0.032f,0.24f,0.036f);   /* hilt */
+      tintf(0.10f,0.16f,0.12f);
+      put(SB,sw_[0],sw_[1],sw_[2],0,0.51f,0); box_sh(0.10f*k,0.02f,0.10f*k);         /* tsuba */
+      tintf(0.10f,0.85f,0.42f); glUniform1f(uEmis,0.60f*k);
+      set_uM(SB,sw_[0],sw_[1],sw_[2]); box_sh(0.014f,1.00f,0.014f);                  /* lit seam */
+      glUniform1f(uEmis,0.08f);
+    }
+    tintf(0.04f,0.05f,0.045f);
+  }
+
+  /* ---- neck / head. The skull leads every turn: it yaws ahead of the
+   * shoulders by most of the gap between the look and the body's eased
+   * facing, pitches with the look, and tucks chin-to-chest in a roll. */
   if(hideBody){ body_alpha(1.0f); glUniform1f(uEmis,0); glUniform1f(uRim,0); primArm=0; return; }
-  float hpit = rolling? 0 : clampf(-ppitch*PI/180.0f*0.55f,-0.45f,0.45f);
-  float Mh[9],HX2[9]; m3rotX(HX2,hpit); m3mul(Mh,M,HX2);
-  float ho[3]; m3v(M,0,1.29f*tk,0,ho);
-  float hcx=px+ho[0], hcy=pcy+ho[1], hcz=pz+ho[2];   /* head centre, world */
+  float dyaw=pyaw*PI/180.0f-avYaw; dyaw=atan2f(sinf(dyaw),cosf(dyaw));
+  float hyaw = rolling? 0 : clampf(dyaw*0.85f,-0.9f,0.9f);
+  float hpit = rolling? 0 : clampf(-ppitch*PI/180.0f*0.55f,-0.6f,0.6f);
+  float Mh[9],HY2[9],HX2[9],HH[9];
+  m3rotY(HY2,-hyaw); m3rotX(HX2,hpit-0.55f*tuck); m3mul(HH,HY2,HX2); m3mul(Mh,Mu,HH);
+  float hc[3]; ppos_u(&P,0,1.29f,0,hc);
   tintf(0.06f,0.07f,0.065f);
-  put(M,px,pcy,pz,0,1.10f*tk,0); cyl_sh(0.052f,0.062f,0.13f,8);
-  set_uM(Mh,hcx,hcy,hcz); sphere_sh(0.125f,0.155f,0.135f,9,6);
+  put_u(&P,Mu,0,1.10f,0); cyl_sh(0.052f,0.062f,0.13f,8);
+  set_uM(Mh,hc[0],hc[1],hc[2]); sphere_sh(0.125f,0.155f,0.135f,9,6);
   /* sharp collar plus distinct angular shades — no mouth/smile geometry.
    * The collar stays on the torso; everything on the face rides Mh. */
   tintf(0.02f,0.02f,0.02f);
-  put(M,px,pcy,pz,0,1.18f*tk,0.015f); bevbox_sh(0.19f,0.040f,0.12f,0.018f);
+  put_u(&P,Mu,0,1.18f,0.015f); bevbox_sh(0.19f,0.040f,0.12f,0.018f);
   for(int si=-1;si<=1;si+=2){
-    put(Mh,hcx,hcy,hcz,si*0.055f,0.025f,-0.118f); bevbox_sh(0.088f,0.046f,0.030f,0.012f);
+    put(Mh,hc[0],hc[1],hc[2],si*0.055f,0.025f,-0.118f); bevbox_sh(0.088f,0.046f,0.030f,0.012f);
   }
-  put(Mh,hcx,hcy,hcz,0,0.022f,-0.121f); bevbox_sh(0.036f,0.018f,0.026f,0.008f);
+  put(Mh,hc[0],hc[1],hc[2],0,0.022f,-0.121f); bevbox_sh(0.036f,0.018f,0.026f,0.008f);
   for(int si=-1;si<=1;si+=2){
-    put(Mh,hcx,hcy,hcz,si*0.124f,0.024f,-0.064f); bevbox_sh(0.030f,0.030f,0.095f,0.010f);
+    put(Mh,hc[0],hc[1],hc[2],si*0.124f,0.024f,-0.064f); bevbox_sh(0.030f,0.030f,0.095f,0.010f);
   }
   glUniform1f(uEmis,0.65f);
   tintf(0.08f,1.25f,0.55f);
   for(int si=-1;si<=1;si+=2){
-    put(Mh,hcx,hcy,hcz,si*0.076f,0.036f,-0.137f); box_sh(0.030f,0.006f,0.006f);
+    put(Mh,hc[0],hc[1],hc[2],si*0.076f,0.036f,-0.137f); box_sh(0.030f,0.006f,0.006f);
   }
   glUniform1f(uEmis,0.0f);
   glUniform1f(uRim,0);
@@ -4081,7 +4191,7 @@ static void draw_lasers(void){
 
 /* player laser pointer: the replacement for the old screen-space crosshair. */
 static void draw_player_laser(void){
-  if(gstate!=ST_PLAY||pammo<=0||rollT>0||swingT>0||swingCD>0)return;
+  if(gstate!=ST_PLAY||pammo<=0||rollT>0)return;
   float mx,my,mz,dx,dy,dz,hx,hy,hz,ld;
   player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&ld);
   /* the VISIBLE beam stops on geometry — the dot lands on the wall/floor the
@@ -4143,10 +4253,11 @@ static void draw_player_laser(void){
 static void draw_slash(void){
   if(swingT<=0)return;
   float s=clampf(swingT/SWING_TIME,0,1);
-  float yr=pyaw*PI/180.0f;
-  float cut=sstep(s);
-  float aS=yr+0.66f, aE=aS-1.42f*cut;   /* right-shoulder -> left-hip, like the arm */
-  float cy=py+1.34f;
+  const PPose*P=pose_get();
+  float yr=avYaw;                        /* the arm's yaw and height, not the camera's */
+  float cut=sstep(clampf((s-0.08f)/0.60f,0,1));
+  float aS=yr-0.66f, aE=aS+1.42f*cut;   /* left-shoulder -> right-hip, like the arm */
+  float cy=P->pcy+0.79f;
   /* two layers: a wide soft wake under a narrow boosted core */
   for(int layer=0;layer<2;layer++){
     float r0=layer?0.60f:0.50f, r1=layer?1.42f:1.62f;
@@ -4264,7 +4375,7 @@ static void draw_world(float camx,float camy,float camz){
     /* the avatar reflects too — it was the one figure on the glossy floor
      * casting no mirror image, which read as the player floating above it */
     if((gstate==ST_PLAY||gstate==ST_WIN) && ads_amt()<0.88f){
-      float pf=clampf(1.0f-py/0.9f,0,1);
+      float pf=clampf(1.0f-pyV/0.9f,0,1)*camFade;
       if(pf>0.02f){ figDim=pf; set_lights(px,pz); draw_player(); figDim=1.0f; }
     }
     set_lights(camx,camz);
@@ -4333,7 +4444,7 @@ static void draw_world(float camx,float camy,float camz){
     if(en[i].type==2) figure_shadow(en[i].x,en[i].y,en[i].z,1.4f,0.6f);
     else figure_shadow(en[i].x,en[i].y,en[i].z,0.52f,0.55f);
   }
-  if(gstate==ST_PLAY||gstate==ST_WIN) figure_shadow(px,py,pz,rollT>0?0.58f:0.46f,0.60f);
+  if(gstate==ST_PLAY||gstate==ST_WIN) figure_shadow(px,pyV,pz,rollT>0?0.58f:0.46f,0.60f);
   for(int i=0;i<nitems;i++){
     if(items[i].taken)continue;
     float ddx=items[i].x-camx, ddz=items[i].z-camz;
@@ -4357,7 +4468,7 @@ static void draw_world(float camx,float camy,float camz){
     set_lights(en[i].x,en[i].z);   /* lit by the emitters around THEM */
     if(en[i].type==2) draw_boss(&en[i]); else draw_agent(&en[i],1.0f);
   }
-  if(gstate==ST_PLAY||gstate==ST_WIN){ set_lights(px,pz); draw_player(); }
+  if((gstate==ST_PLAY||gstate==ST_WIN)&&camFade>0.02f){ figDim=camFade; set_lights(px,pz); draw_player(); figDim=1.0f; }
   set_lights(camx,camz);
   draw_items();
   draw_shards();
@@ -5386,7 +5497,7 @@ int main(int argc,char**argv){
          * two stance strikes), not the old fixed 0.40s timer that drifted
          * against the visible gait. stepT holds the previous half-cycle phase;
          * a wrap means a foot just planted. */
-        float sph=fmodf(bobT*7.5f,PI);
+        float sph=fmodf(bobT*GAIT_K,PI);
         if(sph<stepT && py<=ground_h(px,pz,py)+0.01f) sfx(V_STEP);
         stepT=sph;
       }
@@ -5398,17 +5509,17 @@ int main(int argc,char**argv){
       pvx=(px-ox)/dt; pvz=(pz-oz)/dt;
       /* see the agents' e->spdS: same problem, same cure */
       { float sp=sqrtf(pvx*pvx+pvz*pvz);
-        pspdS = sp>pspdS ? sp : toward(pspdS,sp,dt*7.0f); }
+        pspdS=toward(pspdS,sp,expk(sp>pspdS?18.0f:10.0f,dt)); }
       pmoveb=toward(pmoveb,(ml>0.01f||rollT>0)?1.0f:0.0f,dt*9.0f);
       /* travel-locked cadence: stride phase advances with actual ground speed,
        * so the planted foot tracks the floor instead of skating. A faint idle
        * creep keeps the pose from freezing mid-step. (phase = bobT*7.5 in draw) */
-      { float sp=sqrtf(pvx*pvx+pvz*pvz);
-        bobT+=dt*(0.12f+0.62f*pspdS); (void)sp; }
+      /* the cadence clock only runs on grounded, non-roll travel: a roll or a
+       * jump used to spin it (and the camera bob) at sprint rate */
+      bobT+=dt*(0.12f+0.36f*pspdS*(1.0f-airB)*(rollT>0?0.0f:1.0f));
       /* the avatar's facing eases toward the roll direction and back —
        * no yaw snap entering or leaving a sideways roll */
-      avYaw=angto(avYaw, rollT>0? atan2f(rollDX,-rollDZ) : pyaw*PI/180.0f,
-                  dt*(rollT>0?20.0f:14.0f));    /* near-180° rolls converge inside the roll */
+      avYaw=angto(avYaw, pyaw*PI/180.0f, expk(14.0f,dt));   /* rolls pick their axis, not their yaw */
 
       pvy-=18.0f*dt;
       py += pvy*dt;
@@ -5432,9 +5543,13 @@ int main(int argc,char**argv){
           if(imp>landTgt)landTgt=imp; }
         py=gh; pvy=0; jumps=1;
       }
+      /* the drawn feet ease up onto a step instead of teleporting with py,
+       * and snap down so they never hang over a drop */
+      if(py>pyV) pyV=toward(pyV,py,expk(16.0f,dt)); else pyV=py;
       int air = py>gh+0.01f;
       coyT = air? coyT-dt : 0.12f;
-      airB = toward(airB, air?1.0f:0.0f, dt*7.0f);   /* pose blend, raw dt */
+      airB = toward(airB, air?1.0f:0.0f, expk(7.0f,dt));   /* pose blend, raw dt */
+      update_feet(dt);
 
       /* mouseAcc is pixels-per-FRAME: normalize by dt or the same physical turn
        * unfreezes time twice as hard at 30fps as at 60. */
@@ -5576,39 +5691,53 @@ int main(int argc,char**argv){
      * the moment something blocks (never clip), ease back OUT smoothly.
      * Vertical follows a smoothed pivot so rolls and landings don't pop. */
     float pivy=(gstate==ST_PLAY?player_camh():EYE)+0.10f;
-    if(camYs<0)camYs=pivy;
-    camYs=toward(camYs,pivy,dt*10.0f);
-    float ox2=-fx*2.90f+rx*1.08f, oz2=-fz*2.90f+rz*1.08f;
-    float boom=sqrtf(ox2*ox2+oz2*oz2);
-    float ux=ox2/boom, uz=oz2/boom;
-    float hit=ray_wall(px,camYs,pz,ux,0,uz,boom+0.30f);
-    float maxd=hit-0.28f; if(maxd<0.40f)maxd=0.40f;
-    float tgt=boom<maxd?boom:maxd;
-    /* Occlusion snapped IN in a single frame. Behind the shoulder that is the
-     * right call (never clip through a wall); from inside the head it is a
-     * teleport. Ease both directions, fast inward so cover still works. */
-    camDist=toward(camDist,tgt, dt*(tgt<camDist?18.0f:5.0f));
-    /* ADS scales the SOLVED boom length. It must be applied here, after the
-     * occlusion clamp — folding it into the offset would make the wall probe
-     * shorten with the zoom and the camera would stop respecting cover. */
-    float camDistA=camDist*(1.0f-adsE);
-    float camx=px+ux*camDistA;
-    float camz=pz+uz*camDistA;
-    /* one dip per FOOTFALL (2x the per-leg rate — plants land at phase 0 and
-     * PI), phase-locked with the stride and the step SFX; the old 7.0 beat
-     * against the legs' 7.5 and drifted in and out of sync */
-    float camy3=camYs+(gstate==ST_PLAY?sinf(bobT*15.0f)*0.016f:0.0f);
-    /* The first-person eye comes from the POSE, not from EYE (1.62) — that
-     * constant matches neither the third-person pivot (py+2.02) nor where the
-     * avatar's eye slits are actually drawn. player_pose gives the mid-body
-     * pivot; the head rides 1.29*tk above it and the slits 0.036 above that, so
-     * this puts the camera exactly behind the eyes and it tracks the roll tuck
-     * and the landing absorb for free. */
-    float camyA=camy3;
-    if(gstate==ST_PLAY){
-      const PPose*EP=pose_get();
-      camyA=EP->pcy+1.29f*EP->tk+0.036f;
+    static float cdx=0,cdy=0,cdz=-1;
+    int camInit=camYs<0;
+    if(camInit)camYs=pivy;
+    camYs=toward(camYs,pivy,expk(10.0f,dt));
+    /* the boom ORBITS with the pitch (looking down lifts it over the
+     * shoulder instead of sliding the figure up the screen), tries the
+     * over-shoulder offset, then half, centre and the other shoulder before
+     * collapsing, and the pull-in is eased but never allowed to lag past
+     * the 0.28 clearance — so it neither clips nor pops */
+    float prc=ppitch*PI/180.0f, cpp=cosf(prc), spp=sinf(prc);
+    static const float LAT[4]={1.08f,0.5f,0.0f,-1.08f};
+    float bestd=0,bux=0,buy=0,buz=-1;
+    for(int c=0;c<4;c++){
+      float ox2=-fx*2.90f*cpp+rx*LAT[c], oy2=2.90f*spp, oz2=-fz*2.90f*cpp+rz*LAT[c];
+      float bl=sqrtf(ox2*ox2+oy2*oy2+oz2*oz2), ux=ox2/bl,uy=oy2/bl,uz=oz2/bl;
+      float h=ray_wall(px,camYs,pz,ux,uy,uz,bl+0.30f)-0.28f;
+      if(h>bl)h=bl;
+      if(h>bestd){ bestd=h; bux=ux; buy=uy; buz=uz; }
+      if(c==0&&h>=bl)break;
     }
+    if(camInit){ cdx=bux; cdy=buy; cdz=buz; }
+    cdx=toward(cdx,bux,expk(8.0f,dt)); cdy=toward(cdy,buy,expk(8.0f,dt)); cdz=toward(cdz,buz,expk(8.0f,dt));
+    { float l=sqrtf(cdx*cdx+cdy*cdy+cdz*cdz); if(l>1e-4f){ cdx/=l; cdy/=l; cdz/=l; } }
+    float tgt=ray_wall(px,camYs,pz,cdx,cdy,cdz,bestd+0.30f)-0.28f;
+    if(tgt>bestd)tgt=bestd;
+    if(cdy>1e-4f){ float tc=(wallh-0.15f-camYs)/cdy; if(tgt>tc)tgt=tc; }
+    if(cdy<-1e-4f){ float tf=(camYs-(floor_at(px,pz)+0.25f))/-cdy; if(tgt>tf)tgt=tf; }
+    if(tgt<0.30f)tgt=0.30f;
+    if(tgt<camDist){ camDist=toward(camDist,tgt,expk(40.0f,dt)); if(camDist>tgt+0.20f)camDist=tgt+0.20f; }
+    else camDist=toward(camDist,tgt,expk(5.0f,dt));
+    camFade=clampf((camDist-0.55f)/0.45f,0,1);   /* the figure fades before the near plane cuts it */
+    /* ADS scales the SOLVED boom length, after the occlusion clamp, so the
+     * wall probe never shortens with the zoom */
+    float camDistA=camDist*(1.0f-adsE);
+    float camx=px+cdx*camDistA;
+    float camz=pz+cdz*camDistA;
+    /* the camera dips with the body's own bounce (in phase by construction),
+     * with the landing absorb, and breathes with it at idle */
+    float camBob=0;
+    if(gstate==ST_PLAY){ const PPose*cp=pose_get();
+      camBob=0.022f*(cp->bounce-0.5f*cp->run*cp->run)-0.30f*cp->absorb
+            +0.006f*sinf(gtime*1.2f)*cp->idle; }
+    float camy3=camYs+cdy*camDistA+camBob;
+    /* the first-person eye comes from the POSE: between the drawn eye slits,
+     * so it tracks the roll curl and the landing absorb for free */
+    float camyA=camy3;
+    if(gstate==ST_PLAY) camyA=pose_get()->eyey;
     float camy=camy3+(camyA-camy3)*adsE;
     /* Keep the eye inside the room. NB: on a double jump from a raised floor in
      * a low sector this can still lag the body, because the player has no
