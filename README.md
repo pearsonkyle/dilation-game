@@ -5,7 +5,7 @@
 A single-file SUPERHOT × *Matrix* × **TRON** homage in the demoscene tradition: one C file,
 no assets on disk, no engine. Every texture, level, mesh, sound, and font is
 synthesized at startup or runtime. Stripped down to immediate-mode OpenGL 2 and
-SDL2, the whole game is one `.c` file and compiles to ~190Kb.
+SDL2, the whole game is one `.c` file and compiles to ~210Kb.
 
 Rendering is deferred through an HDR post stack: the scene draws into a
 4x multisampled `RGBA16F` target and comes back out through a five-octave
