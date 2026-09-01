@@ -54,6 +54,7 @@
   GF(PFNGLUNIFORM3FPROC,         glUniform3f)         \
   GF(PFNGLUNIFORM3FVPROC,        glUniform3fv)        \
   GF(PFNGLUNIFORM4FVPROC,        glUniform4fv)        \
+  GF(PFNGLUNIFORM1FVPROC,        glUniform1fv)        \
   GF(PFNGLUNIFORMMATRIX3FVPROC,  glUniformMatrix3fv)  \
   GF(PFNGLACTIVETEXTUREPROC,     glActiveTexture_)    \
   GF(PFNGLUNIFORM2FPROC,         glUniform2f)         \
@@ -147,7 +148,7 @@ static float renderScale=1.0f;
 #define MAXBUL 256
 #define TRAILN 12         /* trail points per bullet */
 #define MAXSHARD 512
-#define SHLIGHTS 8        /* lights fed to the shader per frame */
+#define SHLIGHTS 16       /* lights fed to the shader per frame */
 #define MINTS 0.045f      /* simulation never fully stops (SUPERHOT creep) */
 #define NLEVEL 4
 #define SMOKE_SEEDS 48    /* layouts --smoke validates beyond the one it plays */
@@ -360,7 +361,10 @@ static void gen_textures(void){
   for(int y=0;y<TS;y++)for(int x=0;x<TS;x++){
     float u=x/(float)TS, v=y/(float)TS;
     int sx_=x&63;
-    float slot = (sx_>28&&sx_<35)?1.0f:0.0f;      /* strip every half cell */
+    /* 1m light bars with 1m gaps, a few dark, soft-edged so the mips never
+     * sparkle — fixtures, not the old infinite rails converging on a starburst */
+    float slot = (sx_>28&&sx_<35 && ((y>>6)&1) && hash2(x>>6,y>>7,991u)>0.25f)?1.0f:0.0f;
+    slot*=clampf((34-sx_)*0.5f,0,1)*clampf((sx_-28)*0.5f,0,1);
     float grain=fbm(u,v,4,8,71u);
     hh[y*TS+x]=(1.0f-slot)*0.8f+grain*0.2f;
     float pv=hash2(x>>6,y>>6,551u);
@@ -411,11 +415,14 @@ static const unsigned char font[39][7]={
  {0x04,0x04,0x0A,0x0A,0x11,0x11,0x1F},   /* 37 = delta wordmark glyph */
  {0x00,0x00,0x00,0x00,0x00,0x00,0x04}};  /* 38 = full stop (decimal point) */
 
-static float textw(const char*s,float sc){ return (float)strlen(s)*6*sc; }
+static float textw(const char*s,float sc){ if(sc<4)sc=floorf(sc+0.5f); return (float)strlen(s)*6*sc; }
 /* the glyph pixels of one string go out as a single vertex-array draw: the
  * title rain alone used to be ~24k glVertex calls a frame */
 static void draw_text(float x,float y,float sc,const char*s){
   static float tb[64*35*8]; int n=0;
+  /* below the wordmark scale the cells snap to whole pixels: 2.39px cells
+   * with 0.2px gaps landed on pixel edges at random and dropped rows */
+  float e; if(sc<4){ sc=floorf(sc+0.5f); x=floorf(x); y=floorf(y); e=sc; } else e=sc*0.92f;
   for(;*s;s++,x+=6*sc){
     int gi=-1; char c=*s;
     if(c>='0'&&c<='9')gi=c-'0'; else if(c>='A'&&c<='Z')gi=10+c-'A';
@@ -424,7 +431,7 @@ static void draw_text(float x,float y,float sc,const char*s){
     if(n+35*8>(int)(sizeof tb/sizeof tb[0]))break;
     for(int r=0;r<7;r++){ unsigned char row=font[gi][r];
       for(int col=0;col<5;col++) if(row&(0x10>>col)){
-        float px=x+col*sc, py=y+r*sc, e=sc*0.92f;
+        float px=x+col*sc, py=y+r*sc;
         float*q=tb+n; n+=8;
         q[0]=px;q[1]=py; q[2]=px+e;q[3]=py; q[4]=px+e;q[5]=py+e; q[6]=px;q[7]=py+e;
       }}}
@@ -1396,7 +1403,7 @@ static const char*FS=
 "#version 120\n"
 "uniform sampler2D uAlb; uniform sampler2D uNrm;\n"
 "uniform vec3 uCam; uniform int uNL;\n"
-"uniform vec4 uLpos[8]; uniform vec3 uLcol[8];\n"
+"uniform vec4 uLpos[16]; uniform vec3 uLcol[16];\n"
 "uniform vec3 uTint; uniform float uBump; uniform float uEmis;\n"
 "uniform float uTime; uniform float uRain; uniform float uGloss; uniform float uAlpha;\n"
 "uniform float uEmisMask;\n"
@@ -1410,8 +1417,18 @@ static const char*FS=
 /* per-tile brightness jitter (uv = worldpos*0.5, so floor(vUV) is the 2m cell
  * id): breaks the wallpaper repeat that a single 256px texture tiled to the
  * horizon otherwise shows. World surfaces only — figures run with uBump=0. */
-"  if(uBump>0.5) base *= 0.8231 + 0.36*h1(dot(floor(vUV),vec2(7.31,13.17)));\n"
 "  vec3 N = normalize(vN);\n"
+/* hash inputs wrapped to a small range: world UVs reach ~44 and sin() past
+ * ~1e4 rad is garbage on many GPUs */
+"  vec2 tuv = mod(vUV, 64.0);\n"
+/* per-panel brightness jitter: the floor's 2m tiles, the walls' 1x0.5m
+ * panels (the old 2m block on a wall cut 2x4 panels into one hard band) */
+"  if(uBump>0.5){\n"
+"    bool horiz = abs(N.y)>0.5;\n"
+"    vec2 jc = horiz? floor(tuv) : floor(tuv*vec2(2.0,4.0));\n"
+"    float ja = horiz? 0.36 : 0.16;\n"
+"    base *= (1.0-ja*0.5) + ja*h1(dot(jc,vec2(7.31,13.17)));\n"
+"  }\n"
 "  if(uBump>0.5){\n"
 "    vec3 T = (abs(N.y)>0.5)? vec3(1.0,0.0,0.0) : vec3(N.z,0.0,-N.x);\n"
 "    vec3 B = cross(N,T);\n"
@@ -1432,7 +1449,7 @@ static const char*FS=
 "  float al = rough*rough; float a2 = al*al;\n"
 "  float kv = al*0.5;\n"
 "  float kV = NdV*(1.0-kv)+kv;\n"
-"  for(int i=0;i<8;i++){ if(i>=uNL)break;\n"
+"  for(int i=0;i<16;i++){ if(i>=uNL)break;\n"
 "    vec3 Ld = uLpos[i].xyz - vP;\n"
 "    float d = length(Ld); Ld/=d;\n"
 "    float a = max(0.0, 1.0 - d/uLpos[i].w); a*=a;\n"
@@ -1443,8 +1460,11 @@ static const char*FS=
 "    float NdL = max(dot(N,Ld),0.0);\n"
 "    vec3 H = normalize(Ld+V);\n"
 "    float NdH = max(dot(N,H),0.0);\n"
-"    float dn = NdH*NdH*(a2-1.0)+1.0;\n"
-"    float D = a2/(3.14159265*dn*dn);\n"
+/* sphere-light widening: a lamp is not a point, so its lobe on the obsidian
+ * floor is a soft pool rather than a two-pixel pinprick */
+"    float alp = clamp(al + 0.35/d, al, 1.0); float a2l = alp*alp;\n"
+"    float dn = NdH*NdH*(a2l-1.0)+1.0;\n"
+"    float D = a2l/(3.14159265*dn*dn);\n"
 "    float Vs = 0.25/max((NdL*(1.0-kv)+kv)*kV,1e-3);\n"
 "    float F = 0.04+0.96*pow(1.0-max(dot(H,V),0.0),5.0);\n"
 "    float spec = min(D*Vs*F*NdL, 8.0)*(0.35+1.10*uGloss);\n"
@@ -1476,7 +1496,7 @@ static const char*FS=
  * head-sized, which is what makes them read as characters. The previous 16x34
  * put cells at 6cm, and subdividing those 3x5 for the block font landed the
  * actual features at ~1cm, where they just alias into green noise. */
-"    float cx  = floor(vUV.x*9.0);\n"
+"    float cx  = floor(tuv.x*9.0);\n"
 /* Density. Pulled a long way back: at 0.46 well over half the columns were live
  * and every surface in the room was raining, which stopped reading as a wall
  * with data on it and started reading as a screensaver. 0.80 leaves roughly one
@@ -1487,11 +1507,11 @@ static const char*FS=
 "    float head = fract(uTime*spd + h1(cx*7.7));\n"
 "    float d2  = fract(head + vUV.y*0.34);\n"
 "    float tail = pow(1.0-d2, 11.0);\n"      /* shorter streaks, not sheets */
-"    float row = floor(vUV.y*12.0);\n"
+"    float row = floor(tuv.y*12.0);\n"
 /* the glyph: a 3x5 block font hashed per (column,row,tick). churn is per-column
  * so the sheet shimmers unevenly, the way the real thing does. */
-"    float churn = floor(uTime*(7.0+9.0*h1(cx*2.3))) * 3.0;\n"
-"    vec2  sub = floor(fract(vec2(vUV.x*9.0, vUV.y*12.0))*vec2(3.0,5.0));\n"
+"    float churn = floor(mod(uTime,512.0)*(7.0+9.0*h1(cx*2.3))) * 3.0;\n"
+"    vec2  sub = floor(fract(vec2(tuv.x*9.0, tuv.y*12.0))*vec2(3.0,5.0));\n"
 "    float bit = step(0.44, h1(cx*91.0 + row*17.0 + (sub.x+sub.y*3.0)*7.31 + churn));\n"
 /* leading cell burns white; everything behind it is emerald */
 "    float lead = smoothstep(0.90,1.0,1.0-d2);\n"
@@ -1531,7 +1551,11 @@ static const char*FS=
 "    col = pow(col, vec3(1.0/2.2));\n"
 "    col += (h1(gl_FragCoord.x*3.137+gl_FragCoord.y*7.913)-0.5)*(1.0/255.0);\n"
 "  }\n"
-"  gl_FragColor = vec4(col,uAlpha);\n"
+/* the floor's alpha is its (inverse) reflectivity: Fresnel makes the
+ * obsidian a near-mirror at grazing angles and least reflective underfoot */
+"  float oa = uAlpha;\n"
+"  if(uAlpha<0.999) oa = mix(uAlpha, 0.45, pow(1.0-NdV,4.0));\n"
+"  gl_FragColor = vec4(col,oa);\n"
 "}\n";
 
 static GLuint shader(GLenum ty,const char*src){
@@ -1582,7 +1606,7 @@ static void init_shaders(void){
  *
  * Every stage degrades: no float target -> RGBA8, no multisample -> plain,
  * no FBOs at all -> postOK=0 and the game draws straight to the window. */
-#define NBLOOM 3
+#define NBLOOM 5
 /* ------------------------------------------------------------ quality tiers
  * On the machine this was written on the whole frame costs well under a
  * millisecond of CPU and the GPU never breaks a sweat. On an integrated part
@@ -1601,8 +1625,8 @@ static void init_shaders(void){
 typedef struct { int msaa,hdr,bloom,lights; float scale; const char*name; } Quality;
 static const Quality QUAL[3]={
   { 0, 0, 1, 4, 0.70f, "LOW"    },
-  { 2, 1, 2, 6, 1.00f, "MEDIUM" },
-  { 4, 1, 3, 8, 1.00f, "HIGH"   },
+  { 2, 1, 3, 8, 1.00f, "MEDIUM" },
+  { 4, 1, 5,16, 1.00f, "HIGH"   },
 };
 static int qual=2;          /* index into QUAL; --quality overrides            */
 static int qualAuto=1;      /* auto tier: step down when we cannot hold 60fps  */
@@ -1618,7 +1642,7 @@ static int scW=HUDW, scH=HUDH;
 static GLuint progBright, progBlur, progComp;
 static GLint  bSrc,bTexel,bThresh,bKnee;
 static GLint  lSrc,lDir;
-static GLint  cScene,cB0,cB1,cB2,cTime,cTs,cDmg,cExp,cBloom,cBW;
+static GLint  cScene,cB0,cB1,cB2,cB3,cB4,cTime,cTs,cDmg,cExp,cBloom,cBW;
 
 static const char*PVS=
 "#version 120\n"
@@ -1661,9 +1685,9 @@ static const char*BLURFS=
 
 static const char*COMPFS=
 "#version 120\n"
-"uniform sampler2D uScene,uB0,uB1,uB2;\n"
+"uniform sampler2D uScene,uB0,uB1,uB2,uB3,uB4;\n"
 "uniform float uTime,uTs,uDmg,uExp,uBloom;\n"
-"uniform vec3 uBW;\n"
+"uniform float uBW[5];\n"
 "varying vec2 vUV;\n"
 "float h1(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }\n"
 /* Narkowicz ACES fit: keeps saturation in the shoulder, which matters when the
@@ -1681,11 +1705,13 @@ static const char*COMPFS=
 "  col.r = texture2D(uScene,vUV+d*ab).r;\n"
 "  col.g = texture2D(uScene,vUV).g;\n"
 "  col.b = texture2D(uScene,vUV-d*ab).b;\n"
-"  vec3 bl = texture2D(uB0,vUV).rgb*uBW.x\n"
-"          + texture2D(uB1,vUV).rgb*uBW.y\n"
+"  vec3 bl = texture2D(uB0,vUV).rgb*uBW[0]\n"
+"          + texture2D(uB1,vUV).rgb*uBW[1]\n"
+"          + texture2D(uB2,vUV).rgb*uBW[2]\n"
+"          + texture2D(uB3,vUV).rgb*uBW[3]\n"
 /* anamorphic hint: the widest octave sampled through an x-compressed UV
  * stretches ~1.8x horizontally — emitters grow subtle lens streaks */
-"          + texture2D(uB2, vec2((vUV.x-0.5)*0.55+0.5, vUV.y)).rgb*uBW.z;\n"
+"          + texture2D(uB4, vec2((vUV.x-0.5)*0.55+0.5, vUV.y)).rgb*uBW[4];\n"
 "  col += bl*uBloom;\n"
 "  col *= uExp;\n"
 /* The time-dilation grade: frozen time drains the colour toward a cold blue
@@ -1701,7 +1727,7 @@ static const char*COMPFS=
 "  col *= mix(1.0, 0.45, smoothstep(0.08,0.66,r2));\n"
 "  float sl = 0.5+0.5*cos(gl_FragCoord.y*1.5707963);\n"
 "  col *= 1.0 - 0.07*sl*sl;\n"
-"  col += (h1(gl_FragCoord.xy + uTime*60.0)-0.5)*0.014;\n"
+"  col += (h1(gl_FragCoord.xy + mod(uTime,17.0)*60.0)-0.5)*0.014;\n"
 "  col += (h1(gl_FragCoord.xy*1.7)-0.5)*(1.0/255.0);\n"
 "  gl_FragColor = vec4(col,1.0);\n"
 "}\n";
@@ -1820,6 +1846,8 @@ static void init_post(int msaa){
   cB0=glGetUniformLocation(progComp,"uB0");
   cB1=glGetUniformLocation(progComp,"uB1");
   cB2=glGetUniformLocation(progComp,"uB2");
+  cB3=glGetUniformLocation(progComp,"uB3");
+  cB4=glGetUniformLocation(progComp,"uB4");
   cTime=glGetUniformLocation(progComp,"uTime");
   cTs=glGetUniformLocation(progComp,"uTs");
   cDmg=glGetUniformLocation(progComp,"uDmg");
@@ -1901,12 +1929,20 @@ static void post_end(float ts01,float dmg,float time){
   /* octaves the tier skipped are never rendered, so point their samplers at the
    * last one we DID render and scale the composite weights to match — sampling a
    * stale or undefined target would smear last-second garbage across the frame */
-  bind_tex(1,bloomTex[0][0]);          glUniform1i(cB0,1);
-  bind_tex(2,bloomTex[nb>1?1:0][0]);   glUniform1i(cB1,2);
-  bind_tex(3,bloomTex[nb>2?2:nb-1][0]);glUniform1i(cB2,3);
+  { GLint cB[5]={cB0,cB1,cB2,cB3,cB4};
+    /* the widest octave rendered takes the anamorphic slot; octaves the tier
+     * skipped weigh nothing and never sample an unrendered target */
+    static const float W[5]={1.0f,0.85f,0.55f,0.38f,0.30f};
+    float bw[5];
+    for(int k=0;k<5;k++){
+      int src = k==4 ? nb-1 : (k<nb ? k : nb-1);
+      bind_tex(k+1,bloomTex[src][0]); glUniform1i(cB[k],k+1);
+      bw[k] = k==4 ? (nb>1?0.30f:0.0f) : (k<nb && !(nb<5&&k==nb-1&&k>0) ? W[k] : 0.0f);
+    }
+    if(nb==1)bw[0]=1.0f;
+    glUniform1fv(cBW,5,bw); }
   glUniform1f(cTime,time); glUniform1f(cTs,ts01); glUniform1f(cDmg,dmg);
-  glUniform1f(cExp,1.15f); glUniform1f(cBloom,0.48f);
-  glUniform3f(cBW, 1.0f, nb>1?0.85f:0.0f, nb>2?0.50f:0.0f);
+  glUniform1f(cExp,1.15f); glUniform1f(cBloom,nb>=5?0.40f:0.48f);
   fsquad();
 
   /* leave the bloom textures bound and only restore the active unit: unbinding
@@ -2017,6 +2053,7 @@ static float aimSet=1,stableT;      /* physical aim: 0 = gun rides the running
 static int laserTarget=-1;                    /* living enemy currently reachable by charged beam */
 static unsigned gseed=0;                    /* xor'd into the level seed      */
 static int smoke=0;
+static int msaaReq=4;    /* --msaa N: samples for the scene target (0 = off) */
 static int swRender=0;   /* GL_RENDERER is a software rasterizer (no frame budget) */
 static int titlecap=0;   /* --titlecap: dump a numbered title-screen frame sequence for the README GIF */
 
@@ -3113,21 +3150,15 @@ static int frustum_sphere(float x,float y,float z,float r){
     if(frP[j][0]*x+frP[j][1]*y+frP[j][2]*z+frP[j][3] < -r){ cullSkipped++; return 0; }
   return 1;
 }
-/* The mirror pass draws figures y-flipped about the floor, so a figure whose
- * upright sphere is off screen may still have a visible reflection (and vice
- * versa). Test the reflected sphere for that pass. */
-static int frustum_sphere_m(float x,float y,float z,float r,int mirrored){
-  return frustum_sphere(x, mirrored? -y : y, z, r);
-}
-
 /* figure bounding sphere: centre and radius by type, so one place decides it */
 static void fig_sphere(const Enemy*e,float*cy,float*r){
   if(e->type==2){ *cy=e->y+2.3f; *r=3.2f; } else { *cy=e->y+1.0f; *r=1.35f; }
 }
 static int refl=0;   /* mirror pass: flip Y of every model transform */
+static float reflY=0; /* ...about THIS plane: the floor the figure stands on */
 static void set_uM(const float*m,float tx,float ty,float tz){
   if(refl){ float f[9]; memcpy(f,m,36); f[1]=-f[1]; f[4]=-f[4]; f[7]=-f[7];
-    glUniformMatrix3fv(uM3,1,GL_FALSE,f); glUniform3f(uT,tx,-ty,tz); }
+    glUniformMatrix3fv(uM3,1,GL_FALSE,f); glUniform3f(uT,tx,2.0f*reflY-ty,tz); }
   else { glUniformMatrix3fv(uM3,1,GL_FALSE,m); glUniform3f(uT,tx,ty,tz); }
 }
 /* Every figure colour funnels through these two so the mirror pass can FADE a
@@ -4102,12 +4133,7 @@ static void draw_items(void){
   for(int i=0;i<nitems;i++){
     if(items[i].taken)continue;
     float base=floor_at(items[i].x,items[i].z);
-    if(refl){ /* pickups were the one thing on the glossy floor with no mirror
-                 image; fade by height exactly like the figures do */
-      float rf=clampf(1.0f-base/0.9f,0,1);
-      if(rf<=0.02f)continue;
-      figDim=rf*0.6f;
-    }
+    if(refl){ figDim=0.6f; reflY=base; }   /* mirrored in the floor it hovers over */
     float bob=base+0.45f+0.1f*sinf(wtime*2.5f+i);
     m3rotY(M,wtime*1.5f+i);
     glUniform1f(uEmis,1); glUniform1f(uBump,0); glUniform1f(uGloss,0.4f);
@@ -4136,22 +4162,49 @@ static void draw_items(void){
 
 static void draw_shards(void){
   float M[9],RY[9],RX[9];
-  glUniform1f(uEmis,1); glUniform1f(uBump,0); glUniform1f(uGloss,0.6f);
+  /* lit, not flat: the wedge facets catch the GGX and a Fresnel edge in the
+   * shard's own colour, so the burst reads as shattered glass */
+  glUniform1f(uEmis,0.45f); glUniform1f(uBump,0); glUniform1f(uGloss,0.85f); glUniform1f(uRim,0.9f);
   for(int i=0;i<MAXSHARD;i++){
     Shard*s=&shards[i]; if(s->life<=0)continue;
     float a=s->life/s->max;
     m3rotY(RY,s->yaw); m3rotX(RX,s->pit); m3mul(M,RY,RX);
     glUniform3f(uTint,s->r*a*1.6f,s->g*a*1.6f,s->b*a*1.6f);
+    rimf(s->r*1.4f*a,s->g*1.4f*a,s->b*1.4f*a);
+    if(refl)reflY=floor_at(s->x,s->z);
     set_uM(M,s->x,s->y,s->z);
     wedge_sh(s->sx,s->sy,s->sz);   /* shattered-glass facet, not a die */
   }
+  glUniform1f(uEmis,0); glUniform1f(uRim,0);
+}
+/* the lamps themselves: a pendant plate hung from the ceiling on a stem at
+ * every static light, emissive in the light's colour. The rooms used to be lit
+ * with no visible source, which is most of why the walls read as flat black. */
+static void draw_fixtures(float camx,float camz){
+  primArm=1;
+  glUniform1f(uBump,0); glUniform1f(uGloss,0.3f);
+  for(int i=0;i<nlights;i++){
+    Light*l=&lights[i];
+    float ddx=l->x-camx, ddz=l->z-camz;
+    if(ddx*ddx+ddz*ddz>40.0f*40.0f)continue;
+    if(refl)reflY=floor_at(l->x,l->z);
+    float I[9]; m3id(I);
+    float stem=wallh-l->y-0.06f; if(stem<0.05f)stem=0.05f;
+    glUniform1f(uEmis,0.10f); tintf(0.05f,0.06f,0.06f);
+    primArm=0; set_uM(I,l->x,l->y+0.06f+stem*0.5f,l->z); box_sh(0.03f,stem,0.03f); primArm=1;
+    set_uM(I,l->x,l->y+0.03f,l->z); bevbox_sh(0.42f,0.07f,0.42f,0.016f);
+    glUniform1f(uEmis,1.0f); tintf(l->cr*2.2f,l->cg*2.2f,l->cb*2.2f);
+    set_uM(I,l->x,l->y-0.02f,l->z); bevbox_sh(0.34f,0.03f,0.34f,0.010f);
+  }
   glUniform1f(uEmis,0);
+  primArm=0;
 }
 
 /* camera basis for billboards, refreshed once per frame from pyaw+ppitch.
  * The old sprites rotated only about Y, so every glow quad went edge-on the
  * moment you looked down — fatal in a game built on platforms and leaps. */
 static float bbRx=1,bbRz=0, bbUx=0,bbUy=1,bbUz=0;
+static float bbFx=0,bbFy=0,bbFz=-1;   /* camera forward, for the ribbon tracers */
 static void bb_quad(float x,float y,float z,float hr,float hu,
                     float r,float g,float b,float a){
   glColor4f(r,g,b,a);
@@ -4189,36 +4242,61 @@ static void figure_shadow(float x,float footY,float z,float radius,float strengt
 
 /* oscilloscope trails + doppler-shaded bullet heads. my<0 mirrors into the
  * floor reflection. fixed-function additive pass. */
+/* the trail as a camera-facing ribbon of constant WORLD width (a near miss is
+ * a streak, a far round a thread — the old 2px GL lines were the same width at
+ * any range and drivers increasingly ignore wide lines), and a head stretched
+ * along the velocity so a round hanging in frozen time reads as motion blur */
+static void ribbon_pt(const float*p,const float*q,float w,float my,float r,float g,float b,float a){
+  float dx=q[0]-p[0],dy=(q[1]-p[1])*my,dz=q[2]-p[2];
+  float sx=dy*bbFz-dz*bbFy, sy=dz*bbFx-dx*bbFz, sz=dx*bbFy-dy*bbFx;
+  float l=sqrtf(sx*sx+sy*sy+sz*sz); if(l<1e-6f){ sx=bbRx;sy=0;sz=bbRz; l=1; }
+  sx*=w/l; sy*=w/l; sz*=w/l;
+  glColor4f(r,g,b,a);
+  glVertex3f(p[0]-sx,my*p[1]-sy,p[2]-sz);
+  glVertex3f(p[0]+sx,my*p[1]+sy,p[2]+sz);
+}
 static void draw_bullets(float my){
   static float bcol[MAXBUL][3];   /* doppler shade per bullet, shared by both passes */
-  glLineWidth(2.0f);
   for(int i=0;i<MAXBUL;i++){
     Bullet*b=&bul[i]; if(!b->on)continue;
     float vr=radial_v(b->x,b->z,b->vx,b->vz);
     float r,g,bl; dopp_rgb(vr,&r,&g,&bl);
     bcol[i][0]=r; bcol[i][1]=g; bcol[i][2]=bl;
-    glBegin(GL_LINE_STRIP);
-    int n=b->tn;
+    int n=b->tn; if(n<1)continue;
+    float head[3]={b->x,b->y,b->z};
+    glBegin(GL_QUAD_STRIP);
     for(int k=0;k<n;k++){
       int idx=(b->th-n+k+TRAILN*2)%TRAILN;
       float a=(float)(k+1)/(n+1);
       /* a faint sine wobble across the trail: the oscilloscope read */
       float wob=sinf(k*1.7f+wtime*9.0f)*0.015f;
-      glColor4f(r*a,g*a,bl*a,a*0.8f);
-      glVertex3f(b->tr[idx][0],my*(b->tr[idx][1]+wob),b->tr[idx][2]);
+      float p[3]={b->tr[idx][0],b->tr[idx][1]+wob,b->tr[idx][2]};
+      const float*q = k+1<n ? b->tr[(b->th-n+k+1+TRAILN*2)%TRAILN] : head;
+      ribbon_pt(p,q,0.005f+0.013f*a,my,r*a,g*a,bl*a,a*0.8f);
     }
-    glColor4f(r,g,bl,1);
-    glVertex3f(b->x,my*b->y,b->z);
+    { int idx=(b->th-1+TRAILN)%TRAILN; ribbon_pt(head,b->tr[idx],-0.018f,my,r,g,bl,1); }
     glEnd();
   }
-  /* heads */
+  /* heads: a streak stretched along the velocity plus a bright core */
   glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
   glBegin(GL_QUADS);
   for(int i=0;i<MAXBUL;i++){
     Bullet*b=&bul[i]; if(!b->on)continue;
     float r=bcol[i][0],g=bcol[i][1],bl=bcol[i][2];
-    billboard(b->x,my*b->y,b->z,0.09f,r,g,bl,0.95f);
-    billboard(b->x,my*b->y,b->z,0.22f,r*0.4f,g*0.4f,bl*0.4f,0.5f);
+    float spd=sqrtf(b->vx*b->vx+b->vy*b->vy+b->vz*b->vz)+1e-6f;
+    float vx=b->vx/spd,vy=b->vy/spd*my,vz=b->vz/spd;
+    float sx=vy*bbFz-vz*bbFy, sy=vz*bbFx-vx*bbFz, sz=vx*bbFy-vy*bbFx;
+    float l=sqrtf(sx*sx+sy*sy+sz*sz); if(l<1e-6f){ sx=bbRx;sy=0;sz=bbRz; l=1; }
+    float w=0.036f; sx*=w/l; sy*=w/l; sz*=w/l;
+    float hx=b->x+vx*0.05f, hy=my*b->y+vy*0.05f, hz=b->z+vz*0.05f;
+    float tx=b->x-vx*0.20f, ty=my*b->y-vy*0.20f, tz=b->z-vz*0.20f;
+    glColor4f(r*0.7f,g*0.7f,bl*0.7f,0.7f);
+    glTexCoord2f(0,0); glVertex3f(tx-sx,ty-sy,tz-sz);
+    glTexCoord2f(1,0); glVertex3f(tx+sx,ty+sy,tz+sz);
+    glTexCoord2f(1,1); glVertex3f(hx+sx,hy+sy,hz+sz);
+    glTexCoord2f(0,1); glVertex3f(hx-sx,hy-sy,hz-sz);
+    billboard(b->x,my*b->y,b->z,0.075f,r,g,bl,0.95f);
+    billboard(b->x,my*b->y,b->z,0.20f,r*0.4f,g*0.4f,bl*0.4f,0.5f);
   }
   glEnd();
   glDisable(GL_TEXTURE_2D);
@@ -4374,6 +4452,34 @@ static void set_lights(float x,float z){
   glUniform3fv(uLcol,SHLIGHTS,lc);
 }
 
+/* walls (with rain), ceiling and the emissive platform lips — drawn upright,
+ * and once more mirrored under the floor */
+static void draw_statics(const LevelDef*L){
+  float I[9]; m3id(I); set_uM(I,0,0,0);
+  glUniform1f(uBump,1); glUniform1f(uEmis,0);
+  int texof[2]={TX_WALL,TX_CEIL}; int bid[2]={0,2}; float gls[2]={0.55f,0.3f};
+  float emk[2]={3.5f,1.3f};   /* (walls emit nothing now) / ceiling light slots */
+  for(int b=0;b<2;b++){
+    glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,texAlb[texof[b]]);
+    glActiveTexture_(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,texNrm[texof[b]]);
+    glUniform1f(uGloss,gls[b]); glUniform1f(uRain,b==0?1.0f:0.0f);
+    glUniform1f(uEmisM,emk[b]);
+    float tk=b==0?1.0f:0.8f;
+    glUniform3f(uTint,L->wallt[0]*tk,L->wallt[1]*tk,L->wallt[2]*tk);
+    glCallList(worldList[bid[b]]);
+  }
+  glUniform1f(uRain,0);
+  glUniform1f(uEmisM,0);
+  /* emissive emerald lips along platform/step edges (white-centre glow texel
+   * × emerald tint, near-full emissive) — crisp verticality, SUPERHOT-clean */
+  if(bn[3]>0){
+    glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
+    glUniform1f(uGloss,0.0f); glUniform1f(uBump,0); glUniform1f(uEmis,0.92f);
+    glUniform3f(uTint,0.20f,1.35f,0.55f);
+    glCallList(worldList[3]);
+    glUniform1f(uEmis,0);
+  }
+}
 static void draw_world(float camx,float camy,float camz){
   const LevelDef*L=&LEVELS[curlevel];
   glUseProgram(prog);
@@ -4415,12 +4521,14 @@ static void draw_world(float camx,float camy,float camz){
       float ddx=en[i].x-camx, ddz=en[i].z-camz;
       if(ddx*ddx+ddz*ddz>22.0f*22.0f)continue;
       { float fcy,fr; fig_sphere(&en[i],&fcy,&fr);
-        if(!frustum_sphere_m(en[i].x,fcy,en[i].z,fr,1))continue; }
-      /* fade the mirror image out over the same lift the contact shadow uses,
-       * instead of blinking it off the instant the figure leaves the floor */
-      float rf=clampf(1.0f-en[i].y/0.9f,0,1);
+        if(!frustum_sphere(en[i].x,2.0f*floor_at(en[i].x,en[i].z)-fcy,en[i].z,fr))continue; }
+      /* fade the mirror image out over the lift above the floor it stands on
+       * (raised platforms reflected nothing before) and with distance, instead
+       * of blinking it off the instant the figure leaves the floor or the 22u disc */
+      float fy=floor_at(en[i].x,en[i].z);
+      float rf=clampf(1.0f-(en[i].y-fy)/0.9f,0,1)*clampf((22.0f-sqrtf(ddx*ddx+ddz*ddz))/4.0f,0,1);
       if(rf<=0.02f)continue;
-      figDim=rf;
+      figDim=rf; reflY=fy;
       set_lights(en[i].x,en[i].z);
       if(en[i].type==2) draw_boss(&en[i]); else draw_agent(&en[i],0.6f);
       figDim=1.0f;
@@ -4428,18 +4536,30 @@ static void draw_world(float camx,float camy,float camz){
     /* the avatar reflects too — it was the one figure on the glossy floor
      * casting no mirror image, which read as the player floating above it */
     if((gstate==ST_PLAY||gstate==ST_WIN) && ads_amt()<0.88f){
-      float pf=clampf(1.0f-pyV/0.9f,0,1)*camFade;
-      if(pf>0.02f){ figDim=pf; set_lights(px,pz); draw_player(); figDim=1.0f; }
+      float fyp=floor_at(px,pz);
+      float pf=clampf(1.0f-(pyV-fyp)/0.9f,0,1)*camFade;
+      if(pf>0.02f){ figDim=pf; reflY=fyp; set_lights(px,pz); draw_player(); figDim=1.0f; }
     }
     set_lights(camx,camz);
     draw_items();
     draw_shards();
-    refl=0;
-    /* mirrored additive trails, faint */
+    draw_fixtures(camx,camz);
+    /* the statics reflect too — trims, wall rain, ceiling slots — so the
+     * figures stop looking like they stand on glass over a void */
+    reflY=0; draw_statics(L);
+    refl=0; reflY=0;
+    /* mirrored additive trails and lamp orbs, faint */
     glUseProgram(0);
     glDepthMask(GL_FALSE);
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE);
     draw_bullets(-1.0f);
+    glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
+    glBegin(GL_QUADS);
+    for(int i=0;i<nlights;i++)
+      billboard(lights[i].x,2.0f*floor_at(lights[i].x,lights[i].z)-lights[i].y,lights[i].z,0.30f,
+        lights[i].cr*1.6f,lights[i].cg*1.6f,lights[i].cb*1.6f,1);
+    glEnd();
+    glDisable(GL_TEXTURE_2D);
     glDisable(GL_BLEND);
     glDepthMask(GL_TRUE);
     glUseProgram(prog);
@@ -4455,29 +4575,7 @@ static void draw_world(float camx,float camy,float camz){
     glCallList(worldList[1]);
     glDisable(GL_BLEND);
     glUniform1f(uAlpha,1);
-    /* walls (with rain) and ceiling, opaque, in the sector's climate */
-    int texof[2]={TX_WALL,TX_CEIL}; int bid[2]={0,2}; float gls[2]={0.55f,0.3f};
-    float emk[2]={3.5f,1.3f};   /* wall circuit traces / ceiling light slots */
-    for(int b=0;b<2;b++){
-      glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,texAlb[texof[b]]);
-      glActiveTexture_(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,texNrm[texof[b]]);
-      glUniform1f(uGloss,gls[b]); glUniform1f(uRain,b==0?1.0f:0.0f);
-      glUniform1f(uEmisM,emk[b]);
-      float tk=b==0?1.0f:0.8f;
-      glUniform3f(uTint,L->wallt[0]*tk,L->wallt[1]*tk,L->wallt[2]*tk);
-      glCallList(worldList[bid[b]]);
-    }
-    glUniform1f(uRain,0);
-    glUniform1f(uEmisM,0);
-    /* emissive emerald lips along platform/step edges (white-centre glow texel
-     * × emerald tint, near-full emissive) — crisp verticality, SUPERHOT-clean */
-    if(bn[3]>0){
-      glActiveTexture_(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
-      glUniform1f(uGloss,0.0f); glUniform1f(uBump,0); glUniform1f(uEmis,0.92f);
-      glUniform3f(uTint,0.20f,1.35f,0.55f);
-      glCallList(worldList[3]);
-      glUniform1f(uEmis,0);
-    }
+    draw_statics(L);
     continue;              /* pass 0 done; on to the upright pass */
   }
   glActiveTexture_(GL_TEXTURE0);
@@ -4525,6 +4623,7 @@ static void draw_world(float camx,float camy,float camz){
   set_lights(camx,camz);
   draw_items();
   draw_shards();
+  draw_fixtures(camx,camz);
   glUseProgram(0);
 
   /* additive pass: light orbs, particles, trails, lasers */
@@ -4532,9 +4631,9 @@ static void draw_world(float camx,float camy,float camz){
   glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA,GL_ONE);
   glEnable(GL_TEXTURE_2D); glBindTexture(GL_TEXTURE_2D,texAlb[TX_GLOW]);
   glBegin(GL_QUADS);
-  for(int i=0;i<nlights;i++)
+  for(int i=0;i<nlights;i++)   /* bright enough to bloom: the lamp IS the source */
     billboard(lights[i].x,lights[i].y,lights[i].z,0.30f,
-      lights[i].cr*0.22f,lights[i].cg*0.22f,lights[i].cb*0.22f,1);
+      lights[i].cr*1.6f,lights[i].cg*1.6f,lights[i].cb*1.6f,1);
   if(mzT>0){ /* the avatar's muzzle flash: core + 4-point star spikes */
     float a=mzT/0.06f;
     billboard(mzX,mzY,mzZ,0.10f+0.10f*a, 0.9f,1.8f,1.0f,a);
@@ -4786,7 +4885,7 @@ static void draw_hud(void){
     glColor4f(0.65f,1.0f,0.75f,1);
     draw_text((HUDW-textw("^ILATION",13))/2,120,13,"^ILATION");
     glColor4f(0.35f,0.85f,0.55f,1);
-    draw_text((HUDW-textw("TIME MOVES WHEN YOU MOVE",2.6f))/2,250,2.6f,"TIME MOVES WHEN YOU MOVE");
+    draw_text((HUDW-textw("TIME MOVES WHEN YOU DO",2.6f))/2,250,2.6f,"TIME MOVES WHEN YOU DO");
     /* level select */
     for(int i=0;i<NLEVEL;i++){
       char b2[24]; snprintf(b2,24,"%d %s",i+1,LEVELS[i].name);
@@ -5038,6 +5137,7 @@ int main(int argc,char**argv){
       else if(!strcmp(q,"high"))qual=2; else { qualAuto=1; }
     }
     else if(!strcmp(argv[i],"--seed-sweep")) sweepN = (i+1<argc)? (int)strtol(argv[++i],0,0) : 64;
+    else if(!strcmp(argv[i],"--msaa")&&i+1<argc){ long m=strtol(argv[++i],0,0); msaaReq=(int)(m<0?0:m>8?8:m); }
     else if(!strcmp(argv[i],"--titlecap"))titlecap=1;
     else if(!strcmp(argv[i],"--seed")&&i+1<argc)gseed=(unsigned)strtoul(argv[++i],0,0);
     else if(!strcmp(argv[i],"--level")&&i+1<argc){
@@ -5065,32 +5165,24 @@ int main(int argc,char**argv){
    * which is the worst case for edge crawl — this is the single biggest look
    * upgrade available and costs nothing on any GPU from the last two decades.
    * Drop to no-AA and rebuild the window if the driver won't grant it. */
-  int msaa=4;
-  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS,1);
-  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES,msaa);
+  /* 4x MSAA on the SCENE TARGET, not the window. The geometry is drawn into
+   * the multisampled scene FBO; the window only ever receives the composite
+   * quad and the HUD. Asking the window for samples too paid for a second 4x
+   * target and its resolve every frame, and on drivers that grant none to
+   * the window (Xvfb/llvmpipe, the harness) the whole frame came out
+   * unantialiased. The quality tier caps the request in init_post. */
+  int msaa=msaaReq;
+  SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS,0);
   /* HIGHDPI is the whole point: without it a Retina display hands us a 1280x720
    * backbuffer and upscales, which on geometry made entirely of hard bright edges
    * against black is the worst possible trade. RESIZABLE because the post chain
    * can now be rebuilt at any size (see free_post). */
   Uint32 wflags = SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE|SDL_WINDOW_ALLOW_HIGHDPI;
-  /* ...except under the harness. With HIGHDPI the default framebuffer is 2x on a
-   * Retina panel, and compositing a 1280x720 viewport into a 2560x1440
-   * multisampled window shifts a few dozen subpixels by one LSB versus doing it
-   * into a plain 1280x720 one. Harmless to look at, fatal to a byte gate that is
-   * supposed to mean the same thing on every machine. */
+  /* ...except under the harness, where the capture must be a fixed 1280x720 */
   if(smoke||titlecap) wflags &= ~(Uint32)SDL_WINDOW_ALLOW_HIGHDPI;
   SDL_Window*win=SDL_CreateWindow("Δilation",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
     winW,winH,wflags);
   SDL_GLContext ctx=win?SDL_GL_CreateContext(win):0;
-  if(!ctx){
-    msaa=0;
-    if(win)SDL_DestroyWindow(win);
-    SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS,0);
-    SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES,0);
-    win=SDL_CreateWindow("Δilation",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
-      winW,winH,wflags);
-    ctx=win?SDL_GL_CreateContext(win):0;
-  }
   if(!ctx){ fprintf(stderr,"GL: %s\n",SDL_GetError()); return 1; }
   /* the drawable is what we actually render into, and it is NOT the window size */
   SDL_GL_GetDrawableSize(win,&fbW,&fbH);
@@ -5102,9 +5194,7 @@ int main(int argc,char**argv){
     if(qualAuto)qual=2;
     qualAuto=0; }
   printf("[dilation] window %dx%d, drawable %dx%d\n",winW,winH,fbW,fbH);
-  if(msaa){ SDL_GL_GetAttribute(SDL_GL_MULTISAMPLESAMPLES,&msaa);
-            if(msaa>1)glEnable(GL_MULTISAMPLE); else msaa=0; }
-  printf("[dilation] MSAA: %dx\n",msaa);
+  glEnable(GL_MULTISAMPLE);
   SDL_GL_SetSwapInterval(smoke||titlecap?0:1);
   load_gl();
   printf("[dilation] GL: %s / %s\n",
@@ -5130,6 +5220,7 @@ int main(int argc,char**argv){
   init_shaders();
   printf("[dilation] shaders up\n");
   init_post(msaa);
+  printf("[dilation] MSAA: %dx\n",postMS?msaa:0);
 
   music_init();   /* parse the note-string melodies into step arrays */
   SDL_AudioSpec want={0},have;
@@ -5212,7 +5303,7 @@ int main(int argc,char**argv){
            * choice the adaptive logic must stop second-guessing you. */
           case SDLK_q: if(once){
               qual=(qual+1)%3; qualAuto=0;
-              free_post(); init_post(4);
+              free_post(); init_post(msaaReq);
               printf("[dilation] quality: %s\n",QUAL[qual].name);
             } break;
           /* R rerolls the sector. The layout is fully seeded now, so this is a
@@ -5860,7 +5951,8 @@ int main(int argc,char**argv){
     frustum_build();
     { float yrb=pyaw*PI/180.0f, prb=ppitch*PI/180.0f;   /* billboard basis */
       bbRx=cosf(yrb); bbRz=sinf(yrb);
-      bbUx=sinf(yrb)*sinf(prb); bbUy=cosf(prb); bbUz=-cosf(yrb)*sinf(prb); }
+      bbUx=sinf(yrb)*sinf(prb); bbUy=cosf(prb); bbUz=-cosf(yrb)*sinf(prb);
+      bbFx=sinf(yrb)*cosf(prb); bbFy=-sinf(prb); bbFz=-cosf(yrb)*cosf(prb); }
     draw_world(camx,camy,camz);
     /* tonemap + bloom + grade. ts01 is the timescale remapped to 0..1 so the
      * composite can grade toward the frozen look without knowing about MINTS. */
@@ -5886,10 +5978,10 @@ int main(int argc,char**argv){
         holdT += dt;
         if(holdT>1.5f){
           if(avgDt>0.0215f && qual>0){          /* under ~46fps: drop a tier */
-            qual--; free_post(); init_post(4); holdT=0; avgDt=0;
+            qual--; free_post(); init_post(msaaReq); holdT=0; avgDt=0;
             printf("[dilation] quality auto -> %s (%.1f fps)\n",QUAL[qual].name,1.0f/dt);
           } else if(avgDt<0.0092f && qual<2 && holdT>4.0f){ /* >108fps: room to spare */
-            qual++; free_post(); init_post(4); holdT=0; avgDt=0;
+            qual++; free_post(); init_post(msaaReq); holdT=0; avgDt=0;
             printf("[dilation] quality auto -> %s\n",QUAL[qual].name);
           }
         }
