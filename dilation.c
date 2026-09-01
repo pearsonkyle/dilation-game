@@ -475,7 +475,7 @@ static Enemy en[MAXENEMY]; static int nen, nalive;
  * buffer of past positions. */
 typedef struct {
   float x,y,z,vx,vy,vz,life,range;
-  int on,owner;
+  int on,owner,whooshed;
   float tr[TRAILN][3]; int tn,th; float trd;
 } Bullet;
 static Bullet bul[MAXBUL];
@@ -1056,11 +1056,25 @@ static void emit_voice(int type,float pitch,float gl,float gr){
    * with the frozen world, because you always move in real time */
   int world = !(type==V_CLICK||type==V_WIN||type==V_PICK||type==V_STEP
               ||type==V_ROLL||type==V_JUMP||type==V_KICK||type==V_LAND);
+  /* a full pool used to drop the NEW sound — your own shot or hurt cue —
+   * while a frozen-world eshot tail kept its slot for 12s. Steal instead:
+   * the oldest voice of equal or lower priority, and never let one emitter
+   * class own more than three slots */
+  static const unsigned char vprio[15]={3,1,2,2,2,4, 3,0,3,4,0, 2,2,2,2};
   SDL_LockAudioDevice(adev);   /* cheap: taken once per one-shot, not per sample */
-  for(int i=0;i<MAXVOICE;i++) if(!voices[i].on){
-    voices[i].type=type; voices[i].t=0; voices[i].p=pitch; voices[i].world=world;
-    voices[i].lp=0; voices[i].gl=gl; voices[i].gr=gr;
-    voices[i].on=1; break; }
+  int slot=-1,nsame=0; float oldest=-1;
+  for(int i=0;i<MAXVOICE;i++){
+    if(!voices[i].on){ if(slot<0)slot=i; }
+    else if(voices[i].type==type)nsame++;
+  }
+  if(slot<0) for(int i=0;i<MAXVOICE;i++)
+    if(vprio[voices[i].type]<=vprio[type] && voices[i].t>oldest){ oldest=voices[i].t; slot=i; }
+  if(nsame>=3){ oldest=-1; for(int i=0;i<MAXVOICE;i++)
+    if(voices[i].on && voices[i].type==type && voices[i].t>oldest){ oldest=voices[i].t; slot=i; } }
+  if(slot>=0){
+    voices[slot].type=type; voices[slot].t=0; voices[slot].p=pitch; voices[slot].world=world;
+    voices[slot].lp=0; voices[slot].gl=gl; voices[slot].gr=gr;
+    voices[slot].on=1; }
   SDL_UnlockAudioDevice(adev);
 }
 static void sfxp(int type,float pitch){ if(audioOK) emit_voice(type,pitch,1.0f,1.0f); }
@@ -1212,7 +1226,7 @@ static float music_sample(double mt,int track){
   float db=ntof(root,bsemi)*dt;
   pb+=db; pb-=floorf(pb);
   float bgate=prog_on ? sc : expf(-fmodf(secInBeat*(float)bps*2.0f,1.0f)*5.0f);
-  lpb += 0.25f*(psaw(pb,db)*0.5f-lpb);
+  lpb += 0.25f*(psaw(pb,db)*0.5f-lpb); if(fabsf(lpb)<1e-15f)lpb=0;   /* denormal guard */
   out += lpb*bgate*(prog_on?0.34f:0.32f);
 
   /* lead: one detuned supersaw voice reading the parsed melody, div sixteenths
@@ -1240,12 +1254,13 @@ static float music_sample(double mt,int track){
       if(fc>7000.0f)fc=7000.0f;
       float fco=2.0f*sinf(PI*fc/44100.0f), res=1.05f;  /* res<2; lower = more squelch */
       float hp=drv-svf_lo-res*svf_bp; svf_bp+=fco*hp; svf_lo+=fco*svf_bp;
+      if(fabsf(svf_lo)<1e-15f)svf_lo=0; if(fabsf(svf_bp)<1e-15f)svf_bp=0;   /* rests ring into denormals */
       float pump=0.30f+0.70f*(1.0f-expf(-secInBeat*9.0f));
       out += svf_lo*pump*0.45f;
     } else {
       float cut=0.08f+0.20f*(0.5f+0.5f*sinf((float)mt*1.3f));
       float aenv=expf(-inNote*8.0f);                   /* tight staccato pluck */
-      lpa += cut*(saws-lpa);
+      lpa += cut*(saws-lpa); if(fabsf(lpa)<1e-15f)lpa=0;
       out += (lpa*0.7f+saws*0.3f)*aenv*aatk*(T->full?0.34f:0.22f);
     }
   }
@@ -1266,6 +1281,13 @@ static float music_sample(double mt,int track){
   return out;
 }
 
+/* phase of a linear down-sweep f0 -> fmin at k Hz/s: sin(2*pi*(f0-kt)*t)
+ * has instantaneous frequency f0-2kt and bounced back UP at the tail */
+static float chirp(float f0,float k,float fmin,float t){
+  float tc=(f0-fmin)/k;
+  if(t<tc) return f0*t-0.5f*k*t*t;
+  return f0*tc-0.5f*k*tc*tc + fmin*(t-tc);
+}
 static void audio_cb(void*ud,Uint8*stream,int len){
   (void)ud;
   float*out=(float*)stream; int n=len/8;   /* stereo: 2 floats per frame */
@@ -1285,12 +1307,10 @@ static void audio_cb(void*ud,Uint8*stream,int len){
       float atk=t<0.005f?t/0.005f:1.0f;   /* 5ms fade-in kills click transients */
       switch(voices[v].type){
         case V_SHOT:{ float nz=arand()*expf(-t*30)*0.30f*atk;
-          float f=(170.0f-t*460.0f)*p; if(f<35)f=35;
-          vs+=nz+sinf(2*PI*f*t)*expf(-t*15)*0.70f;
+          vs+=nz+sinf(2*PI*p*chirp(170.0f,460.0f,35.0f,t))*expf(-t*15)*0.70f;
           if(t>0.45f)voices[v].on=0; }break;
         case V_ESHOT:{ float nz=arand()*expf(-t*24)*0.25f*atk;
-          float f=(95.0f-t*180.0f)*p; if(f<28)f=28;
-          vs+=nz+sinf(2*PI*f*t)*expf(-t*10)*0.6f;
+          vs+=nz+sinf(2*PI*p*chirp(95.0f,180.0f,28.0f,t))*expf(-t*10)*0.6f;
           if(t>0.55f)voices[v].on=0; }break;
         case V_DEFLECT:{ /* metallic ping: inharmonic partials, softened top */
           vs+=(sinf(2*PI*1318*p*t)+0.6f*sinf(2*PI*2093*p*t)+0.25f*sinf(2*PI*2960*p*t))
@@ -1304,9 +1324,9 @@ static void audio_cb(void*ud,Uint8*stream,int len){
             +(sinf(2*PI*1318*t)+sinf(2*PI*1760*t*1.013f))*expf(-t*12)*0.12f;
           if(t>0.8f)voices[v].on=0; }break;
         case V_HURT:{ /* warm descending thud: pure tone + sub octave, no buzz */
-          float f=(180.0f-t*230.0f)*p; if(f<70)f=70;
+          float ph=p*chirp(180.0f,230.0f,70.0f,t);
           float env=expf(-t*7.0f)*atk;
-          vs+=(sinf(2*PI*f*t)*0.5f + sinf(2*PI*f*0.5f*t)*0.3f)*env;
+          vs+=(sinf(2*PI*ph)*0.5f + sinf(2*PI*ph*0.5f)*0.3f)*env;
           if(t>0.4f)voices[v].on=0; }break;
         case V_PICK:{ /* phase-continuous: the raw f*t step clicked at 90ms */
           float phc = t<0.09f ? 660*t : 660*0.09f+990*(t-0.09f);
@@ -1331,11 +1351,9 @@ static void audio_cb(void*ud,Uint8*stream,int len){
           float env=1.0f-t*2.5f; if(env<0)env=0;
           vs+=lp*env*1.1f;
           if(t>0.4f)voices[v].on=0; }break;
-        case V_JUMP:{ float f=(260.0f+t*1700.0f)*p;
-          vs+=sinf(2*PI*f*t)*expf(-t*18)*0.30f + arand()*expf(-t*40)*0.15f;
+        case V_JUMP:{ vs+=sinf(2*PI*p*(260.0f*t+850.0f*t*t))*expf(-t*18)*0.30f + arand()*expf(-t*40)*0.15f;
           if(t>0.25f)voices[v].on=0; }break;
-        case V_KICK:{ float f=(120.0f-t*160.0f)*p; if(f<40)f=40;
-          vs+=sinf(2*PI*f*t)*expf(-t*14)*0.5f + arand()*expf(-t*50)*0.25f;
+        case V_KICK:{ vs+=sinf(2*PI*p*chirp(120.0f,160.0f,40.0f,t))*expf(-t*14)*0.5f + arand()*expf(-t*50)*0.25f;
           if(t>0.3f)voices[v].on=0; }break;
         case V_LAND:{ vs+=sinf(2*PI*55.0f*t)*expf(-t*18)*0.55f*p
             + arand()*expf(-t*35)*0.2f;
@@ -1989,6 +2007,10 @@ static float pyV;       /* visual foot height: eases up steps, snaps down drops 
 static float lookS;     /* smoothed turn rate for the aim-settle hysteresis                */
 static float fax[2],faz[2],fstep[2],fsx[2],fsz[2],ftx[2],ftz[2]; static int flock; /* planted feet */
 static float camFade=1; /* avatar fade when the boom collapses onto it                     */
+static float jumpBuf,rollBuf,fireBuf,cutBuf; /* buffered one-shot inputs (s) */
+static float jumpT;          /* just jumped: the step-down snap stands aside  */
+static int   wasGround;      /* last frame's ground contact                   */
+static unsigned hitMask;     /* agents already cut by the current swing      */
 static float aimSet=1,stableT;      /* physical aim: 0 = gun rides the running
                                        body, 1 = settled on the look ray after
                                        GUN_SETTLE_TIME of stillness */
@@ -2003,7 +2025,17 @@ static int titlecap=0;   /* --titlecap: dump a numbered title-screen frame seque
  * sector's climate under the new name. Regenerating on selection turns the
  * title into a real preview of the chosen sector (agents, lights and all). */
 static unsigned reroll=0;   /* bumped by R on the title, mixed into the seed */
-static void preview_level(void){ gen_level(curlevel,gseed^reroll); laserTarget=-1; }
+static void clear_fx(void){
+  for(int i=0;i<MAXTEMPL;i++)templ_[i].life=0;
+  for(int i=0;i<MAXPART;i++)parts[i].life=0;
+  for(int i=0;i<MAXSHARD;i++)shards[i].life=0;
+  for(int i=0;i<MAXBUL;i++)bul[i].on=0;
+  mzT=0; dmgFlash=0; shake=0; hitstop=0;
+}
+/* the title shows a clean preview of the sector: ESC out of a fight used to
+ * leave its rounds hanging in the air and every aiming agent's laser converging
+ * on the spawn point */
+static void preview_level(void){ gen_level(curlevel,gseed^reroll); laserTarget=-1; clear_fx(); }
 
 static void reset_game(void){
   gen_level(curlevel,gseed^reroll);
@@ -2017,6 +2049,7 @@ static void reset_game(void){
   coyT=hurtCD=mzT=landT=landTgt=hitstop=airB=0;
   ads=0; adsHold=0;   /* respawning mid-zoom used to drop you in already aimed */
   lookS=0; flock=0; fstep[0]=fstep[1]=1; camFade=1;
+  jumpBuf=rollBuf=fireBuf=cutBuf=jumpT=0; wasGround=1; hitMask=0;
   camDist=3.05f; camYs=-1.0f;
   fireCD=swingT=swingCD=dmgFlash=stepT=shake=bobT=winT=wtime=0;
   winRealT=winSimT=rollPT=0;
@@ -2024,10 +2057,7 @@ static void reset_game(void){
   gunCharge=0;
   msgT=3.0f;
   laserTarget=-1;
-  for(int i=0;i<MAXTEMPL;i++)templ_[i].life=0;
-  for(int i=0;i<MAXPART;i++)parts[i].life=0;
-  for(int i=0;i<MAXSHARD;i++)shards[i].life=0;
-  for(int i=0;i<MAXBUL;i++)bul[i].on=0;
+  clear_fx();
 }
 
 /* circle-vs-grid, axis separated. y = mover's foot height: cells whose floor
@@ -2057,12 +2087,15 @@ static float ground_h(float x,float z,float y){
   return g;
 }
 /* is there a kickable wall right beside us? returns its outward normal */
-static int wall_kick(float x,float z,float y,float*nx,float*nz){
+static int wall_kick(float x,float z,float y,float ix,float iz,float*nx,float*nz){
   static const float D[4][2]={{1,0},{-1,0},{0,1},{0,-1}};
   for(int k=0;k<4;k++){
     int cx=(int)floorf((x+D[k][0]*0.55f)/CELL);
     int cz=(int)floorf((z+D[k][1]*0.55f)/CELL);
-    if(cellh(cx,cz)>y+1.0f){ *nx=-D[k][0]; *nz=-D[k][1]; return 1; }
+    /* a real wall (taller than any ledge you could mantle), and only when
+     * the stick is pushing INTO it — a ledge you are jumping onto must never
+     * hijack the double jump and throw you back off it */
+    if(cellh(cx,cz)>y+1.6f && ix*D[k][0]+iz*D[k][1]>0.3f){ *nx=-D[k][0]; *nz=-D[k][1]; return 1; }
   }
   return 0;
 }
@@ -2070,6 +2103,7 @@ static int wall_kick(float x,float z,float y,float*nx,float*nz){
  * floors block the ray where it passes below their top. */
 static float ray_wall(float ox,float oy,float oz,float dx,float dy,float dz,float maxd){
   float t=0; int cx=(int)floorf(ox/CELL), cz=(int)floorf(oz/CELL);
+  if(cellh(cx,cz)>1e8f)return 0;   /* starting inside a wall: nothing is visible */
   int sx=dx>0?1:-1, sz=dz>0?1:-1;
   float tdx=fabsf(dx)>1e-6f?CELL/fabsf(dx):1e9f, tdz=fabsf(dz)>1e-6f?CELL/fabsf(dz):1e9f;
   float nx=(sx>0?(cx+1)*CELL-ox:ox-cx*CELL), nz=(sz>0?(cz+1)*CELL-oz:oz-cz*CELL);
@@ -2522,14 +2556,11 @@ static int laser_target(void){
   }
   return best;
 }
-static void fire(void){
-  /* swingCD, not just swingT: the blade stays IN THE HAND through the whole
-   * cooldown (player_pose's `blade` is `s>0 || swingCD>0`), and both the laser
-   * and the lock-on already gate on it. Without it there was a ~0.24s window
-   * where a round left a gun that is not drawn — flash, report and ammo spent
-   * from a phantom pistol beside the katana. */
-  if(fireCD>0||rollT>0||swingT>0)return;   /* the body is busy: not during the cut itself */
-  if(pammo<=0){ sfx(V_CLICK); fireCD=0.3f; gunCharge=0; return; }
+static int fire(void){
+  /* the katana lives in the LEFT hand now, so only the cut itself (swingT)
+   * blocks the pistol; the press waits in fireBuf meanwhile */
+  if(fireCD>0||rollT>0||swingT>0)return 0;
+  if(pammo<=0){ sfx(V_CLICK); fireCD=0.3f; gunCharge=0; return 1; }
   /* sample the barrel FIRST: the round leaves the gun as it was at trigger
    * pull — where the gun physically points, not where the camera looks —
    * before the recoil state (fireCD raise, settle knock) kicks the pose.
@@ -2540,6 +2571,10 @@ static void fire(void){
   pose_dirty();
   float mx,my,mz,dx,dy,dz,hx,hy,hz,ld;
   player_laser(&mx,&my,&mz,&dx,&dy,&dz,&hx,&hy,&hz,&ld);
+  if(solid((int)floorf(mx/CELL),(int)floorf(mz/CELL))){
+    /* the muzzle is poked into a pillar: the round still leaves the body and
+     * hits the wall in front instead of dying inside it */
+    const ArmR*a=arm_get(); mx=a->sx; my=a->sy; mz=a->sz; }
   fireCD=FIRE_TIME; actT=0.22f;
   pammo--;
   /* Recoil unsettles the aim so follow-ups want a beat. Knock the SETTLE CLOCK
@@ -2556,17 +2591,19 @@ static void fire(void){
   gunCharge=0;
   add_templ(mx+dx*0.20f,my+dy*0.20f,mz+dz*0.20f,5.0f,0.07f, 1.2f,3.2f,1.8f);
   mzX=mx; mzY=my; mzZ=mz; mzT=0.06f;
+  return 1;
 }
-static void katana(void){
-  if(swingCD>0||swingT>0)return;
+static int katana(void){
+  if(swingCD>0||swingT>0||rollT>0)return 0;   /* no cuts from the tucked ball */
   /* Drawing the blade lowers the gun. ADS and the katana are the same hand, and
    * without this you could hold RMB to full zoom — camera inside the skull, near
    * plane pulled to 0.035 — and then swing a 1.05-unit blade whose centre passes
    * 6cm in front of the lens. The ads target below also gates on the blade, so
    * the two cannot re-enter each other during the follow-through. */
   adsHold=0;
-  swingT=0.0001f; swingCD=0.5f; actT=0.26f;
+  swingT=0.0001f; swingCD=0.5f; actT=0.26f; hitMask=0;
   sfx(V_SWING);
+  return 1;
 }
 /* the active swing window: kill close agents, bat bullets back */
 static void katana_strike(void){
@@ -2577,6 +2614,8 @@ static void katana_strike(void){
     float reach=e->type==2?3.0f:1.9f, vreach=e->type==2?3.0f:1.4f;
     if(d>reach||fabsf(e->y-py)>vreach)continue;
     if((dx*fx+dz*fz)/(d+1e-6f) < 0.45f)continue;
+    if(hitMask&(1u<<i))continue;               /* one cut per agent per swing */
+    hitMask|=1u<<i;
     damage_enemy(e,1);
   }
   for(int i=0;i<MAXBUL;i++){
@@ -2596,7 +2635,7 @@ static void katana_strike(void){
     else    { ndx=fx; ndy=0.02f; ndz=fz; }
     float il=1.0f/sqrtf(ndx*ndx+ndy*ndy+ndz*ndz+1e-9f);
     b->vx=ndx*il*19.0f; b->vy=ndy*il*19.0f; b->vz=ndz*il*19.0f;
-    b->owner=1; b->life=6.0f;
+    b->owner=1; b->life=6.0f; b->whooshed=0;
     /* a clean deflection is also a free round: bat the bullet back AND pocket
      * the brass — rewards aggressive katana play, capped like any pickup */
     if(pammo<PLAYER_MAX_AMMO)pammo++;
@@ -2617,6 +2656,7 @@ static void update_bullets(float wdt){
     int nsub=(int)(step/0.22f)+1;
     float sdt=wdt/nsub;
     for(int s=0;s<nsub && b->on;s++){
+      float ox=b->x,oy=b->y,oz=b->z;
       b->x+=b->vx*sdt; b->y+=b->vy*sdt; b->z+=b->vz*sdt;
       float moved=spd*sdt;
       /* trail breadcrumb every 0.30 units of travel */
@@ -2636,6 +2676,14 @@ static void update_bullets(float wdt){
       /* walls / floors (raised or not) / ceiling */
       if(b->y>wallh-0.03f ||
          b->y<cellh((int)floorf(b->x/CELL),(int)floorf(b->z/CELL))+0.03f){
+        /* back the round up to the face it crossed, so the sparks and the
+         * impact light sit ON the surface instead of buried up to a substep
+         * inside it (where the wall itself got no splash) */
+        { float il=1.0f/spd, t=ray_wall(ox,oy,oz,b->vx*il,b->vy*il,b->vz*il,moved);
+          if(b->vy<-1e-4f){ float tf=(oy-(floor_at(b->x,b->z)+0.03f))/(-b->vy*il); if(tf>0&&tf<t)t=tf; }
+          if(b->vy> 1e-4f){ float tc=(wallh-0.03f-oy)/(b->vy*il); if(tc>0&&tc<t)t=tc; }
+          t-=0.03f; if(t<0)t=0;
+          b->x=ox+b->vx*il*t; b->y=oy+b->vy*il*t; b->z=oz+b->vz*il*t; }
         spawn_parts(7,b->x,b->y,b->z,2.4f, 0.3f,1.1f,0.6f);
         add_templ(b->x,b->y,b->z,3.0f,0.10f, 0.5f,2.0f,1.0f);
         b->on=0; break;
@@ -2649,10 +2697,15 @@ static void update_bullets(float wdt){
           spawn_parts(8,b->x,b->y,b->z,2.0f, 1.2f,0.3f,0.2f);
           b->on=0; break;
         }
-        /* near miss: doppler whoosh, pitch from closing speed */
+        /* near miss: doppler whoosh, pitch from closing speed. Latched per
+         * round: this used to re-roll every substep of every frame, so one
+         * passing round in frozen time fired dozens of 11-second whooshes
+         * and flooded the voice pool. Audio is not simulation, so the coin
+         * comes from the visual stream and the sim RNG is left alone. */
         float d2=dx*dx+dz*dz;
-        if(d2<1.3f*1.3f && d2>1.0f && (b->vx*dx+b->vz*dz)>0 && frand()<0.5f)
-          sfx3(V_WHOOSH, 0.7f+clampf(spd/14.0f,0,1)*0.8f, b->x,b->y,b->z);
+        if(!b->whooshed && d2<1.3f*1.3f && d2>1.0f && (b->vx*dx+b->vz*dz)>0){
+          b->whooshed=1;
+          if(vrand()<0.6f) sfx3(V_WHOOSH, 0.7f+clampf(spd/14.0f,0,1)*0.8f, b->x,b->y,b->z); }
       } else { /* player round vs agents */
         for(int j=0;j<nen;j++){
           Enemy*e=&en[j]; if(e->state==4)continue;
@@ -4930,6 +4983,40 @@ static int nan_check(int frame){
 }
 
 /* WASD -> world-space move direction, relative to the view yaw */
+/* one-shot actions, resolved in the sim block from short input buffers so a
+ * press a few frames early (before touchdown, during a cooldown) still lands
+ * instead of being silently dropped. Each returns whether it consumed the press. */
+static void wasd_dir(int w,int s,int a,int d,float*mx,float*mz);
+static int try_jump(int w,int s,int a,int d){
+  if(rollT>0)return 0;
+  float gh=ground_h(px,pz,py), wnx,wnz, ix,iz;
+  wasd_dir(w,s,a,d,&ix,&iz);
+  { float l=sqrtf(ix*ix+iz*iz); if(l>0.01f){ ix/=l; iz/=l; } else ix=iz=0; }
+  if(py<=gh+0.001f||coyT>0){ /* coyote: late edge jumps count */
+    pvy=7.5f; jumps=1; actT=0.20f; coyT=0; jumpT=0.15f; sfx(V_JUMP); return 1; }
+  if(wall_kick(px,pz,py,ix,iz,&wnx,&wnz)){
+    /* kick off the wall: up and away, air jump restored */
+    pvy=7.4f; kvx=wnx*6.0f; kvz=wnz*6.0f; jumps=1; actT=0.20f; jumpT=0.15f;
+    spawn_parts(8,px-wnx*0.4f,py+0.8f,pz-wnz*0.4f,2.5f, 0.30f,1.2f,0.6f);
+    sfx(V_KICK); return 1; }
+  if(jumps>0){ jumps--; pvy=6.6f; actT=0.20f; jumpT=0.15f;
+    spawn_parts(10,px,py+0.1f,pz,2.2f, 0.25f,1.1f,0.55f);
+    sfxp(V_JUMP,1.3f); return 1; }
+  return 0;
+}
+static int try_roll(int w,int s,int a,int d){
+  if(rollCD>0||rollT>0||py>ground_h(px,pz,py)+0.05f)return 0;
+  /* dodge roll along current input, or straight ahead */
+  float mx,mz;
+  wasd_dir(w,s,a,d,&mx,&mz);
+  float ml2=sqrtf(mx*mx+mz*mz);
+  if(ml2<0.01f){ float yr2=pyaw*PI/180;
+    mx=sinf(yr2); mz=-cosf(yr2); ml2=1; }
+  rollDX=mx/ml2; rollDZ=mz/ml2;
+  rollT=ROLL_TIME; rollCD=ROLL_CD; actT=ROLL_TIME;
+  sfx(V_ROLL);
+  return 1;
+}
 static void wasd_dir(int w,int s,int a,int d,float*mx,float*mz){
   float yr=pyaw*PI/180;
   float fx=sinf(yr),fz=-cosf(yr),rx=cosf(yr),rz=sinf(yr);
@@ -5109,42 +5196,18 @@ int main(int argc,char**argv){
           case SDLK_w:wdown=d;break; case SDLK_a:adown=d;break;
           case SDLK_s:sdown=d;break; case SDLK_d:ddown=d;break;
           case SDLK_SPACE:
-            if(once&&gstate==ST_PLAY&&rollT<=0){
-              float gh=ground_h(px,pz,py), wnx,wnz;
-              if(py<=gh+0.001f||coyT>0){ /* coyote: late edge jumps count */
-                pvy=7.5f; jumps=1; actT=0.20f; coyT=0; sfx(V_JUMP);
-              }
-              else if(wall_kick(px,pz,py,&wnx,&wnz)){
-                /* kick off the wall: up and away, air jump restored */
-                pvy=7.4f; kvx=wnx*6.0f; kvz=wnz*6.0f; jumps=1; actT=0.20f;
-                spawn_parts(8,px-wnx*0.4f,py+0.8f,pz-wnz*0.4f,2.5f, 0.30f,1.2f,0.6f);
-                sfx(V_KICK);
-              }
-              else if(jumps>0){ jumps--; pvy=6.6f; actT=0.20f;
-                spawn_parts(10,px,py+0.1f,pz,2.2f, 0.25f,1.1f,0.55f);
-                sfxp(V_JUMP,1.3f);
-              }
-            } break;
+            if(once&&gstate==ST_PLAY) jumpBuf=0.12f;   /* resolved in the sim block */
+            break;
           case SDLK_LCTRL: case SDLK_RCTRL: case SDLK_c:
           case SDLK_LSHIFT: case SDLK_RSHIFT:
-            if(once&&gstate==ST_PLAY&&rollCD<=0&&rollT<=0
-               &&py<=ground_h(px,pz,py)+0.05f){
-              /* dodge roll along current input, or straight ahead */
-              float mx,mz;
-              wasd_dir(wdown,sdown,adown,ddown,&mx,&mz);
-              float ml2=sqrtf(mx*mx+mz*mz);
-              if(ml2<0.01f){ float yr2=pyaw*PI/180;
-                mx=sinf(yr2); mz=-cosf(yr2); ml2=1; }
-              rollDX=mx/ml2; rollDZ=mz/ml2;
-              rollT=ROLL_TIME; rollCD=ROLL_CD; actT=ROLL_TIME;
-              sfx(V_ROLL);
-            } break;
+            if(once&&gstate==ST_PLAY) rollBuf=0.12f;
+            break;
           case SDLK_1: case SDLK_2: case SDLK_3: case SDLK_4:
             if(once&&gstate==ST_TITLE){ curlevel=ev.key.keysym.sym-SDLK_1;
               if(curlevel>=NLEVEL)curlevel=NLEVEL-1;
               preview_level(); sfx(V_CLICK); }
             break;
-          case SDLK_f: if(once&&gstate==ST_PLAY)katana(); break;
+          case SDLK_f: if(once&&gstate==ST_PLAY)cutBuf=0.15f; break;
           /* Q cycles the quality tier by hand and pins it — once you have made a
            * choice the adaptive logic must stop second-guessing you. */
           case SDLK_q: if(once){
@@ -5172,7 +5235,7 @@ int main(int argc,char**argv){
           case SDLK_ESCAPE:
             if(once){
               if(gstate==ST_TITLE)running=0;
-              else { gstate=ST_TITLE; laserTarget=-1; adsHold=0;
+              else { gstate=ST_TITLE; preview_level(); adsHold=0;
                      SDL_SetRelativeMouseMode(SDL_FALSE); }
             } break;
         }
@@ -5198,7 +5261,7 @@ int main(int argc,char**argv){
            * last sector loops so OVERLORD stays replayable. */
           if(gstate==ST_WIN && curlevel+1<NLEVEL) curlevel++;
           reset_game(); gstate=ST_PLAY; SDL_SetRelativeMouseMode(SDL_TRUE); }
-        else fire();
+        else fireBuf=0.15f;
       }
       /* RMB is ADS now; the katana moved to F. RMB-to-aim is the binding every
        * player already has in their hands, and the katana is a deliberate,
@@ -5480,6 +5543,14 @@ int main(int argc,char**argv){
       float mx,mz;
       wasd_dir(wdown,sdown,adown,ddown,&mx,&mz);
       float ml=sqrtf(mx*mx+mz*mz);
+      /* buffered presses: tried before the physics step (so an on-ground
+       * press keeps its zero-latency response) and again after the ground
+       * clamp (so a press just before touchdown lands on the same frame) */
+      if(jumpBuf>0){ jumpBuf-=dt; if(try_jump(wdown,sdown,adown,ddown))jumpBuf=0; }
+      if(rollBuf>0){ rollBuf-=dt; if(try_roll(wdown,sdown,adown,ddown))rollBuf=0; }
+      if(fireBuf>0){ fireBuf-=dt; if(fire())fireBuf=0; }
+      if(cutBuf>0){ cutBuf-=dt; if(katana())cutBuf=0; }
+      if(jumpT>0)jumpT-=dt;
       float ox=px,oz=pz;
       if(rollT>0){                 /* the roll owns the legs while it runs */
         rollT-=dt;
@@ -5503,14 +5574,14 @@ int main(int argc,char**argv){
       }
       if(kvx*kvx+kvz*kvz>0.01f){   /* wall-kick momentum, easing off */
         move_circ(&px,&pz,kvx*dt,kvz*dt,0.34f,py);
-        kvx-=kvx*clampf(dt*4.0f,0,1); kvz-=kvz*clampf(dt*4.0f,0,1);
+        kvx-=kvx*expk(4.0f,dt); kvz-=kvz*expk(4.0f,dt);
       }
       if(rollCD>0)rollCD-=dt;
       pvx=(px-ox)/dt; pvz=(pz-oz)/dt;
       /* see the agents' e->spdS: same problem, same cure */
       { float sp=sqrtf(pvx*pvx+pvz*pvz);
         pspdS=toward(pspdS,sp,expk(sp>pspdS?18.0f:10.0f,dt)); }
-      pmoveb=toward(pmoveb,(ml>0.01f||rollT>0)?1.0f:0.0f,dt*9.0f);
+      pmoveb=toward(pmoveb,(ml>0.01f||rollT>0)?1.0f:0.0f,expk(9.0f,dt));
       /* travel-locked cadence: stride phase advances with actual ground speed,
        * so the planted foot tracks the floor instead of skating. A faint idle
        * creep keeps the pose from freezing mid-step. (phase = bobT*7.5 in draw) */
@@ -5521,9 +5592,13 @@ int main(int argc,char**argv){
        * no yaw snap entering or leaving a sideways roll */
       avYaw=angto(avYaw, pyaw*PI/180.0f, expk(14.0f,dt));   /* rolls pick their axis, not their yaw */
 
+      float pyPrev=py;
       pvy-=18.0f*dt;
-      py += pvy*dt;
-      float gh=ground_h(px,pz,py);
+      py += (pvy+9.0f*dt)*dt;          /* exact constant-gravity step: same apex at any dt */
+      if(pvy<-14.0f)pvy=-14.0f;        /* terminal velocity keeps one frame under STEP */
+      /* swept: any platform top between the old and the new feet counts, so
+       * a hitch frame can never drop the player through a tier */
+      float gh=ground_h(px,pz, pyPrev>py?pyPrev:py);
       if(py<gh){
         if(pvy<-7.0f){           /* a real landing: thud, dust, camera dip */
           sfxp(V_LAND,clampf(-pvy/14.0f,0.5f,1.2f));
@@ -5540,15 +5615,25 @@ int main(int argc,char**argv){
          * absorb has a fast but finite attack and a slower release. landTgt is
          * the target the compression now runs TO over ~60ms. */
         { float imp=clampf(-pvy/15.0f,0,1);
+          if(gh-pyPrev>0.12f && imp<0.22f) imp=0.22f;   /* a stair tread: a small knee dip */
           if(imp>landTgt)landTgt=imp; }
         py=gh; pvy=0; jumps=1;
+      }
+      else if(wasGround && pvy<=0 && py-gh<=STEP && jumpT<=0){
+        /* stepping DOWN a riser stays planted: it used to be 0.2s of fake
+         * airtime per stair that unsettled the gun, unfroze time and played
+         * the airborne pose — the knees just register the drop */
+        if(py-gh>0.05f && landTgt<0.10f) landTgt=0.10f;
+        py=gh; pvy=0;
       }
       /* the drawn feet ease up onto a step instead of teleporting with py,
        * and snap down so they never hang over a drop */
       if(py>pyV) pyV=toward(pyV,py,expk(16.0f,dt)); else pyV=py;
-      int air = py>gh+0.01f;
+      int air = py>gh+0.01f; wasGround=!air;
       coyT = air? coyT-dt : 0.12f;
       airB = toward(airB, air?1.0f:0.0f, expk(7.0f,dt));   /* pose blend, raw dt */
+      if(jumpBuf>0 && try_jump(wdown,sdown,adown,ddown))jumpBuf=0;
+      if(rollBuf>0 && try_roll(wdown,sdown,adown,ddown))rollBuf=0;
       update_feet(dt);
 
       /* mouseAcc is pixels-per-FRAME: normalize by dt or the same physical turn
@@ -5559,17 +5644,27 @@ int main(int argc,char**argv){
        * onto the look ray — an eased 0.22s, so the stop-time-aim-fire rhythm
        * never waits on the gun. Runs on raw dt: this is the player's own
        * body, which never dilates with the frozen world. */
-      { int stable = !air && rollT<=0
-                   && sqrtf(pvx*pvx+pvz*pvz)<0.8f && look<0.35f;
-        stableT = stable? stableT+dt : 0;
+      { lookS=toward(lookS,look,expk(25.0f,dt));
+        int still = !air && rollT<=0 && sqrtf(pvx*pvx+pvz*pvz)<0.8f;
+        stableT = still? stableT+dt : 0;
         float want=sstep(clampf(stableT/GUN_SETTLE_TIME,0,1));
-        aimSet = want>aimSet ? want : toward(aimSet,want,dt*8.0f); }
+        /* a flick to correct onto a target must never drop the gun: turning
+         * only CAPS the settle in proportion to the sustained turn rate, so
+         * small corrections cost a few degrees and only a real spin swings
+         * the barrel off the ray */
+        float cap=1.0f-clampf((lookS-0.25f)*1.6f,0,0.6f);
+        if(want>cap)want=cap;
+        aimSet = want>aimSet ? want : toward(aimSet,want,expk(8.0f,dt)); }
       if(actT>0)actT-=dt;
-      float target=(ml>0.01f||rollT>0||air)?1.0f:0.0f;
+      /* keyed to DISPLACEMENT, not to the key: pushing into a wall or an
+       * agent no longer runs the world at full speed around a body that is
+       * standing still */
+      float target=clampf(sqrtf(pvx*pvx+pvz*pvz)/4.0f,0,1);
+      if(air)target=1.0f;
       if(look>target)target=look;
       if(actT>0)target=1.0f;
       target=MINTS+(1.0f-MINTS)*target;
-      tscale+=(target-tscale)*clampf(dt*14.0f,0,1);
+      tscale+=(target-tscale)*expk(14.0f,dt);
       /* impact freeze: a kill or a deflect pins the world for ~50ms. In a game
        * whose whole language is timescale, the punch belongs in tscale rather
        * than in a camera kick — the shards hang in the air for a beat and the
@@ -5594,13 +5689,19 @@ int main(int argc,char**argv){
         if(look>chargeDrive)chargeDrive=look;
         gunCharge=clampf(gunCharge+dt*chargeDrive/GUN_CHARGE_TIME,0,1);
       } else gunCharge=0;
-      laserTarget=laser_target();
+      { int lt=laser_target();
+        /* the recoil kick rides the laser for a beat: keep a live lock through
+         * it rather than flickering it off after every shot */
+        if(lt<0 && fireCD>FIRE_TIME*0.5f && laserTarget>=0 && laserTarget<nen && en[laserTarget].state!=4) lt=laserTarget;
+        laserTarget=lt; }
       if(swingCD>0){ swingCD-=dt;
         if(swingCD<=0)swStow=1.0f;      /* katana leaves the hand: ease back */
       }
       if(swingT>0){
-        float pt=swingT; swingT+=dt;
-        if(pt<0.10f&&swingT>=0.10f)katana_strike();  /* one strike per swing */
+        swingT+=dt;
+        /* the cut is live for the window the blade visibly sweeps, not one
+         * sampled frame: a round that enters the arc mid-swing is parried */
+        if(swingT>=0.07f&&swingT<=0.21f)katana_strike();
         if(swingT>SWING_TIME){ swingT=0; swRel=1.0f; } /* cut ends: ease down */
       }
       if(swRel>0){ swRel-=dt*4.0f; if(swRel<0)swRel=0; }
@@ -5639,7 +5740,10 @@ int main(int argc,char**argv){
     for(int i=0;i<MAXPART;i++){
       Part*p=&parts[i]; if(p->life<=0)continue;
       p->life-=wdt; p->vy-=6.0f*wdt;
-      p->x+=p->vx*wdt; p->y+=p->vy*wdt; p->z+=p->vz*wdt;
+      { float nx=p->x+p->vx*wdt, nz=p->z+p->vz*wdt;   /* never into a wall or a platform side */
+        if(cellh((int)floorf(nx/CELL),(int)floorf(nz/CELL))>p->y+0.02f){ p->vx*=-0.4f; p->vz*=-0.4f; }
+        else { p->x=nx; p->z=nz; } }
+      p->y+=p->vy*wdt;
       float pg=floor_at(p->x,p->z);
       if(p->y<pg+0.02f){p->y=pg+0.02f;p->vy*=-0.3f;p->vx*=0.7f;p->vz*=0.7f;}
     }
@@ -5650,7 +5754,10 @@ int main(int argc,char**argv){
     for(int i=0;i<MAXSHARD;i++){
       Shard*s=&shards[i]; if(s->life<=0)continue;
       s->life-=wdt; s->vy-=7.0f*wdt;
-      s->x+=s->vx*wdt; s->y+=s->vy*wdt; s->z+=s->vz*wdt;
+      { float nx=s->x+s->vx*wdt, nz=s->z+s->vz*wdt;
+        if(cellh((int)floorf(nx/CELL),(int)floorf(nz/CELL))>s->y){ s->vx*=-0.4f; s->vz*=-0.4f; s->wy*=0.5f; }
+        else { s->x=nx; s->z=nz; } }
+      s->y+=s->vy*wdt;
       s->yaw+=s->wy*wdt; s->pit+=s->wp*wdt;
       float sg=floor_at(s->x,s->z);
       if(s->y<sg+s->sy*0.5f){ s->y=sg+s->sy*0.5f; s->vy*=-0.35f; s->vx*=0.6f; s->vz*=0.6f;
@@ -5677,8 +5784,8 @@ int main(int argc,char**argv){
     /* smoothed shake: per-frame white noise read as flicker, not impact.
      * The offset chases a random target, so it jolts and settles instead. */
     static float shxS=0,shyS=0;
-    shxS=toward(shxS, shake>0?(vrand()-0.5f)*shake*7.0f:0.0f, dt*30.0f);
-    shyS=toward(shyS, shake>0?(vrand()-0.5f)*shake*7.0f:0.0f, dt*30.0f);
+    shxS=toward(shxS, shake>0?(vrand()-0.5f)*shake*7.0f:0.0f, expk(30.0f,dt));
+    shyS=toward(shyS, shake>0?(vrand()-0.5f)*shake*7.0f:0.0f, expk(30.0f,dt));
     /* Shake is applied as raw DEGREES of view rotation. From behind the shoulder
      * that reads as a camera jolt; from inside the head the same angle is a
      * whiplash, and through a narrower lens it is worse again. Damp it as we
