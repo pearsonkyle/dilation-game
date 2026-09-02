@@ -499,6 +499,7 @@ typedef struct {
   float r,g,b;
 } Shard;
 static Shard shards[MAXSHARD]; static int shHead=0;
+static int wakeN;   /* katana wake samples in use (the buffer lives with draw_player); fx state like the pools */
 
 /* level definitions: four hand-tuned sectors, each with its own climate —
  * same Matrix family, different temperature. */
@@ -1825,8 +1826,8 @@ static void init_post(int msaa){
     glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,rbDepMS);
     postMS = glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE ? msaa : 0;
   }
-  /* bloom chain: half, quarter, eighth (the tier may use fewer octaves, but we
-   * allocate all three so a tier change never has to reallocate) */
+  /* bloom chain: five octaves, half down to 1/32 (the tier may use fewer, but
+   * we allocate all NBLOOM so a tier change never has to reallocate) */
   for(int i=0;i<NBLOOM;i++){
     bloomW[i]=scW>>(i+1); bloomH[i]=scH>>(i+1);
     if(bloomW[i]<2)bloomW[i]=2; if(bloomH[i]<2)bloomH[i]=2;
@@ -2100,6 +2101,7 @@ static void clear_fx(void){
   for(int i=0;i<MAXSHARD;i++)shards[i].life=0;
   for(int i=0;i<MAXBUL;i++)bul[i].on=0;
   mzT=0; dmgFlash=0; shake=0; hitstop=0;
+  wakeN=0;   /* a cut interrupted by death or ESC must not seed the next one's trail */
 }
 /* the title shows a clean preview of the sector: ESC out of a fight used to
  * leave its rounds hanging in the air and every aiming agent's laser converging
@@ -2598,9 +2600,6 @@ static void player_aim(float*dx,float*dy,float*dz){
   float yr=pyaw*PI/180, pr=ppitch*PI/180;
   *dx=sinf(yr)*cosf(pr); *dy=-sinf(pr); *dz=-cosf(yr)*cosf(pr);
 }
-/* one deterministic evaluation of the avatar's whole-body stance — shared by
- * draw_player and the sim-side aiming chain below, so the drawn figure and
- * the ballistics can never drift apart. */
 /* ---- avatar anatomy, shared by the pose solver and the renderer ---------
  * one set of numbers so the drawn figure and the ballistics can never drift */
 #define SPINE_Y    0.62f   /* upper-body pivot above the body origin        */
@@ -3038,11 +3037,12 @@ static int fire(void){
 }
 static int katana(void){
   if(swingCD>0||swingT>0||rollT>0)return 0;   /* no cuts from the tucked ball */
-  /* Drawing the blade lowers the gun. ADS and the katana are the same hand, and
-   * without this you could hold RMB to full zoom — camera inside the skull, near
-   * plane pulled to 0.035 — and then swing a 1.05-unit blade whose centre passes
-   * 6cm in front of the lens. The ads target below also gates on the blade, so
-   * the two cannot re-enter each other during the follow-through. */
+  /* Drawing the blade drops ADS. The katana lives in the LEFT hand, so it is
+   * not the pistol that objects: without this you could hold RMB to full zoom
+   * — camera inside the skull, near plane pulled to 0.035 — and then swing a
+   * 1.05-unit blade whose centre passes 6cm in front of the lens. The ads
+   * target below also gates on the blade, so the two cannot re-enter each
+   * other during the follow-through. */
   adsHold=0;
   swingT=0.0001f; swingCD=0.5f; actT=0.26f; hitMask=0;
   sfx(V_SWING);
@@ -4025,13 +4025,18 @@ static void draw_boss(Enemy*e){
     float aph=e->anim+(ai>0?PI:0);
     float sw =sinf(aph)*0.40f*e->moveb*(1.0f-e->armp);
     float idle=0.06f*sinf(wtime*1.6f+ai);
-    /* the swat, driven by the melee clock: the lead claw sweeps UP and BACK
-       through the windup, then whips to full reach so the extreme lands on the
-       hit frame, and sags back over the recovery; melB fades it in and out */
-    float reach=mel*(ai==1 ? -2.40f*mw*(1.0f-ms)+1.25f*ms*msag
+    /* the swat, driven by the melee clock: the lead claw cocks up beside the
+       skull through the windup, then whips to full reach so the extreme lands
+       on the hit frame, and sags back over the recovery; melB fades it in and out */
+    float reach=mel*(ai==1 ? -0.90f*mw*(1.0f-ms)+1.25f*ms*msag
                            : -0.45f*mw*(1.0f-ms)+0.30f*ms*msag);
-    /* and cocks it out to the side: a raise alone is invisible head-on */
-    float cock=ai==1 ? 0.55f*mel*mw*(1.0f-ms) : 0.0f;
+    /* the raise is ABDUCTION, not a backward swing: swept toward +Z the arm
+       foreshortens to a stub from the player's side. The upper arm cocks out
+       to horizontal (1.9 rad) and the forearm lifts a further 1.8 rad about Z,
+       an L with the claw up by the skull in the frontal plane where it reads;
+       the X elbow bend straightens out of the way and returns for the hook */
+    float wa = ai==1 ? mel*mw*(1.0f-ms) : 0.0f;
+    float cock=1.90f*wa, lift=1.80f*wa;
     /* up: down-forward base, rears up while airborne (armp), then thrust down to
        brace on impact (crouch) so the arms visibly come out of the leap pose */
     /* forward-POSITIVE, like the agents and the avatar: m3rotX(+t) swings the
@@ -4039,15 +4044,15 @@ static void draw_boss(Enemy*e){
      * throughout, so "down-and-forward" hung backward and the melee claw hooked
      * away from the player it was swatting. Mirrored wholesale to keep the tuning. */
     float up=0.50f+reach+0.85f*e->armp-0.40f*crouch-sw-idle;
-    float eb=0.80f-0.45f*mel*ms*msag;              /* the elbow straightens through the strike */
-    float A[9],F[9],RX[9],RE[9],RZ[9],S[9];
-    m3rotZ(RZ,ai*(0.26f+cock));
+    float eb=(0.80f-0.45f*mel*ms*msag)*(1.0f-wa);  /* the elbow straightens through the strike */
+    float A[9],F[9],RX[9],RE[9],RZ[9],RZf[9],S[9];
+    m3rotZ(RZ,ai*(0.26f+cock)); m3rotZ(RZf,ai*(0.26f+cock+lift));
     m3rotX(RX,up);    m3mul(S,RX,RZ); m3mul(A,M,S);
     float sh[3]; m3v(M,ai*0.82f,1.80f,0,sh);
     float shx=e->x+sh[0], shy=pvY+sh[1], shz=e->z+sh[2];
     float ex,ey,ez; limb_seg(A,shx,shy,shz,-0.46f, 0.24f,0.19f,0.95f,7,-0.92f,&ex,&ey,&ez);
     set_uM(A,ex,ey,ez); sphere_sh(0.23f,0.26f,0.23f,6,4);
-    m3rotX(RE,up+eb); m3mul(S,RE,RZ); m3mul(F,M,S);
+    m3rotX(RE,up+eb); m3mul(S,RE,RZf); m3mul(F,M,S);
     float wx,wy,wz; limb_seg(F,ex,ey,ez,-0.40f, 0.19f,0.12f,0.85f,7,-0.82f,&wx,&wy,&wz);
     for(int c=-1;c<=1;c++){ put(F,wx,wy,wz, c*0.12f,-0.18f,-0.10f); wedge_sh(0.06f,0.10f,0.46f); }
   }
@@ -4069,8 +4074,9 @@ static void draw_boss(Enemy*e){
     m3v(Hh,hi*0.34f,0.36f,0.02f,o);
     set_uM(HR,hcx+o[0],hcy+o[1],hcz+o[2]); cyl_sh(0.125f,0.012f,0.66f,6);
   }
-  /* eye cluster: emerald -> furnace red across phases, flaring with the roar */
-  float glow=1.0f+e->roar*2.0f+0.5f*ph;
+  /* eye cluster: emerald -> furnace red across phases, flaring with the roar
+   * and going out as the body comes apart */
+  float glow=(1.0f+e->roar*2.0f+0.5f*ph)*(1.0f-die);
   glUniform1f(uEmis,1.0f);
   tintf((0.5f+0.9f*ph)*glow,(1.6f-0.6f*ph)*glow,0.35f*glow);
   float eyx[5]={-0.30f,-0.15f,0.0f,0.15f,0.30f}, eyy[5]={0.04f,0.11f,0.15f,0.11f,0.04f};
@@ -4291,7 +4297,7 @@ static void put_u(const PPose*P,const float*B,float x,float y,float z){
  * hips that only met the blade at the very end of the cut. */
 #define WAKE_N 48
 typedef struct { float b[3],t[3],s; } Wake;
-static Wake wake[WAKE_N]; static int wakeN;
+static Wake wake[WAKE_N];
 static void wake_sample(float s,const float*b,const float*t){
   static unsigned stamp; if(stamp==poseStamp)return; stamp=poseStamp;
   if(wakeN && wake[wakeN-1].s>=s){ if(wake[wakeN-1].s==s)return; wakeN=0; }   /* a new cut restarts it */
@@ -4597,11 +4603,15 @@ static void draw_items(void){
 static void draw_shards(void){
   float M[9],RY[9],RX[9];
   /* lit, not flat: the wedge facets catch the GGX and a Fresnel edge in the
-   * shard's own colour, so the burst reads as shattered glass */
-  glUniform1f(uEmis,0.45f); glUniform1f(uBump,0); glUniform1f(uGloss,0.85f); glUniform1f(uRim,0.9f);
+   * shard's own colour, so the burst reads as shattered glass. Freshly shed
+   * they are fully emissive and settle to lit over the first third of their
+   * life: at 0.45 flat the OVERLORD's facets were lost against its own hide
+   * in the dark throne room and the win frame showed an intact boss. */
+  glUniform1f(uBump,0); glUniform1f(uGloss,0.85f); glUniform1f(uRim,0.9f);
   for(int i=0;i<MAXSHARD;i++){
     Shard*s=&shards[i]; if(s->life<=0)continue;
     float a=s->life/s->max;
+    glUniform1f(uEmis,0.45f+0.8f*a*a);
     m3rotY(RY,s->yaw); m3rotX(RX,s->pit); m3mul(M,RY,RX);
     glUniform3f(uTint,s->r*a*1.6f,s->g*a*1.6f,s->b*a*1.6f);
     rimf(s->r*1.4f*a,s->g*1.4f*a,s->b*1.4f*a);
@@ -4849,15 +4859,16 @@ static void draw_slash(void){
   }
 }
 
-/* upload the 8 nearest lights (static + temp) to (x,z). Once per frame for
- * the world batches — and once per FIGURE, so an agent 25u away is lit by
- * the emitters around IT, not whichever eight happen to hug the camera. */
+/* upload the SHLIGHTS nearest lights (static + temp) to (x,z), the tier then
+ * capping how many the shader loops. Once per frame for the world batches —
+ * and once per FIGURE, so an agent 25u away is lit by the emitters around IT,
+ * not whichever ones happen to hug the camera. */
 static void set_lights(float x,float z){
   float lp[SHLIGHTS*4]={0}, lc[SHLIGHTS*3]={0}; int ln=0;
-  /* Bounded insertion into an 8-slot array, one pass over the candidates. The
-   * old version ran a partial SELECTION SORT — up to 8 passes over as many as
-   * MAXLIGHT+MAXTEMPL = 80 entries — and it runs once per figure per pass, so a
-   * crowded TERMINAL was doing ~50 of them a frame for eight results. */
+  /* Bounded insertion into a SHLIGHTS-slot array, one pass over the candidates.
+   * The old version ran a partial SELECTION SORT — one pass per slot over as
+   * many as MAXLIGHT+MAXTEMPL = 80 entries — and it runs once per figure per
+   * pass, so a crowded TERMINAL was doing ~50 of them a frame. */
   float bd[SHLIGHTS]; int bi[SHLIGHTS], bt[SHLIGHTS];
   for(int k=0;k<SHLIGHTS;k++){ bd[k]=1e30f; bi[k]=-1; bt[k]=0; }
   for(int pass=0;pass<2;pass++){
@@ -4884,7 +4895,7 @@ static void set_lights(float x,float z){
     ln++;
   }
   /* skip the two array uploads when the selected set is bit-identical to the
-   * last one — walking a corridor re-sends the same eight lights every figure */
+   * last one — walking a corridor re-sends the same lights every figure */
   static float pl[SHLIGHTS*4], pc[SHLIGHTS*3]; static int pn=-1;
   if(pn==ln && !memcmp(pl,lp,sizeof lp) && !memcmp(pc,lc,sizeof lc)) return;
   pn=ln; memcpy(pl,lp,sizeof lp); memcpy(pc,lc,sizeof lc);
