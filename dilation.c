@@ -1267,7 +1267,8 @@ static float music_sample(double mt,int track){
       if(fc>7000.0f)fc=7000.0f;
       float fco=2.0f*sinf(PI*fc/44100.0f), res=1.05f;  /* res<2; lower = more squelch */
       float hp=drv-svf_lo-res*svf_bp; svf_bp+=fco*hp; svf_lo+=fco*svf_bp;
-      if(fabsf(svf_lo)<1e-15f)svf_lo=0; if(fabsf(svf_bp)<1e-15f)svf_bp=0;   /* rests ring into denormals */
+      if(fabsf(svf_lo)<1e-15f)svf_lo=0;                /* rests ring into denormals */
+      if(fabsf(svf_bp)<1e-15f)svf_bp=0;
       float pump=0.30f+0.70f*(1.0f-expf(-secInBeat*9.0f));
       out += svf_lo*pump*0.45f;
     } else {
@@ -1636,7 +1637,7 @@ static const Quality QUAL[3]={
 };
 static int qual=2;          /* index into QUAL; --quality overrides            */
 static int qualAuto=1;      /* auto tier: step down when we cannot hold 60fps  */
-static int postOK=0, postMS=0;
+static int postOK=0, postMS=0;   /* postMS: scene-target samples in use, 0 = none */
 static GLuint fboMS, rbColMS, rbDepMS;      /* multisampled scene target */
 static GLuint fboScene, texScene, rbDepth;  /* resolved (or direct) scene   */
 static GLuint bloomFbo[NBLOOM][2], bloomTex[NBLOOM][2];
@@ -1822,7 +1823,7 @@ static void init_post(int msaa){
     glGenRenderbuffers(1,&rbDepMS); glBindRenderbuffer(GL_RENDERBUFFER,rbDepMS);
     glRenderbufferStorageMultisample(GL_RENDERBUFFER,msaa,GL_DEPTH_COMPONENT24,scW,scH);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,rbDepMS);
-    postMS = glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE;
+    postMS = glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE ? msaa : 0;
   }
   /* bloom chain: half, quarter, eighth (the tier may use fewer octaves, but we
    * allocate all three so a tier change never has to reallocate) */
@@ -1863,7 +1864,7 @@ static void init_post(int msaa){
   }
   postOK=1;
   printf("[dilation] post: %s quality, %s, bloom x%d, %dx MSAA, %d lights, scene %dx%d -> window %dx%d\n",
-    Q->name, hdr?"RGBA16F HDR":"RGBA8 LDR", Q->bloom, postMS?msaa:0, Q->lights,
+    Q->name, hdr?"RGBA16F HDR":"RGBA8 LDR", Q->bloom, postMS, Q->lights,
     scW,scH, fbW,fbH);
 }
 
@@ -2468,7 +2469,7 @@ static void boss_basis(const Enemy*e,float*M){
   float lean = 0.10f + 0.16f*e->moveb + 0.04f*sinf(wtime*1.2f+e->bphase);
   lean += -0.34f*e->armp + 0.45f*crouch;
   float w,s,sag=boss_melee(e,&w,&s);
-  lean += e->melB*(-0.15f*w*(1.0f-s) + 0.34f*s*sag);
+  lean += e->melB*(-0.30f*w*(1.0f-s) + 0.34f*s*sag);
   float R[9],X[9]; m3rotY(R,-e->yaw); m3rotX(X,-lean); m3mul(M,R,X);   /* +rotX tips the head BACK */
   /* the collapse: 0.30s for a 4.5-unit body, so the OVERLORD comes apart over
    * a beat rather than blinking into confetti */
@@ -2620,7 +2621,7 @@ static void player_aim(float*dx,float*dy,float*dz){
  * the ballistics can never drift apart. */
 typedef struct {
   int rolling,blade;
-  float tuck,tk,walk,armw,armwF,s,cut,swIn,spd,run,fs,fwdb,latb,absorb,idle,breath,
+  float tuck,walk,armw,armwF,s,cut,swIn,spd,run,fs,fwdb,latb,absorb,idle,breath,
         poseYaw,pcy,bounce,jtuck,wk,wknf,wknl,fall,bladeTw;
   float M[9];       /* body basis: yaw + lean + the roll                      */
   float Mp[9];      /* pelvis / legs: M yawed toward the forward leg          */
@@ -2628,7 +2629,7 @@ typedef struct {
                        sway, about the spine base — the roll folds the chest
                        onto the pelvis instead of squashing every anchor height */
   float ux,uy,uz;   /* spine base pivot (world)                               */
-  float eyex,eyey,eyez;   /* between the eye slits (world): the ADS camera   */
+  float eyey;       /* eye-slit height (world): the ADS camera's eye level    */
 } PPose;
 /* world position of an upper-body point given in body-local coordinates */
 static void ppos_u(const PPose*P,float x,float y,float z,float*w){
@@ -2639,7 +2640,6 @@ static void player_pose(PPose*P){
   P->rolling = rollT>0;
   float rp = P->rolling? sstep(1.0f-rollT/ROLL_TIME) : 0; /* roll progress    */
   P->tuck = P->rolling? sinf(rp*PI) : 0;               /* curl: 0 -> 1 -> 0  */
-  P->tk = 1.0f-0.10f*P->tuck;                          /* the curl does the folding now */
   P->walk = sinf(bobT*GAIT_K);
   /* contralateral arm phase: cos peaks with the stride, so the right arm is
    * forward as the LEFT leg plants */
@@ -2728,7 +2728,7 @@ static void player_pose(PPose*P){
   m3mul(P->Mu,P->M,TT);
   float sp[3]; m3v(P->M,0,SPINE_Y,0,sp);
   P->ux=px+sp[0]; P->uy=P->pcy+sp[1]; P->uz=pz+sp[2];
-  { float e[3]; ppos_u(P,0,1.29f+0.036f,0,e); P->eyex=e[0]; P->eyey=e[1]; P->eyez=e[2]; }
+  { float e[3]; ppos_u(P,0,1.29f+0.036f,0,e); P->eyey=e[1]; }
 }
 
 /* the right arm + pistol, solved once for BOTH the renderer and the sim.
@@ -3144,12 +3144,13 @@ static void update_bullets(float wdt){
         /* near miss: doppler whoosh, pitch from closing speed. Latched per
          * round: this used to re-roll every substep of every frame, so one
          * passing round in frozen time fired dozens of 11-second whooshes
-         * and flooded the voice pool. Audio is not simulation, so the coin
-         * comes from the visual stream and the sim RNG is left alone. */
+         * and flooded the voice pool. The 60% coin is a hash of the round
+         * (slot and flight time): sim code touches neither RNG stream. */
         float d2=dx*dx+dz*dz;
         if(!b->whooshed && d2<1.3f*1.3f && d2>1.0f && (b->vx*dx+b->vz*dz)>0){
           b->whooshed=1;
-          if(vrand()<0.6f) sfx3(V_WHOOSH, 0.7f+clampf(spd/14.0f,0,1)*0.8f, b->x,b->y,b->z); }
+          unsigned h=(unsigned)(b-bul)*2654435761u ^ (unsigned)(b->life*1e4f);
+          if(h%5<3) sfx3(V_WHOOSH, 0.7f+clampf(spd/14.0f,0,1)*0.8f, b->x,b->y,b->z); }
       } else { /* player round vs agents */
         for(int j=0;j<nen;j++){
           Enemy*e=&en[j]; if(e->state==4)continue;
@@ -4027,8 +4028,10 @@ static void draw_boss(Enemy*e){
     /* the swat, driven by the melee clock: the lead claw sweeps UP and BACK
        through the windup, then whips to full reach so the extreme lands on the
        hit frame, and sags back over the recovery; melB fades it in and out */
-    float reach=mel*(ai==1 ? -0.90f*mw*(1.0f-ms)+1.25f*ms*msag
-                           : -0.30f*mw*(1.0f-ms)+0.30f*ms*msag);
+    float reach=mel*(ai==1 ? -2.40f*mw*(1.0f-ms)+1.25f*ms*msag
+                           : -0.45f*mw*(1.0f-ms)+0.30f*ms*msag);
+    /* and cocks it out to the side: a raise alone is invisible head-on */
+    float cock=ai==1 ? 0.55f*mel*mw*(1.0f-ms) : 0.0f;
     /* up: down-forward base, rears up while airborne (armp), then thrust down to
        brace on impact (crouch) so the arms visibly come out of the leap pose */
     /* forward-POSITIVE, like the agents and the avatar: m3rotX(+t) swings the
@@ -4038,7 +4041,7 @@ static void draw_boss(Enemy*e){
     float up=0.50f+reach+0.85f*e->armp-0.40f*crouch-sw-idle;
     float eb=0.80f-0.45f*mel*ms*msag;              /* the elbow straightens through the strike */
     float A[9],F[9],RX[9],RE[9],RZ[9],S[9];
-    m3rotZ(RZ,ai*0.26f);
+    m3rotZ(RZ,ai*(0.26f+cock));
     m3rotX(RX,up);    m3mul(S,RX,RZ); m3mul(A,M,S);
     float sh[3]; m3v(M,ai*0.82f,1.80f,0,sh);
     float shx=e->x+sh[0], shy=pvY+sh[1], shz=e->z+sh[2];
@@ -4281,6 +4284,20 @@ static void avatar_arm(float sx,float sy,float sz,float ex,float ey,float ez,
 static void put_u(const PPose*P,const float*B,float x,float y,float z){
   float w[3]; ppos_u(P,x,y,z,w); set_uM(B,w[0],w[1],w[2]);
 }
+/* the katana's wake is the surface the blade ACTUALLY swept: draw_player
+ * samples the blade's base and tip once per render frame of the cut (the
+ * mirror pass shares the upright's sample via the pose stamp) and draw_slash
+ * strips a crescent through them. It used to be a parametric arc about the
+ * hips that only met the blade at the very end of the cut. */
+#define WAKE_N 48
+typedef struct { float b[3],t[3],s; } Wake;
+static Wake wake[WAKE_N]; static int wakeN;
+static void wake_sample(float s,const float*b,const float*t){
+  static unsigned stamp; if(stamp==poseStamp)return; stamp=poseStamp;
+  if(wakeN && wake[wakeN-1].s>=s){ if(wake[wakeN-1].s==s)return; wakeN=0; }   /* a new cut restarts it */
+  if(wakeN==WAKE_N){ memmove(wake,wake+1,sizeof wake-sizeof *wake); wakeN--; }
+  memcpy(wake[wakeN].b,b,12); memcpy(wake[wakeN].t,t,12); wake[wakeN++].s=s;
+}
 static void draw_player(void){
   primArm=1;
   PPose P=*pose_get();
@@ -4475,6 +4492,10 @@ static void draw_player(void){
         tintf(0.30f,2.0f,0.9f); glUniform1f(uEmis,1.0f);
         m3v(B,0.024f,-0.26f-0.50f*bladeVis,0,o);
         set_uM(Bs,hx+o[0],hy+o[1],hz+o[2]); box_sh(0.006f,1.00f,0.012f);
+        if(s>0){ float bb[3],bt[3];                     /* the wake rides the drawn blade */
+          m3v(B,0,-0.26f,0,o);          bb[0]=hx+o[0]; bb[1]=hy+o[1]; bb[2]=hz+o[2];
+          m3v(B,0,-0.26f-bladeVis,0,o); bt[0]=hx+o[0]; bt[1]=hy+o[1]; bt[2]=hz+o[2];
+          wake_sample(s,bb,bt); }
       }
       glUniform1f(uEmis,0.08f); tintf(0.04f,0.05f,0.045f);
     } else {
@@ -4791,29 +4812,38 @@ static void draw_player_laser(void){
   glDisable(GL_TEXTURE_2D);
 }
 
-/* the katana's wake: an emerald crescent swept across the cut plane,
- * strongest at the blade and fading along the arc behind it */
+/* Catmull-Rom through four wake samples: a cut is a dozen render frames, so
+ * the strip is subdivided between them or the crescent reads as a fan of quads */
+static void crom(const float*p0,const float*p1,const float*p2,const float*p3,float u,float*o){
+  float u2=u*u,u3=u2*u;
+  for(int i=0;i<3;i++)
+    o[i]=0.5f*(2*p1[i]+(p2[i]-p0[i])*u+(2*p0[i]-5*p1[i]+4*p2[i]-p3[i])*u2+(3*p1[i]-p0[i]-3*p2[i]+p3[i])*u3);
+}
+/* the katana's wake: an emerald crescent over the surface the blade has swept
+ * this cut, strongest at the blade and fading along the trail behind it */
 static void draw_slash(void){
-  if(swingT<=0)return;
-  float s=clampf(swingT/SWING_TIME,0,1);
+  if(swingT<=0||wakeN<2)return;
   const PPose*P=pose_get();
-  float yr=avYaw;                        /* the arm's yaw and height, not the camera's */
-  float cut=sstep(clampf((s-0.08f)/0.60f,0,1));
-  float aS=yr-0.66f, aE=aS+1.42f*cut;   /* left-shoulder -> right-hip, like the arm */
-  float cy=P->pcy+0.79f;
+  /* the trail is the last 0.30 of swing phase (so its length does not depend
+   * on the frame rate) and its leading edge is THIS frame's blade */
+  int n=wakeN, k0=0; while(k0<n-2 && wake[k0].s<P->s-0.30f) k0++;
+  float s0=wake[k0].s, sp=wake[n-1].s-s0;
+  if(wake[n-1].s>P->s||sp<=0)return;    /* the last cut's trail, before this one samples */
   /* two layers: a wide soft wake under a narrow boosted core */
   for(int layer=0;layer<2;layer++){
-    float r0=layer?0.60f:0.50f, r1=layer?1.42f:1.62f;
+    float e0=layer?0.04f:-0.12f, e1=layer?-0.04f:0.20f;   /* overhang past the fist / the tip */
     glBegin(GL_TRIANGLE_STRIP);
-    for(int k=0;k<=16;k++){
-      float f=k/16.0f, a=aS+(aE-aS)*f;
-      float yk=cy+0.24f-0.58f*f;              /* high right -> low left diagonal */
-      float al=0.62f*f*f*(0.35f+0.65f*cut)*(layer?1.25f:0.45f);
-      float sa=sinf(a),ca=-cosf(a);
+    for(int k=k0;k<n-1;k++) for(int j=0;j<(k==n-2?5:4);j++){
+      const Wake*w0=&wake[k>k0?k-1:k0],*w1=&wake[k],*w2=&wake[k+1],*w3=&wake[k+2<n?k+2:n-1];
+      float u=j*0.25f, b[3],t[3];
+      crom(w0->b,w1->b,w2->b,w3->b,u,b); crom(w0->t,w1->t,w2->t,w3->t,u,t);
+      float f=(w1->s+(w2->s-w1->s)*u-s0)/sp;
+      float al=0.62f*f*f*f*(0.35f+0.65f*P->cut)*(layer?1.25f:0.45f);
+      float dx=t[0]-b[0],dy=t[1]-b[1],dz=t[2]-b[2];
       if(layer) glColor4f(0.20f*al,1.00f*al,0.45f*al,al);
       else      glColor4f(0.10f*al,0.55f*al,0.30f*al,al);
-      glVertex3f(px+sa*r0,yk,pz+ca*r0);
-      glVertex3f(px+sa*r1,yk-0.08f,pz+ca*r1);
+      glVertex3f(b[0]+dx*e0,b[1]+dy*e0,b[2]+dz*e0);
+      glVertex3f(t[0]+dx*e1,t[1]+dy*e1,t[2]+dz*e1);
     }
     glEnd();
   }
@@ -5634,7 +5664,7 @@ int main(int argc,char**argv){
   init_shaders();
   printf("[dilation] shaders up\n");
   init_post(msaa);
-  printf("[dilation] MSAA: %dx\n",postMS?msaa:0);
+  printf("[dilation] MSAA: %dx\n",postMS);   /* the tier-capped count, not the request */
 
   music_init();   /* parse the note-string melodies into step arrays */
   SDL_AudioSpec want={0},have;
@@ -6356,8 +6386,9 @@ int main(int argc,char**argv){
       camBob=0.022f*(cp->bounce-0.5f*cp->run*cp->run)-0.30f*cp->absorb
             +0.006f*sinf(gtime*1.2f)*cp->idle; }
     float camy3=camYs+cdy*camDistA+camBob;
-    /* the first-person eye comes from the POSE: between the drawn eye slits,
-     * so it tracks the roll curl and the landing absorb for free */
+    /* the first-person eye HEIGHT comes from the POSE (the drawn eye slits),
+     * so it tracks the roll curl and the landing absorb for free; x/z stay
+     * on the boom, which the ADS zoom has already pulled onto the body */
     float camyA=camy3;
     if(gstate==ST_PLAY) camyA=pose_get()->eyey;
     float camy=camy3+(camyA-camy3)*adsE;
